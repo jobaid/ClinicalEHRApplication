@@ -72,7 +72,7 @@ Healthcare billing software is a genuinely hard domain — it's not "patients ta
 - **Deliberately honest about its own limits.** The app surfaces its own scope boundaries in-product (e.g., the login screen's dev-credentials panel is explicitly labeled non-production, OCR fields are manual-entry-only rather than faked) — because pretending a demo is production-grade is a worse engineering habit than admitting the boundary.
 
 ---
-
+<img src="clinicGIF.gif" alt="Medical Billing Demo" width="800">
 ## Getting started
 
 ```bash
