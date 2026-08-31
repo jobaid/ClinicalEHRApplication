@@ -52,7 +52,7 @@ const providers = ["Dr. S. Reyes", "Dr. A. Okafor", "Dr. M. Lin"];
 
 const DEMO_USERS = [
   { email: "admin@medbill.local", password: "Admin@12345", name: "Jobaid Azim", role: "SUPER_ADMIN" },
-  { email: "manager@medbill.local", password: "Manager@12345", name: "Ibnat Nuha", role: "MANAGER" },
+  { email: "manager@medbill.local", password: "Manager@12345", name: "Obaidul", role: "MANAGER" },
   { email: "nurse@medbill.local", password: "Nurse@12345", name: "Dana Ruiz", role: "NURSE" },
   { email: "reception@medbill.local", password: "Reception@12345", name: "Leah Ford", role: "RECEPTIONIST" },
   { email: "biller@medbill.local", password: "Biller@12345", name: "Marcus Webb", role: "BILLER" },
