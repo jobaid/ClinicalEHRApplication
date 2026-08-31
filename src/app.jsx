@@ -51,8 +51,8 @@ const providers = ["Dr. S. Reyes", "Dr. A. Okafor", "Dr. M. Lin"];
 // Postman, curl, etc. Real enforcement has to live in the Express API layer.
 
 const DEMO_USERS = [
-  { email: "admin@medbill.local", password: "Admin@12345", name: "Jobaid Azim", role: "SUPER_ADMIN" },
-  { email: "manager@medbill.local", password: "Manager@12345", name: "Ibnat Nuha", role: "MANAGER" },
+  { email: "admin@medbill.local", password: "Admin@12345", name: "Obaidul", role: "SUPER_ADMIN" },
+  { email: "manager@medbill.local", password: "Manager@12345", name: "Anowara", role: "MANAGER" },
   { email: "nurse@medbill.local", password: "Nurse@12345", name: "Dana Ruiz", role: "NURSE" },
   { email: "reception@medbill.local", password: "Reception@12345", name: "Leah Ford", role: "RECEPTIONIST" },
   { email: "biller@medbill.local", password: "Biller@12345", name: "Marcus Webb", role: "BILLER" },
@@ -370,7 +370,7 @@ function generateSampleERA(claims, patientById, chargeById) {
     `BPR*I*${eligible.reduce((s, c) => s + Math.round(c.amount * 0.8 * 100) / 100, 0).toFixed(2)}*C*ACH*CTX*01*999999999*DA*123456789*1512345678**01*999999998*DA*987654321*20260824~`,
     "TRN*1*EFT00293841*1512345678~",
     "N1*PR*Aetna~",
-    "N1*PE*Jobaid Clinic*XX*1912345678~",
+    "N1*PE*Obaid Clinic*XX*1912345678~",
   ];
   eligible.forEach(c => {
     const charge = chargeById[c.chargeId];
@@ -935,7 +935,7 @@ function ClinicApp({ session, onLogout }) {
               <Stethoscope size={18} />
             </div>
             <div>
-              <div className="text-white font-semibold text-sm leading-tight">Jobaid Clinic</div>
+              <div className="text-white font-semibold text-sm leading-tight">Obaid Clinic</div>
               <div className="text-xs text-slate-500">Practice manager</div>
             </div>
           </div>
