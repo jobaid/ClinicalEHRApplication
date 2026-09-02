@@ -56,8 +56,13 @@ const emptyDxCodes = () => Array(10).fill("");
 // Postman, curl, etc. Real enforcement has to live in the Express API layer.
 
 const DEMO_USERS = [
+<<<<<<< HEAD
   { email: "admin@medbill.local", password: "Admin@12345", name: "Obaidul", role: "SUPER_ADMIN" },
   { email: "manager@medbill.local", password: "Manager@12345", name: "Anowara", role: "MANAGER" },
+=======
+  { email: "admin@medbill.local", password: "Admin@12345", name: "Jobaid Azim", role: "SUPER_ADMIN" },
+  { email: "manager@medbill.local", password: "Manager@12345", name: "Obaidul", role: "MANAGER" },
+>>>>>>> 6be356807a9bcf8ad6b3560e604255b62b82bfe9
   { email: "nurse@medbill.local", password: "Nurse@12345", name: "Dana Ruiz", role: "NURSE" },
   { email: "reception@medbill.local", password: "Reception@12345", name: "Leah Ford", role: "RECEPTIONIST" },
   { email: "biller@medbill.local", password: "Biller@12345", name: "Marcus Webb", role: "BILLER" },
