@@ -303,6 +303,22 @@ const payerLabel = (c, policies) => {
 
 function nowIso() { return TODAY + "T" + new Date().toTimeString().slice(0, 8); }
 
+// Splits an insurance-allowed amount into patient responsibility (copay, then deductible,
+// then coinsurance on what's left) using a policy's flat rates, leaving the remainder as
+// what the insurer actually pays. Used to auto-fill the manual posting form from an EOB.
+function splitAllowedAmount(allowed, policy) {
+  let remaining = Math.max(0, Number(allowed) || 0);
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const copay = policy ? Math.min(remaining, Number(policy.copay) || 0) : 0;
+  remaining = round2(remaining - copay);
+  const deductible = policy ? Math.min(remaining, Number(policy.deductible) || 0) : 0;
+  remaining = round2(remaining - deductible);
+  const coinsRate = policy ? (parseFloat(policy.coinsurance) || 0) / 100 : 0;
+  const coinsurance = round2(remaining * coinsRate);
+  remaining = round2(remaining - coinsurance);
+  return { copay: round2(copay), deductible: round2(deductible), coinsurance, insurancePaid: Math.max(0, remaining) };
+}
+
 // The single source of truth for "what insurance is this patient on right now" —
 // everywhere the app used to read a flat patient.insurer field, it reads this instead.
 function currentPrimaryPolicy(patientId, policies) {
@@ -920,15 +936,60 @@ function ClinicApp({
   // ----- Claim / Ledger: posting a transaction onto a specific DOS charge -----
   // Shared apply step: bump paid/writeoff/credits, push a detailed posting record, log a global
   // transaction (for Reports) and an audit entry. Never overwrites prior postings — append-only.
-  function postToCharge(chargeId, { field, amount, posting, txnType, auditLabel }) {
+  // Multiple entries (e.g. a payment plus its contractual write-off) are applied against one
+  // running balance so they can never together exceed the charge's remaining room.
+  function postToChargeMulti(chargeId, entries) {
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
-    const room = Math.max(0, target.charge - target.paid - target.writeoff - (target.credits || 0));
-    const applied = Math.min(room, amount);
-    if (applied <= 0) return;
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, [field]: (c[field] || 0) + applied, postings: [...(c.postings || []), { id: uid("PST"), amount: applied, debited: 0, postedBy: session.name, postedAt: nowIso(), ...posting }] } : c));
-    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId, patientId: target.patientId, type: txnType, amount: applied, date: posting.date || TODAY, source: posting.insuranceName || posting.payer || posting.method || "Manual", reference: posting.reference || posting.checkNumber || "" }]);
-    addAudit(target.patientId, auditLabel, "charge", chargeId, null, `${money(applied)} — ${posting.notes || posting.type || ""}`.trim());
+    let room = Math.max(0, target.charge - target.paid - target.writeoff - (target.credits || 0));
+    const applied = [];
+    entries.forEach(entry => {
+      const amt = Math.min(room, Math.max(0, Number(entry.amount) || 0));
+      if (amt <= 0) return;
+      room -= amt;
+      applied.push({ ...entry, amount: amt });
+    });
+    if (applied.length === 0) return;
+    setCharges(prev => prev.map(c => {
+      if (c.id !== chargeId) return c;
+      const fieldDeltas = {};
+      applied.forEach(e => { fieldDeltas[e.field] = (fieldDeltas[e.field] || 0) + e.amount; });
+      const updated = { ...c };
+      Object.entries(fieldDeltas).forEach(([field, delta]) => { updated[field] = (c[field] || 0) + delta; });
+      updated.postings = [...(c.postings || []), ...applied.map(e => ({ id: uid("PST"), amount: e.amount, debited: 0, postedBy: session.name, postedAt: nowIso(), ...e.posting }))];
+      return updated;
+    }));
+    setTransactions(prev => [...prev, ...applied.map(e => ({ id: uid("TXN"), chargeId, patientId: target.patientId, type: e.txnType, amount: e.amount, date: e.posting.date || TODAY, source: e.posting.insuranceName || e.posting.payer || e.posting.method || "Manual", reference: e.posting.reference || e.posting.checkNumber || "" }))]);
+    applied.forEach(e => addAudit(target.patientId, e.auditLabel, "charge", chargeId, null, `${money(e.amount)} — ${e.posting.notes || e.posting.type || ""}`.trim()));
+  }
+  function postToCharge(chargeId, entry) {
+    postToChargeMulti(chargeId, [entry]);
+  }
+
+  // Guided manual posting (Post payments > Manual post): a single payment plus an optional,
+  // reason-required contractual write-off, applied atomically to one charge.
+  function postManualLinePayment(chargeId, form) {
+    const entries = [];
+    const amt = Number(form.amount) || 0;
+    if (amt > 0) {
+      entries.push({
+        field: "paid", amount: amt, txnType: "payment", auditLabel: form.insuranceName ? "Insurance payment posted" : "Patient payment posted",
+        posting: {
+          type: form.insuranceName ? "Insurance Credit" : "Patient Credit", insuranceName: form.insuranceName || undefined,
+          payer: form.insuranceName || "Patient", checkNumber: form.checkNumber, reference: form.checkNumber, date: form.paymentDate, notes: form.notes,
+          copay: form.copay, coinsurance: form.coinsurance, deductible: form.deductible, allowedAmount: form.allowedAmount,
+        },
+      });
+    }
+    const writeoffAmt = Number(form.writeoff) || 0;
+    if (writeoffAmt > 0) {
+      entries.push({
+        field: "writeoff", amount: writeoffAmt, txnType: "writeoff", auditLabel: "Write-off posted",
+        posting: { type: "Write-off", reason: form.writeoffReason, checkNumber: form.checkNumber, date: form.paymentDate, notes: `Allowed ${money(Number(form.allowedAmount) || 0)} of billed ${money(Number(form.billedAmount) || 0)}` },
+      });
+    }
+    if (entries.length === 0) return;
+    postToChargeMulti(chargeId, entries);
   }
 
   function postCheckPayment(chargeId, form) {
@@ -1193,34 +1254,6 @@ function ClinicApp({
     setTab("billing");
   }
 
-  // Manual payment posting: apply a batch of {chargeId, payment, writeoff} rows at once.
-  function postManualBatch(rows, meta = {}) {
-    setCharges(prev => prev.map(c => {
-      const row = rows.find(r => r.chargeId === c.id);
-      if (!row) return c;
-      const room = Math.max(0, c.charge - c.paid - c.writeoff);
-      const paidApplied = Math.min(room, row.payment || 0);
-      const writeoffApplied = Math.min(room - paidApplied, row.writeoff || 0);
-      return { ...c, paid: c.paid + paidApplied, writeoff: c.writeoff + writeoffApplied };
-    }));
-    setClaims(prev => prev.map(cl => {
-      const row = rows.find(r => r.chargeId === cl.chargeId);
-      if (!row) return cl;
-      return cl.status === "Draft" ? cl : { ...cl, status: "Paid" };
-    }));
-    const newTxns = [];
-    rows.forEach(row => {
-      const target = charges.find(c => c.id === row.chargeId);
-      if (!target) return;
-      const room = Math.max(0, target.charge - target.paid - target.writeoff);
-      const paidApplied = Math.min(room, row.payment || 0);
-      const writeoffApplied = Math.min(room - paidApplied, row.writeoff || 0);
-      if (paidApplied > 0) newTxns.push({ id: uid("TXN"), chargeId: row.chargeId, patientId: target.patientId, type: "payment", amount: paidApplied, date: meta.date || TODAY, source: meta.payer || "Manual", reference: meta.reference || "" });
-      if (writeoffApplied > 0) newTxns.push({ id: uid("TXN"), chargeId: row.chargeId, patientId: target.patientId, type: "writeoff", amount: writeoffApplied, date: meta.date || TODAY, source: meta.payer || "Manual write-off", reference: meta.reference || "" });
-    });
-    if (newTxns.length) setTransactions(prev => [...prev, ...newTxns]);
-  }
-
   // Electronic remittance (835) posting: apply parsed, matched claim rows in one batch.
   function postERABatch(matchedRows, meta = {}) {
     setCharges(prev => prev.map(c => {
@@ -1376,7 +1409,8 @@ function ClinicApp({
                 patients={patients}
                 patientById={patientById}
                 chargeById={chargeById}
-                onPostManual={postManualBatch}
+                policies={policies}
+                onPostManualLine={postManualLinePayment}
                 onPostERA={postERABatch}
               />
             )}
@@ -1695,7 +1729,7 @@ function BillingSearch({ patients, policies, patientBalance, onSelect }) {
 
 // ---------- Billing: post payments (manual + electronic 835) ----------
 
-function PaymentPosting({ charges, claims, patients, patientById, chargeById, onPostManual, onPostERA }) {
+function PaymentPosting({ charges, claims, patients, patientById, chargeById, policies, onPostManualLine, onPostERA }) {
   const [mode, setMode] = useState("manual");
   return (
     <div>
@@ -1711,61 +1745,51 @@ function PaymentPosting({ charges, claims, patients, patientById, chargeById, on
         </button>
       </div>
 
-      {mode === "manual" && <ManualPosting charges={charges} patientById={patientById} onPostManual={onPostManual} />}
+      {mode === "manual" && <ManualPosting charges={charges} patientById={patientById} policies={policies} onPostManualLine={onPostManualLine} />}
       {mode === "electronic" && <ElectronicRemittance charges={charges} claims={claims} patientById={patientById} chargeById={chargeById} onPostERA={onPostERA} />}
     </div>
   );
 }
 
-function ManualPosting({ charges, patientById, onPostManual }) {
+function ManualPosting({ charges, patientById, policies, onPostManualLine }) {
   const openCharges = charges.filter(c => balanceOf(c) > 0);
   const [search, setSearch] = useState("");
-  const [rows, setRows] = useState({}); // chargeId -> { payment, writeoff }
-  const [payer, setPayer] = useState("");
-  const [reference, setReference] = useState("");
+  const [checkNumber, setCheckNumber] = useState("");
   const [postDate, setPostDate] = useState(TODAY);
-  const [postedMsg, setPostedMsg] = useState("");
+  const [postingCharge, setPostingCharge] = useState(null);
+  const [postedLines, setPostedLines] = useState([]);
 
   const filtered = openCharges.filter(c => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
     const name = patientById[c.patientId]?.name?.toLowerCase() || "";
-    return name.includes(search.toLowerCase()) || c.id.toLowerCase().includes(search.toLowerCase());
+    return name.includes(q) || c.patientId.toLowerCase().includes(q) || c.id.toLowerCase().includes(q);
   });
 
-  function setRow(chargeId, field, value) {
-    setRows(prev => ({ ...prev, [chargeId]: { ...prev[chargeId], [field]: Number(value) || 0 } }));
-  }
-
-  const batchTotal = Object.values(rows).reduce((s, r) => s + (r.payment || 0), 0);
-  const linesToPost = Object.entries(rows).filter(([, r]) => (r.payment || 0) > 0 || (r.writeoff || 0) > 0);
-
-  function postBatch() {
-    if (linesToPost.length === 0) return;
-    onPostManual(
-      linesToPost.map(([chargeId, r]) => ({ chargeId, payment: r.payment || 0, writeoff: r.writeoff || 0 })),
-      { payer: payer || "Manual", reference, date: postDate }
-    );
-    setPostedMsg(`Posted ${linesToPost.length} line${linesToPost.length > 1 ? "s" : ""} totaling ${money(batchTotal)}.`);
-    setRows({});
+  function handleSubmit(form) {
+    onPostManualLine(postingCharge.id, form);
+    const patientName = patientById[postingCharge.patientId]?.name || postingCharge.patientId;
+    const parts = [];
+    if (Number(form.amount) > 0) parts.push(`${money(Number(form.amount))} payment`);
+    if (Number(form.writeoff) > 0) parts.push(`${money(Number(form.writeoff))} write-off`);
+    setPostedLines(prev => [{ id: uid("LOG"), text: `${patientName} (${postingCharge.patientId}) — ${postingCharge.dos} · ${postingCharge.cpt}: ${parts.join(" + ")}` }, ...prev].slice(0, 8));
+    setPostingCharge(null);
   }
 
   return (
     <div>
       <Card className="p-4 mb-4">
-        <div className="grid grid-cols-3 gap-3">
-          <Field label="Payment source">
-            <select className={inputCls} value={payer} onChange={(e) => setPayer(e.target.value)}>
-              <option value="">Select…</option>
-              <option>Patient payment</option><option>Aetna</option><option>UnitedHealthcare</option><option>Cigna</option><option>Medicare</option>
-            </select>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Check / EFT number" hint="Prefills each line below; can still be edited per posting.">
+            <input className={inputCls} value={checkNumber} onChange={(e) => setCheckNumber(e.target.value)} placeholder="e.g. 4471029" />
           </Field>
-          <Field label="Check / EFT / reference #"><input className={inputCls} value={reference} onChange={(e) => setReference(e.target.value)} placeholder="e.g. 4471029" /></Field>
           <Field label="Post date"><input type="date" className={inputCls} value={postDate} onChange={(e) => setPostDate(e.target.value)} /></Field>
         </div>
       </Card>
 
       <div className="relative mb-3 max-w-sm">
         <Search size={15} className="absolute left-3 top-2.5 text-slate-400" />
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Filter open charges by patient or charge ID" className={`${inputCls} pl-9`} />
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search open charges by patient name, patient ID, or charge ID" className={`${inputCls} pl-9`} />
       </div>
 
       <Card>
@@ -1773,42 +1797,137 @@ function ManualPosting({ charges, patientById, onPostManual }) {
           <thead>
             <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
               <th className="px-4 py-2.5 font-medium">Patient</th>
+              <th className="px-4 py-2.5 font-medium">Account</th>
               <th className="px-4 py-2.5 font-medium">DOS / CPT</th>
+              <th className="px-4 py-2.5 font-medium text-right">Billed</th>
               <th className="px-4 py-2.5 font-medium text-right">Balance</th>
-              <th className="px-4 py-2.5 font-medium text-right">Payment</th>
-              <th className="px-4 py-2.5 font-medium text-right">Write-off</th>
+              <th className="px-4 py-2.5"></th>
             </tr>
           </thead>
           <tbody>
             {filtered.map(c => {
               const bal = balanceOf(c);
-              const row = rows[c.id] || {};
               return (
                 <tr key={c.id} className="border-b border-slate-100 last:border-0">
                   <td className="px-4 py-2.5 text-slate-700">{patientById[c.patientId]?.name}</td>
+                  <td className="px-4 py-2.5 text-slate-500 text-xs">{c.patientId}</td>
                   <td className="px-4 py-2.5 text-slate-500 text-xs">{c.dos} · {c.cpt}</td>
+                  <td className="px-4 py-2.5 text-right text-slate-600">{money(c.charge)}</td>
                   <td className="px-4 py-2.5 text-right font-medium text-rose-600">{money(bal)}</td>
                   <td className="px-4 py-2.5 text-right">
-                    <input type="number" min="0" step="0.01" className="w-24 border border-slate-300 rounded-lg px-2 py-1 text-sm text-right" value={row.payment || ""} onChange={(e) => setRow(c.id, "payment", e.target.value)} />
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    <input type="number" min="0" step="0.01" className="w-24 border border-slate-300 rounded-lg px-2 py-1 text-sm text-right" value={row.writeoff || ""} onChange={(e) => setRow(c.id, "writeoff", e.target.value)} />
+                    <button onClick={() => setPostingCharge(c)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-teal-700 ml-auto">
+                      <CreditCard size={13} /> Post
+                    </button>
                   </td>
                 </tr>
               );
             })}
-            {filtered.length === 0 && <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-400">No open balances match this filter.</td></tr>}
+            {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No open balances match this search.</td></tr>}
           </tbody>
         </table>
       </Card>
 
-      <div className="flex items-center justify-between mt-4">
-        <div className="text-sm text-slate-600">Batch payment total: <span className="font-semibold text-slate-800">{money(batchTotal)}</span></div>
-        <button onClick={postBatch} disabled={linesToPost.length === 0} className="flex items-center gap-1.5 bg-teal-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed">
-          <CreditCard size={15} /> Post batch
+      {postedLines.length > 0 && (
+        <div className="mt-4 space-y-1">
+          {postedLines.map(l => <p key={l.id} className="text-emerald-600 text-xs">{l.text}</p>)}
+        </div>
+      )}
+
+      {postingCharge && (
+        <Modal title={`Post payment · ${patientById[postingCharge.patientId]?.name || postingCharge.patientId} · ${postingCharge.dos}`} onClose={() => setPostingCharge(null)}>
+          <ManualLinePostingForm
+            charge={postingCharge}
+            policies={policies.filter(p => p.patientId === postingCharge.patientId && p.status === "Active")}
+            defaultCheckNumber={checkNumber}
+            defaultPostDate={postDate}
+            onSubmit={handleSubmit}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// Guided single-charge posting: ask check number / insurance / amount first, then let the
+// biller key an EOB's allowed amount and auto-split it into copay/coinsurance/deductible,
+// leaving any gap between billed and allowed as a write-off that requires a reason.
+function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPostDate, onSubmit }) {
+  const bal = balanceOf(charge);
+  const [f, setF] = useState({
+    checkNumber: defaultCheckNumber || "", insuranceName: policies[0]?.insuranceCompany || "", paymentDate: defaultPostDate || TODAY,
+    amount: "", allowedAmount: "", copay: "", coinsurance: "", deductible: "", writeoff: "", writeoffReason: "", notes: "",
+  });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF(prev => ({ ...prev, [k]: e.target.value }));
+
+  function autoCalculate() {
+    const allowed = Number(f.allowedAmount) || 0;
+    const policy = policies.find(p => p.insuranceCompany === f.insuranceName);
+    const { copay, deductible, coinsurance, insurancePaid } = splitAllowedAmount(allowed, policy);
+    const amount = Math.min(bal, insurancePaid);
+    const writeoff = Math.min(Math.max(0, bal - amount), Math.max(0, charge.charge - allowed));
+    setF(prev => ({
+      ...prev,
+      copay: copay ? String(copay) : "", coinsurance: coinsurance ? String(coinsurance) : "", deductible: deductible ? String(deductible) : "",
+      amount: amount ? String(amount) : "0", writeoff: writeoff ? String(writeoff) : "",
+    }));
+  }
+
+  function submit() {
+    const amt = Number(f.amount) || 0;
+    const writeoffAmt = Number(f.writeoff) || 0;
+    if (!f.checkNumber.trim()) { setError("Check number is required."); return; }
+    if (amt <= 0 && writeoffAmt <= 0) { setError("Enter a payment or write-off amount greater than 0."); return; }
+    if (amt + writeoffAmt > bal + 0.001) { setError(`Payment plus write-off can't exceed the remaining balance (${money(bal)}).`); return; }
+    if (writeoffAmt > 0 && !f.writeoffReason.trim()) { setError("A write-off reason is required."); return; }
+    setError("");
+    onSubmit({ ...f, amount: amt, writeoff: writeoffAmt, billedAmount: charge.charge });
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
+        <span>Billed {money(charge.charge)}</span>
+        <span>Adjusted {money(adjustedOf(charge))}</span>
+        <span className={bal > 0 ? "text-rose-600 font-medium" : "font-medium"}>Remaining {money(bal)}</span>
+      </div>
+
+      <SectionTitle>Payment</SectionTitle>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Check / EFT number"><input className={inputCls} value={f.checkNumber} onChange={set("checkNumber")} /></Field>
+        <Field label="Insurance">
+          <select className={inputCls} value={f.insuranceName} onChange={set("insuranceName")}>
+            <option value="">Self / Patient payment</option>
+            {policies.map(p => <option key={p.id} value={p.insuranceCompany}>{p.insuranceCompany}</option>)}
+          </select>
+        </Field>
+        <AmountField label={`Amount received (max ${money(bal)})`} value={f.amount} onChange={set("amount")} />
+        <Field label="Payment date"><input type="date" className={inputCls} value={f.paymentDate} onChange={set("paymentDate")} /></Field>
+      </div>
+
+      <SectionTitle>Claim posting (from EOB)</SectionTitle>
+      <div className="flex items-end gap-2 mb-1">
+        <div className="flex-1"><AmountField label="Allowed amount" value={f.allowedAmount} onChange={set("allowedAmount")} /></div>
+        <button type="button" onClick={autoCalculate} disabled={!f.allowedAmount} className="h-9 mb-4 flex items-center gap-1.5 text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-3 hover:bg-teal-100 disabled:opacity-40 whitespace-nowrap">
+          <Wand2 size={13} /> Auto-calculate
         </button>
       </div>
-      {postedMsg && <p className="text-emerald-600 text-sm mt-2">{postedMsg}</p>}
+      <p className="text-xs text-slate-400 mb-3">Auto-calculate splits the allowed amount into copay/deductible/coinsurance using this patient's policy, fills the payment amount with what's left, and write-off with billed minus allowed. All fields stay editable.</p>
+      <div className="grid grid-cols-3 gap-3">
+        <AmountField label="Copay" value={f.copay} onChange={set("copay")} />
+        <AmountField label="Coinsurance" value={f.coinsurance} onChange={set("coinsurance")} />
+        <AmountField label="Deductible" value={f.deductible} onChange={set("deductible")} />
+      </div>
+
+      <SectionTitle>Write off</SectionTitle>
+      <AmountField label="Write-off amount" value={f.writeoff} onChange={set("writeoff")} />
+      {Number(f.writeoff) > 0 && (
+        <Field label="Write-off reason (required)"><input className={inputCls} value={f.writeoffReason} onChange={set("writeoffReason")} placeholder="Contractual adjustment, timely filing, etc." /></Field>
+      )}
+
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Post payment</button>
     </div>
   );
 }
