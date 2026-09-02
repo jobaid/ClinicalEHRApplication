@@ -156,8 +156,9 @@ const seedPatientMemos = [
 const followUpTypes = ["Call", "Note", "Letter", "Portal message", "Other"];
 const followUpStatuses = ["Open", "Resolved"];
 
-// Debiting (reversing) a posted payment — reasons shown in the debit dialog
-const debitReasons = ["System Debit", "Overpayment", "Insurance Recall", "Posting Error", "Duplicate Payment", "Refund Request", "Patient Dispute", "Incorrect Posting", "Other"];
+// Debiting (reversing) a posted payment — reasons shown in the debit dialog. "System Debit" is
+// deliberately not in this list: it's a separate action in DebitPostingForm that takes no reason.
+const debitReasons = ["Overpayment", "Insurance Recall", "Posting Error", "Duplicate Payment", "Refund Request", "Patient Dispute", "Incorrect Posting", "Other"];
 
 // A posting is "insurance-sourced" if it's an Insurance Credit, or a Check/other posting
 // that names an insurer; everything else (Patient Credit, Card, unattributed Check) is patient-sourced.
@@ -287,11 +288,15 @@ const money = (n) => Number(n || 0).toLocaleString("en-US", { style: "currency",
 const maskSSN = (ssn) => ssn ? `***-**-${ssn.slice(-4)}` : "—";
 const uid = (prefix) => `${prefix}${Math.floor(1000 + Math.random() * 9000)}`;
 const adjustedOf = (c) => c.paid + c.writeoff + (c.credits || 0);
+// Charges = paid + write-off + credits + remaining balance — this is never clamped, so a payment
+// larger than what was owed legitimately drives the balance negative (an overpayment), not $0.00.
 const balanceOf = (c) => c.charge - c.paid - c.writeoff - (c.credits || 0);
+const BALANCE_EPSILON = 0.005; // absorbs floating-point cents, not real balance
 const chargeStatus = (c) => {
   const bal = balanceOf(c);
-  if (bal <= 0 && c.writeoff > 0 && c.paid === 0 && (c.credits || 0) === 0) return "Written off";
-  if (bal <= 0) return "Paid";
+  if (bal < -BALANCE_EPSILON) return "Overpayment";
+  if (bal <= BALANCE_EPSILON && c.writeoff > 0 && c.paid === 0 && (c.credits || 0) === 0) return "Written off";
+  if (bal <= BALANCE_EPSILON) return "Paid";
   if (c.paid > 0 || c.writeoff > 0 || (c.credits || 0) > 0) return "Partial";
   return "Open";
 };
@@ -343,6 +348,104 @@ function fileToDataUrl(file) {
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+function formatFileSize(bytes) {
+  if (bytes === null || bytes === undefined || Number.isNaN(bytes)) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Opens an uploaded ID document in a separate, small popup window — never a same-tab navigation
+// and never a full-page modal — with its own zoom controls for images, or the browser's native
+// PDF viewer for PDFs. The popup is opened blank (about:blank) and the document is attached via
+// direct DOM assignment rather than through window.open's URL argument, so the data URL never
+// lands in an address bar, browser history, or console log.
+function openIdDocumentViewerWindow(doc) {
+  const dataUrl = doc?.file;
+  if (!dataUrl) return;
+  const isPdf = doc.fileType === "application/pdf" || dataUrl.startsWith("data:application/pdf");
+  const win = window.open("", `iddoc-viewer-${doc.id}`, "width=800,height=600,resizable=yes,scrollbars=yes");
+  if (!win) {
+    alert("Your browser blocked the document viewer pop-up. Please allow pop-ups for this site and try again.");
+    return;
+  }
+  const d = win.document;
+  d.title = "ID Document Viewer";
+
+  const style = d.createElement("style");
+  style.textContent = `
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #0f172a; font-family: -apple-system, "Segoe UI", sans-serif; }
+    .idv-bar { position:absolute; top:0; left:0; right:0; height:42px; display:flex; align-items:center; justify-content:space-between;
+      padding: 0 14px; background:#1e293b; color:#e2e8f0; font-size:13px; font-weight:600; border-bottom:1px solid #334155; }
+    .idv-bar button { background:none; border:none; color:#94a3b8; font-size:17px; cursor:pointer; line-height:1; padding:4px 8px; border-radius:4px; }
+    .idv-bar button:hover { background:#334155; color:#fff; }
+    .idv-body { position:absolute; top:42px; bottom:${isPdf ? "0" : "46px"}; left:0; right:0; overflow:auto; background:#1e293b; }
+    .idv-body-inner { min-height:100%; display:flex; align-items:center; justify-content:center; padding:16px; }
+    .idv-body-inner img { display:block; max-width:100%; height:auto; }
+    .idv-body embed { width:100%; height:100%; border:0; }
+    .idv-zoombar { position:absolute; bottom:0; left:0; right:0; height:46px; display:flex; align-items:center; justify-content:center; gap:14px;
+      background:#1e293b; border-top:1px solid #334155; color:#e2e8f0; font-size:13px; }
+    .idv-zoombar button { width:26px; height:26px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:#e2e8f0; cursor:pointer; font-size:15px; line-height:1; }
+    .idv-zoombar button:hover { background:#334155; }
+    .idv-zoombar .idv-pct { min-width:44px; text-align:center; }
+    .idv-zoombar .idv-reset { width:auto; padding:0 10px; }
+  `;
+  d.head.appendChild(style);
+
+  const bar = d.createElement("div");
+  bar.className = "idv-bar";
+  const title = d.createElement("span");
+  title.textContent = "ID Document Viewer";
+  const closeBtn = d.createElement("button");
+  closeBtn.textContent = "✕";
+  closeBtn.title = "Close";
+  closeBtn.onclick = () => win.close();
+  bar.appendChild(title);
+  bar.appendChild(closeBtn);
+  d.body.appendChild(bar);
+
+  const body = d.createElement("div");
+  body.className = "idv-body";
+  d.body.appendChild(body);
+
+  if (isPdf) {
+    const embed = d.createElement("embed");
+    embed.type = "application/pdf";
+    embed.src = dataUrl;
+    body.appendChild(embed);
+    return;
+  }
+
+  const inner = d.createElement("div");
+  inner.className = "idv-body-inner";
+  const img = d.createElement("img");
+  img.alt = "ID document";
+  inner.appendChild(img);
+  body.appendChild(inner);
+
+  const zoombar = d.createElement("div");
+  zoombar.className = "idv-zoombar";
+  const outBtn = d.createElement("button"); outBtn.textContent = "−"; outBtn.title = "Zoom out";
+  const pct = d.createElement("span"); pct.className = "idv-pct"; pct.textContent = "100%";
+  const inBtn = d.createElement("button"); inBtn.textContent = "+"; inBtn.title = "Zoom in";
+  const resetBtn = d.createElement("button"); resetBtn.className = "idv-reset"; resetBtn.textContent = "Reset";
+  zoombar.appendChild(outBtn); zoombar.appendChild(pct); zoombar.appendChild(inBtn); zoombar.appendChild(resetBtn);
+  d.body.appendChild(zoombar);
+
+  let scale = 1;
+  function applyZoom(fit) {
+    if (fit) { img.style.maxWidth = "100%"; img.style.width = ""; img.style.height = "auto"; }
+    else if (img.naturalWidth) { img.style.maxWidth = "none"; img.style.width = Math.round(img.naturalWidth * scale) + "px"; img.style.height = "auto"; }
+    pct.textContent = Math.round(scale * 100) + "%";
+  }
+  img.onload = () => applyZoom(scale === 1);
+  outBtn.onclick = () => { scale = Math.max(0.25, +(scale - 0.25).toFixed(2)); applyZoom(false); };
+  inBtn.onclick = () => { scale = Math.min(3, +(scale + 0.25).toFixed(2)); applyZoom(false); };
+  resetBtn.onclick = () => { scale = 1; applyZoom(true); };
+  img.src = dataUrl; // set last so onload fires after listeners are attached
 }
 
 // ---------- X12 835 (electronic remittance) helpers ----------
@@ -440,6 +543,7 @@ function StatusPill({ status }) {
     "Open": "bg-sky-50 text-sky-700 border-sky-200",
     "Partial": "bg-amber-50 text-amber-700 border-amber-200",
     "Paid": "bg-emerald-50 text-emerald-700 border-emerald-200",
+    "Overpayment": "bg-violet-50 text-violet-700 border-violet-200",
     "Written off": "bg-slate-100 text-slate-500 border-slate-200",
     "Draft": "bg-slate-100 text-slate-600 border-slate-200",
     "Submitted": "bg-sky-50 text-sky-700 border-sky-200",
@@ -505,17 +609,23 @@ function SectionTitle({ children }) {
 }
 
 function FileDrop({ label, value, onChange }) {
+  const isPdf = typeof value === "string" && value.startsWith("data:application/pdf");
   async function handle(e) {
     const file = e.target.files?.[0];
     if (!file) return;
-    onChange(await fileToDataUrl(file));
+    // Second argument (the raw File) is optional — existing callers that only take the data URL are unaffected.
+    onChange(await fileToDataUrl(file), file);
   }
   return (
     <div className="mb-3">
       <span className="block text-xs font-medium text-slate-500 mb-1">{label}</span>
       {value ? (
         <div className="flex items-center gap-3 border border-slate-200 rounded-lg p-2">
-          <img src={value} alt={label} className="w-16 h-16 object-cover rounded-md border border-slate-200" />
+          {isPdf ? (
+            <div className="w-16 h-16 rounded-md bg-slate-100 flex items-center justify-center border border-slate-200"><FileText size={22} className="text-slate-400" /></div>
+          ) : (
+            <img src={value} alt={label} className="w-16 h-16 object-cover rounded-md border border-slate-200" />
+          )}
           <label className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 cursor-pointer hover:bg-teal-100">
             Replace
             <input type="file" accept="image/*,application/pdf" capture="environment" className="hidden" onChange={handle} />
@@ -922,8 +1032,18 @@ function ClinicApp({
     // Previous ID docs of the same type are archived, never deleted — history stays queryable.
     setIdDocuments(prev => prev.map(d => d.patientId === patientId && d.idType === doc.idType && d.status === "Active" ? { ...d, status: "Archived" } : d));
     const id = uid("DOC");
-    setIdDocuments(prev => [...prev, { id, patientId, status: "Active", uploadedBy: "Front Desk User", uploadedAt: nowIso(), ...doc }]);
+    setIdDocuments(prev => [...prev, { id, patientId, status: "Active", uploadedBy: session.name, uploadedAt: nowIso(), ...doc }]);
     addAudit(patientId, "ID uploaded", "document", id, null, `${doc.idType} ${doc.idNumber || ""}`.trim());
+  }
+
+  // Soft-delete: this app never hard-deletes records (everything is append-only, see addAudit
+  // callers throughout), so "Delete" archives the document instead — it drops off the active
+  // list but stays in history rather than vanishing without a trace.
+  function archiveIdDocument(patientId, docId) {
+    const doc = idDocuments.find(d => d.id === docId && d.patientId === patientId);
+    if (!doc || doc.status !== "Active") return;
+    setIdDocuments(prev => prev.map(d => d.id === docId ? { ...d, status: "Archived" } : d));
+    addAudit(patientId, "ID document deleted", "document", docId, "Active", `${doc.idType} ${doc.idNumber || ""}`.trim());
   }
 
   // ----- Patient-level memos (billing/admin notes, separate from per-charge follow-ups) -----
@@ -937,17 +1057,23 @@ function ClinicApp({
   // Shared apply step: bump paid/writeoff/credits, push a detailed posting record, log a global
   // transaction (for Reports) and an audit entry. Never overwrites prior postings — append-only.
   // Multiple entries (e.g. a payment plus its contractual write-off) are applied against one
-  // running balance so they can never together exceed the charge's remaining room.
+  // running balance. Write-offs/credits can never exceed the charge's remaining room, but a cash
+  // payment (field "paid") is posted in full even past that room — the charge is then legitimately
+  // overpaid and balanceOf() goes negative rather than silently truncating the payment.
   function postToChargeMulti(chargeId, entries) {
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
     let room = Math.max(0, target.charge - target.paid - target.writeoff - (target.credits || 0));
     const applied = [];
     entries.forEach(entry => {
-      const amt = Math.min(room, Math.max(0, Number(entry.amount) || 0));
+      const requested = Math.max(0, Number(entry.amount) || 0);
+      if (requested <= 0) return;
+      const amt = entry.field === "paid" ? requested : Math.min(room, requested);
       if (amt <= 0) return;
       room -= amt;
-      applied.push({ ...entry, amount: amt });
+      // Generated once and shared by the posting record and its transaction, so a later
+      // System Debit can look up and remove both by the same id.
+      applied.push({ ...entry, amount: amt, postingId: uid("PST") });
     });
     if (applied.length === 0) return;
     setCharges(prev => prev.map(c => {
@@ -956,10 +1082,10 @@ function ClinicApp({
       applied.forEach(e => { fieldDeltas[e.field] = (fieldDeltas[e.field] || 0) + e.amount; });
       const updated = { ...c };
       Object.entries(fieldDeltas).forEach(([field, delta]) => { updated[field] = (c[field] || 0) + delta; });
-      updated.postings = [...(c.postings || []), ...applied.map(e => ({ id: uid("PST"), amount: e.amount, debited: 0, postedBy: session.name, postedAt: nowIso(), ...e.posting }))];
+      updated.postings = [...(c.postings || []), ...applied.map(e => ({ id: e.postingId, field: e.field, amount: e.amount, debited: 0, postedBy: session.name, postedAt: nowIso(), ...e.posting }))];
       return updated;
     }));
-    setTransactions(prev => [...prev, ...applied.map(e => ({ id: uid("TXN"), chargeId, patientId: target.patientId, type: e.txnType, amount: e.amount, date: e.posting.date || TODAY, source: e.posting.insuranceName || e.posting.payer || e.posting.method || "Manual", reference: e.posting.reference || e.posting.checkNumber || "" }))]);
+    setTransactions(prev => [...prev, ...applied.map(e => ({ id: uid("TXN"), postingId: e.postingId, chargeId, patientId: target.patientId, type: e.txnType, amount: e.amount, date: e.posting.date || TODAY, source: e.posting.insuranceName || e.posting.payer || e.posting.method || "Manual", reference: e.posting.reference || e.posting.checkNumber || "" }))]);
     applied.forEach(e => addAudit(target.patientId, e.auditLabel, "charge", chargeId, null, `${money(e.amount)} — ${e.posting.notes || e.posting.type || ""}`.trim()));
   }
   function postToCharge(chargeId, entry) {
@@ -1059,11 +1185,32 @@ function ClinicApp({
 
   // Debits (reverses) part or all of a previously posted payment. Never edits the original
   // posting — appends a linked "Debit" posting and reduces paid/balance accordingly.
+  // System Debit is the exception: it's a correction for a posting that shouldn't have existed
+  // (mis-click, wrong patient, duplicate), not a business reversal — so it takes no reason and
+  // instead removes the original posting and its transaction outright, rather than leaving a
+  // credit/debit pair in the ledger history.
   function debitPosting(chargeId, postingId, form) {
     const target = charges.find(c => c.id === chargeId);
     const posting = target?.postings.find(p => p.id === postingId);
     if (!target || !posting) return;
     const debitable = Math.max(0, posting.amount - (posting.debited || 0));
+
+    if (form.systemDebit) {
+      if (debitable <= 0) return;
+      const field = posting.field || "paid";
+      setCharges(prev => prev.map(c => c.id === chargeId ? {
+        ...c,
+        [field]: Math.max(0, (c[field] || 0) - debitable),
+        postings: c.postings.filter(p => p.id !== postingId),
+        // Surfaced in Follow-up history too — that panel is what billing staff actually look at
+        // per DOS, and a removal like this shouldn't be visible only in the separate Audit History tab.
+        memos: [...(c.memos || []), { type: "System Debit", text: `System debited — ${posting.type} ${money(debitable)} removed from the ledger (no reason recorded).`, date: TODAY, user: session.name }],
+      } : c));
+      setTransactions(prev => prev.filter(t => t.postingId !== postingId));
+      addAudit(target.patientId, "System debit — posting removed", "charge", chargeId, `${posting.type} ${money(posting.amount)}`, "Removed entirely by system debit (no reason recorded)");
+      return;
+    }
+
     const applied = Math.min(debitable, Number(form.amount) || 0);
     if (applied <= 0) return;
 
@@ -1447,6 +1594,7 @@ function ClinicApp({
             onEndCoverage={endCoverage}
             onUploadCard={uploadInsuranceCard}
             onUploadIdDoc={(doc) => uploadIdDocument(billingPatientId, doc)}
+            onArchiveIdDoc={(docId) => archiveIdDocument(billingPatientId, docId)}
             onAddPatientMemo={(text) => addPatientMemo(billingPatientId, text)}
             onAddAppointment={addAppointment}
             onPostCheck={postCheckPayment}
@@ -1873,12 +2021,16 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
     }));
   }
 
+  const amtNum = Number(f.amount) || 0;
+  const willOverpay = amtNum > bal + BALANCE_EPSILON;
+
   function submit() {
     const amt = Number(f.amount) || 0;
     const writeoffAmt = Number(f.writeoff) || 0;
     if (!f.checkNumber.trim()) { setError("Check number is required."); return; }
     if (amt <= 0 && writeoffAmt <= 0) { setError("Enter a payment or write-off amount greater than 0."); return; }
-    if (amt + writeoffAmt > bal + 0.001) { setError(`Payment plus write-off can't exceed the remaining balance (${money(bal)}).`); return; }
+    // A payment may exceed the remaining balance (overpayment) — only the write-off can't.
+    if (writeoffAmt > Math.max(0, bal) + BALANCE_EPSILON) { setError(`Write-off can't exceed the remaining balance (${money(Math.max(0, bal))}).`); return; }
     if (writeoffAmt > 0 && !f.writeoffReason.trim()) { setError("A write-off reason is required."); return; }
     setError("");
     onSubmit({ ...f, amount: amt, writeoff: writeoffAmt, billedAmount: charge.charge });
@@ -1889,7 +2041,7 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
       <div className="flex items-center justify-between text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
         <span>Billed {money(charge.charge)}</span>
         <span>Adjusted {money(adjustedOf(charge))}</span>
-        <span className={bal > 0 ? "text-rose-600 font-medium" : "font-medium"}>Remaining {money(bal)}</span>
+        <span className={bal < -BALANCE_EPSILON ? "text-violet-700 font-medium" : bal > BALANCE_EPSILON ? "text-rose-600 font-medium" : "font-medium"}>Remaining {money(bal)}</span>
       </div>
 
       <SectionTitle>Payment</SectionTitle>
@@ -1901,9 +2053,14 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
             {policies.map(p => <option key={p.id} value={p.insuranceCompany}>{p.insuranceCompany}</option>)}
           </select>
         </Field>
-        <AmountField label={`Amount received (max ${money(bal)})`} value={f.amount} onChange={set("amount")} />
+        <AmountField label={`Amount received (balance ${money(bal)})`} value={f.amount} onChange={set("amount")} />
         <Field label="Payment date"><input type="date" className={inputCls} value={f.paymentDate} onChange={set("paymentDate")} /></Field>
       </div>
+      {willOverpay && (
+        <p className="text-xs text-violet-700 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2 mb-3">
+          This payment exceeds the remaining balance by {money(amtNum - bal)} — the charge will post as an <strong>overpayment</strong> with a negative balance instead of being capped at $0.00.
+        </p>
+      )}
 
       <SectionTitle>Claim posting (from EOB)</SectionTitle>
       <div className="flex items-end gap-2 mb-1">
@@ -2077,12 +2234,13 @@ function ElectronicRemittance({ claims, patientById, chargeById, onPostERA }) {
 function PatientBilling({
   patient, charges, claims, policies, idDocuments, auditLogs, patientMemos, appointments, allPatients, allCharges, patientById, patientCreditBalances, insuranceCreditBalances, session,
   onBack, onUpdatePatient, onAddCharge, onRecordPayment, onWriteOff, onRecode, onAddMemo, onGenerateClaim,
-  onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc,
+  onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc, onArchiveIdDoc,
   onAddPatientMemo, onAddAppointment, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit,
   onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp, onDebitPosting, onApplyCreditBalance,
 }) {
   const [pageTab, setPageTab] = useState("demography");
   const totalBalance = charges.reduce((s, c) => s + Math.max(0, balanceOf(c)), 0);
+  const totalOverpaid = charges.reduce((s, c) => s + Math.max(0, -balanceOf(c)), 0);
   const activePolicies = policies.filter(p => p.status === "Active").sort((a, b) => a.priority.localeCompare(b.priority));
 
   const pageTabs = [
@@ -2119,6 +2277,11 @@ function PatientBilling({
         <div className={`text-right ${totalBalance > 0 ? "text-rose-600" : "text-slate-700"}`}>
           <div className="text-2xl font-semibold">{money(totalBalance)}</div>
           <div className="text-xs text-slate-400">Total balance due</div>
+          {totalOverpaid > BALANCE_EPSILON && (
+            <div className="flex items-center justify-end gap-1 text-xs text-violet-700 font-medium mt-1">
+              <StatusPill status="Overpayment" /> {money(totalOverpaid)} owed back
+            </div>
+          )}
         </div>
       </div>
 
@@ -2164,7 +2327,12 @@ function PatientBilling({
       )}
 
       {pageTab === "documents" && (
-        <PatientIdDocuments documents={idDocuments} onUpload={onUploadIdDoc} />
+        <PatientIdDocuments
+          documents={idDocuments}
+          onUpload={onUploadIdDoc}
+          onArchive={onArchiveIdDoc}
+          canManage={["SUPER_ADMIN", "MANAGER", "BILLER"].includes(session.role)}
+        />
       )}
 
       {pageTab === "audit" && <AuditHistory auditLogs={auditLogs} />}
@@ -2315,6 +2483,7 @@ function ClaimLedgerTab({
 
   const totalCharge = charges.reduce((s, c) => s + c.charge, 0);
   const totalBalanceDue = charges.reduce((s, c) => s + Math.max(0, balanceOf(c)), 0);
+  const totalOverpayment = charges.reduce((s, c) => s + Math.max(0, -balanceOf(c)), 0);
   const myPatientCredits = patientCreditBalances.filter(c => c.patientId === patientId && c.remaining > 0);
   const relevantInsurerNames = new Set(policies.map(p => p.insuranceCompany));
   const myInsuranceCredits = insuranceCreditBalances.filter(c => relevantInsurerNames.has(c.insuranceName) && c.remaining > 0);
@@ -2338,15 +2507,17 @@ function ClaimLedgerTab({
         <h3 className="font-medium text-slate-700">DOS / claim summary</h3>
         <button onClick={() => setShowAddCharge(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Plus size={13} /> Add charge</button>
       </div>
-      <Card className="mb-6">
+      <Card className="mb-6 overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-xs text-slate-500 border-b border-slate-200 sticky top-0 bg-white">
               <th className="px-4 py-2.5 font-medium">DOS</th>
               <th className="px-4 py-2.5 font-medium">CPT</th>
               <th className="px-4 py-2.5 font-medium text-right">Charge</th>
-              <th className="px-4 py-2.5 font-medium text-right">Adjusted</th>
+              <th className="px-4 py-2.5 font-medium text-right">Payment</th>
+              <th className="px-4 py-2.5 font-medium text-right">Adjustment</th>
               <th className="px-4 py-2.5 font-medium text-right">Remaining balance</th>
+              <th className="px-4 py-2.5 font-medium">Status</th>
               <th className="px-4 py-2.5 font-medium">Physician</th>
               <th className="px-4 py-2.5 font-medium">Referral physician</th>
               <th className="px-4 py-2.5 font-medium">Payer</th>
@@ -2367,8 +2538,12 @@ function ClaimLedgerTab({
                   <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{c.dos}</td>
                   <td className="px-4 py-2.5 font-medium text-slate-800">{c.cpt}</td>
                   <td className="px-4 py-2.5 text-right">{money(c.charge)}</td>
-                  <td className="px-4 py-2.5 text-right text-emerald-700">{money(adjustedOf(c))}</td>
-                  <td className={`px-4 py-2.5 text-right font-medium ${bal > 0 ? "text-rose-600" : "text-slate-700"}`}>{money(bal)}</td>
+                  <td className="px-4 py-2.5 text-right text-emerald-700">{money(c.paid)}</td>
+                  <td className="px-4 py-2.5 text-right text-slate-500">{money(c.writeoff + (c.credits || 0))}</td>
+                  <td className={`px-4 py-2.5 text-right font-medium whitespace-nowrap ${bal < -BALANCE_EPSILON ? "text-violet-700" : bal > BALANCE_EPSILON ? "text-rose-600" : "text-slate-700"}`}>
+                    {money(bal)}
+                  </td>
+                  <td className="px-4 py-2.5"><StatusPill status={chargeStatus(c)} /></td>
                   <td className="px-4 py-2.5 text-slate-600">{c.provider}</td>
                   <td className="px-4 py-2.5 text-slate-500">{c.referralPhysician || "—"}</td>
                   <td className="px-4 py-2.5 text-slate-600">{payerLabel(c, policies)}</td>
@@ -2378,7 +2553,7 @@ function ClaimLedgerTab({
                 </tr>
               );
             })}
-            {sorted.length === 0 && <tr><td colSpan={9} className="px-4 py-6 text-center text-slate-400">No charges on file yet.</td></tr>}
+            {sorted.length === 0 && <tr><td colSpan={11} className="px-4 py-6 text-center text-slate-400">No charges on file yet.</td></tr>}
           </tbody>
         </table>
       </Card>
@@ -2395,6 +2570,11 @@ function ClaimLedgerTab({
         <Card className="p-3">
           <div className="text-xs text-slate-400">Balance due</div>
           <div className={`text-lg font-semibold ${totalBalanceDue > 0 ? "text-rose-600" : "text-slate-800"}`}>{money(totalBalanceDue)}</div>
+          {totalOverpayment > BALANCE_EPSILON && (
+            <div className="flex items-center gap-1 text-xs text-violet-700 font-medium mt-1">
+              <StatusPill status="Overpayment" /> {money(totalOverpayment)} owed back
+            </div>
+          )}
         </Card>
         <Card className="p-3">
           <div className="text-xs text-slate-400">Patient credit balance</div>
@@ -2563,7 +2743,16 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
           <div className="grid grid-cols-2 gap-y-2 text-sm">
             <div><span className="text-slate-400 text-xs block">Charge</span>{money(charge.charge)}</div>
             <div><span className="text-slate-400 text-xs block">Adjusted (paid + write-off + credit)</span>{money(adjustedOf(charge))}</div>
-            <div><span className="text-slate-400 text-xs block">Remaining balance</span><span className={balanceOf(charge) > 0 ? "text-rose-600 font-medium" : ""}>{money(balanceOf(charge))}</span></div>
+            <div className="col-span-2">
+              <span className="text-slate-400 text-xs block">Remaining balance</span>
+              <span className="flex items-center gap-2">
+                <span className={
+                  balanceOf(charge) < -BALANCE_EPSILON ? "text-violet-700 font-semibold" :
+                  balanceOf(charge) > BALANCE_EPSILON ? "text-rose-600 font-medium" : "text-slate-700"
+                }>{money(balanceOf(charge))}</span>
+                <StatusPill status={chargeStatus(charge)} />
+              </span>
+            </div>
           </div>
         </Card>
 
@@ -2571,9 +2760,9 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
           <SectionTitle>Follow-up history</SectionTitle>
           <div className="space-y-1.5 max-h-56 overflow-y-auto">
             {followUps.map((f, i) => (
-              <div key={i} className="text-xs border border-slate-100 rounded-lg px-2.5 py-2">
+              <div key={i} className={`text-xs border rounded-lg px-2.5 py-2 ${f.type === "System Debit" ? "border-rose-200 bg-rose-50" : "border-slate-100"}`}>
                 <div className="flex items-center justify-between text-slate-400 mb-0.5">
-                  <span>{f.type || "Note"} · {f.user}</span><span>{f.date}</span>
+                  <span className={f.type === "System Debit" ? "text-rose-600 font-medium" : ""}>{f.type || "Note"} · {f.user}</span><span>{f.date}</span>
                 </div>
                 <div className="text-slate-700">{f.text}</div>
                 {f.nextFollowUpDate && <div className="text-slate-400 mt-1">Next follow-up: {f.nextFollowUpDate}</div>}
@@ -2622,12 +2811,14 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
 function DebitPostingForm({ posting, max, onSubmit }) {
   const kind = postingPayerKind(posting);
   const debitTypeOptions = kind === "insurance" ? ["Insurance Refund", "Insurance Credit Balance"] : ["Patient Refund", "Patient Credit Balance"];
+  const [mode, setMode] = useState("debit"); // "debit" (reason required, keeps history) | "system" (no reason, removes the posting)
   const [f, setF] = useState({ amount: String(max), debitType: debitTypeOptions[0], reason: debitReasons[0], date: TODAY, notes: "" });
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
   function requestSubmit() {
+    if (mode === "system") { setError(""); setConfirming(true); return; }
     const amt = Number(f.amount);
     if (!amt || amt <= 0) { setError("Enter a debit amount greater than 0."); return; }
     if (amt > max) { setError(`Cannot debit more than ${money(max)} — the remaining amount on this posting.`); return; }
@@ -2635,16 +2826,24 @@ function DebitPostingForm({ posting, max, onSubmit }) {
     setConfirming(true);
   }
 
+  function confirmSubmit() {
+    onSubmit(mode === "system" ? { systemDebit: true } : f);
+  }
+
   if (confirming) {
     return (
       <div>
         <div className="flex items-center gap-2 text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5 mb-4 text-sm">
           <AlertTriangle size={16} className="shrink-0" />
-          <span>You're about to debit <strong>{money(Number(f.amount))}</strong> as <strong>{f.debitType}</strong> ({f.reason}). This reduces the recorded payment on this posting and cannot be undone. Continue?</span>
+          {mode === "system" ? (
+            <span>You're about to <strong>system debit</strong> this posting — <strong>{posting.type} {money(max)}</strong> posted {posting.date}. It will be removed entirely, along with its recorded payment — no reason is captured, and this cannot be undone.</span>
+          ) : (
+            <span>You're about to debit <strong>{money(Number(f.amount))}</strong> as <strong>{f.debitType}</strong> ({f.reason}). This reduces the recorded payment on this posting and cannot be undone. Continue?</span>
+          )}
         </div>
         <div className="flex gap-2">
           <button onClick={() => setConfirming(false)} className="flex-1 border border-slate-200 text-slate-600 text-sm font-medium py-2 rounded-lg hover:bg-slate-50">Go back</button>
-          <button onClick={() => onSubmit(f)} className="flex-1 bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">Confirm debit</button>
+          <button onClick={confirmSubmit} className="flex-1 bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">{mode === "system" ? "Confirm system debit" : "Confirm debit"}</button>
         </div>
       </div>
     );
@@ -2652,20 +2851,38 @@ function DebitPostingForm({ posting, max, onSubmit }) {
 
   return (
     <div>
+      <div className="flex items-center gap-1 mb-4 border border-slate-200 bg-white rounded-lg p-1 w-fit">
+        <button onClick={() => { setMode("debit"); setError(""); }} className={`px-3 py-1.5 text-sm rounded-md ${mode === "debit" ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>Debit</button>
+        <button onClick={() => { setMode("system"); setError(""); }} className={`px-3 py-1.5 text-sm rounded-md ${mode === "system" ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>System Debit</button>
+      </div>
+
       <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
         Debiting <strong>{posting.type}</strong> posted {posting.date} for {money(posting.amount)}. Up to <strong>{money(max)}</strong> is available to debit from this posting.
       </div>
-      <AmountField label={`Debit amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
-      <Field label="Debit type">
-        <select className={inputCls} value={f.debitType} onChange={set("debitType")}>{debitTypeOptions.map(o => <option key={o}>{o}</option>)}</select>
-      </Field>
-      <Field label="Reason">
-        <select className={inputCls} value={f.reason} onChange={set("reason")}>{debitReasons.map(r => <option key={r}>{r}</option>)}</select>
-      </Field>
-      <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
-      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
-      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
-      <button onClick={requestSubmit} className="w-full bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">Review debit</button>
+
+      {mode === "system" ? (
+        <>
+          <p className="text-xs text-slate-500 mb-3">
+            Use System Debit only to correct a posting that should never have existed — wrong patient, duplicate entry, mis-click. It removes this posting and its recorded payment entirely, for the full {money(max)} available. No reason is required, and no debit/credit pair is left behind in the ledger history.
+          </p>
+          {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+          <button onClick={requestSubmit} className="w-full bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">Review system debit</button>
+        </>
+      ) : (
+        <>
+          <AmountField label={`Debit amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+          <Field label="Debit type">
+            <select className={inputCls} value={f.debitType} onChange={set("debitType")}>{debitTypeOptions.map(o => <option key={o}>{o}</option>)}</select>
+          </Field>
+          <Field label="Reason">
+            <select className={inputCls} value={f.reason} onChange={set("reason")}>{debitReasons.map(r => <option key={r}>{r}</option>)}</select>
+          </Field>
+          <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
+          <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+          {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+          <button onClick={requestSubmit} className="w-full bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">Review debit</button>
+        </>
+      )}
     </div>
   );
 }
@@ -2688,7 +2905,7 @@ function ChargeActionDialog({ dialog, charge, policies, onClose, onPostCheck, on
       <div className="flex items-center justify-between text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
         <span>Charge {money(charge.charge)}</span>
         <span>Adjusted {money(adjustedOf(charge))}</span>
-        <span className={bal > 0 ? "text-rose-600 font-medium" : "font-medium"}>Remaining {money(bal)}</span>
+        <span className={bal < -BALANCE_EPSILON ? "text-violet-700 font-medium" : bal > BALANCE_EPSILON ? "text-rose-600 font-medium" : "font-medium"}>Remaining {money(bal)}</span>
       </div>
 
       {dialog.type === "check" && <CheckPaymentForm max={bal} onSubmit={(f) => { onPostCheck(charge.id, f); onClose(); }} />}
@@ -2785,7 +3002,12 @@ function CheckPaymentForm({ max, onSubmit }) {
   }
   return (
     <div>
-      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <AmountField label={`Payment amount (balance ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      {Number(f.amount) > max + BALANCE_EPSILON && (
+        <p className="text-xs text-violet-700 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2 mb-3">
+          This exceeds the remaining balance — it will post as an overpayment with a negative balance.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Check number"><input className={inputCls} value={f.checkNumber} onChange={set("checkNumber")} /></Field>
         <Field label="Check date"><input type="date" className={inputCls} value={f.checkDate} onChange={set("checkDate")} /></Field>
@@ -2813,7 +3035,12 @@ function CardPaymentForm({ max, onSubmit }) {
   return (
     <div>
       <p className="text-xs text-slate-400 mb-3">Only a reference/transaction number is stored — never a card number or CVV.</p>
-      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <AmountField label={`Payment amount (balance ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      {Number(f.amount) > max + BALANCE_EPSILON && (
+        <p className="text-xs text-violet-700 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2 mb-3">
+          This exceeds the remaining balance — it will post as an overpayment with a negative balance.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Payment date"><input type="date" className={inputCls} value={f.paymentDate} onChange={set("paymentDate")} /></Field>
         <Field label="Payer"><input className={inputCls} value={f.payer} onChange={set("payer")} /></Field>
@@ -2843,7 +3070,12 @@ function InsuranceCreditForm({ max, policies, onSubmit }) {
           {policies.length === 0 && <option value="">No policies on file</option>}
         </select>
       </Field>
-      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <AmountField label={`Payment amount (balance ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      {Number(f.amount) > max + BALANCE_EPSILON && (
+        <p className="text-xs text-violet-700 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2 mb-3">
+          This exceeds the remaining balance — it will post as an overpayment with a negative balance.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Check / EFT / ERA reference"><input className={inputCls} value={f.reference} onChange={set("reference")} /></Field>
         <Field label="Deposit date"><input type="date" className={inputCls} value={f.depositDate} onChange={set("depositDate")} /></Field>
@@ -2874,7 +3106,12 @@ function PatientCreditForm({ max, onSubmit }) {
   }
   return (
     <div>
-      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <AmountField label={`Payment amount (balance ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      {Number(f.amount) > max + BALANCE_EPSILON && (
+        <p className="text-xs text-violet-700 bg-violet-50 border border-violet-200 rounded-lg px-3 py-2 mb-3">
+          This exceeds the remaining balance — it will post as an overpayment with a negative balance.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Method">
           <select className={inputCls} value={f.method} onChange={set("method")}><option>Cash</option><option>Check</option><option>Credit Card</option><option>Debit Card</option><option>Online Payment</option></select>
@@ -3254,24 +3491,44 @@ function InsuranceForm({ initial, onSubmit, onUploadCard, isEdit }) {
 
 // ---------- Patient billing: ID Documents tab ----------
 
-function PatientIdDocuments({ documents, onUpload }) {
+function PatientIdDocuments({ documents, onUpload, onArchive, canManage }) {
   const [showAdd, setShowAdd] = useState(false);
+  const isPdf = (d) => d.fileType === "application/pdf" || (d.file || "").startsWith("data:application/pdf");
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-medium text-slate-700">ID documents</h3>
-        <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Upload size={13} /> Upload ID</button>
+        {canManage && <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Upload size={13} /> Upload ID document</button>}
       </div>
       <div className="grid grid-cols-2 gap-3">
         {documents.map(d => (
-          <Card key={d.id} className="p-3 flex items-center gap-3">
-            {d.file ? <img src={d.file} className="w-14 h-14 object-cover rounded-md border border-slate-200" /> : <div className="w-14 h-14 rounded-md bg-slate-100 flex items-center justify-center"><FileText size={18} className="text-slate-400" /></div>}
-            <div className="flex-1">
-              <div className="text-sm font-medium text-slate-800">{d.idType}</div>
-              <div className="text-xs text-slate-500">#{d.idNumber} · exp {d.expirationDate || "—"}</div>
-              <div className="text-xs text-slate-400">Uploaded {d.uploadedAt?.slice(0, 10)} by {d.uploadedBy}</div>
+          <Card key={d.id} className="p-3">
+            <div className="flex items-center gap-3">
+              {isPdf(d) ? (
+                <div className="w-14 h-14 rounded-md bg-slate-100 flex items-center justify-center shrink-0"><FileText size={18} className="text-slate-400" /></div>
+              ) : d.file ? (
+                <img src={d.file} alt="" className="w-14 h-14 object-cover rounded-md border border-slate-200 shrink-0" />
+              ) : (
+                <div className="w-14 h-14 rounded-md bg-slate-100 flex items-center justify-center shrink-0"><IdCard size={18} className="text-slate-400" /></div>
+              )}
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium text-slate-800 truncate">{d.fileName || d.idType}</div>
+                <div className="text-xs text-slate-500">{d.idType} · #{d.idNumber} · exp {d.expirationDate || "—"}</div>
+                <div className="text-xs text-slate-400">Uploaded {d.uploadedAt?.slice(0, 10)} by {d.uploadedBy}</div>
+                <div className="text-xs text-slate-400">{d.fileType || "Unknown type"} · {formatFileSize(d.fileSize)}</div>
+              </div>
+              <StatusPill status={d.status} />
             </div>
-            <StatusPill status={d.status} />
+            <div className="flex items-center gap-2 mt-2.5 pt-2.5 border-t border-slate-100">
+              <button onClick={() => openIdDocumentViewerWindow(d)} disabled={!d.file} className="flex items-center gap-1 text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2.5 py-1 hover:bg-teal-100 disabled:opacity-40">
+                <Eye size={12} /> View
+              </button>
+              {canManage && d.status === "Active" && (
+                <button onClick={() => onArchive(d.id)} className="flex items-center gap-1 text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1 hover:bg-rose-100">
+                  <Trash2 size={12} /> Delete
+                </button>
+              )}
+            </div>
           </Card>
         ))}
         {documents.length === 0 && <p className="text-sm text-slate-400 col-span-2">No ID documents on file.</p>}
@@ -3286,11 +3543,11 @@ function PatientIdDocuments({ documents, onUpload }) {
 }
 
 function IdDocForm({ onSubmit }) {
-  const [form, setForm] = useState({ idType: idTypes[0], idNumber: "", issuingState: "NY", issueDate: "", expirationDate: "", file: null });
+  const [form, setForm] = useState({ idType: idTypes[0], idNumber: "", issuingState: "NY", issueDate: "", expirationDate: "", file: null, fileName: "", fileType: "", fileSize: null });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const [error, setError] = useState("");
   function submit() {
-    if (!form.file) { setError("Upload or scan an image of the ID first."); return; }
+    if (!form.file) { setError("Upload or scan an image or PDF of the ID first."); return; }
     setError(""); onSubmit(form);
   }
   return (
@@ -3304,7 +3561,11 @@ function IdDocForm({ onSubmit }) {
         <Field label="Issue date"><input type="date" className={inputCls} value={form.issueDate} onChange={set("issueDate")} /></Field>
         <Field label="Expiration date"><input type="date" className={inputCls} value={form.expirationDate} onChange={set("expirationDate")} /></Field>
       </div>
-      <FileDrop label="ID image" value={form.file} onChange={(dataUrl) => setForm({ ...form, file: dataUrl })} />
+      <FileDrop
+        label="ID image or PDF"
+        value={form.file}
+        onChange={(dataUrl, file) => setForm({ ...form, file: dataUrl, fileName: file?.name || form.fileName, fileType: file?.type || form.fileType, fileSize: file ? file.size : form.fileSize })}
+      />
       <p className="text-xs text-slate-400 mb-3">OCR isn't wired up in this prototype — enter fields manually and confirm before saving.</p>
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
       <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Save document</button>
