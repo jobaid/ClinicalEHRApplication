@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import Papa from "papaparse";
 import {
   LayoutDashboard, CalendarDays, Users, Receipt, FileStack, BarChart3,
@@ -44,6 +44,11 @@ const seedPatients = [
 ];
 
 const providers = ["Dr. S. Reyes", "Dr. A. Okafor", "Dr. M. Lin"];
+
+// CMS-1500-style claim fields — practice defaults, prefilled but editable per charge.
+const PRACTICE_INFO = { name: "Jobaid Clinic", address: "400 Harbor Way, Bellerose, NY 11426", taxId: "13-5551234" };
+const providerNPI = { "Dr. S. Reyes": "1912345678", "Dr. A. Okafor": "1923456789", "Dr. M. Lin": "1934567890" };
+const emptyDxCodes = () => Array(10).fill("");
 
 // ---------- Auth / RBAC (demo only — see LoginPage/Forbidden for the honesty caveat) ----------
 // This gates the UI so each role sees the right nav, matching the permission matrix in the spec.
@@ -143,6 +148,25 @@ const seedAuditLogs = [
 
 const seedIdDocuments = [];
 
+// Patient-level billing/admin memos (distinct from per-charge follow-ups)
+const seedPatientMemos = [
+  { id: "PMEMO-1001", patientId: "P1004", text: "Patient requested itemized statement for tax purposes.", user: "Marcus Webb", date: "2026-08-12" },
+];
+
+const followUpTypes = ["Call", "Note", "Letter", "Portal message", "Other"];
+const followUpStatuses = ["Open", "Resolved"];
+
+// Debiting (reversing) a posted payment — reasons shown in the debit dialog
+const debitReasons = ["System Debit", "Overpayment", "Insurance Recall", "Posting Error", "Duplicate Payment", "Refund Request", "Patient Dispute", "Incorrect Posting", "Other"];
+
+// A posting is "insurance-sourced" if it's an Insurance Credit, or a Check/other posting
+// that names an insurer; everything else (Patient Credit, Card, unattributed Check) is patient-sourced.
+function postingPayerKind(posting) {
+  if (posting.type === "Insurance Credit") return "insurance";
+  if (posting.type === "Check" && posting.insuranceName) return "insurance";
+  return "patient";
+}
+
 // ---------- Clinical charting (EHR-lite: vitals, allergies, medications, problems, notes) ----------
 
 const allergySeverities = ["Mild", "Moderate", "Severe", "Unknown"];
@@ -188,12 +212,12 @@ const seedAppointments = [
 
 // Charges = the patient ledger. One row per CPT code / date of service.
 const seedCharges = [
-  { id: "C5001", patientId: "P1001", dos: "2026-08-10", provider: providers[0], cpt: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, paid: 0, writeoff: 0, memos: [] },
-  { id: "C5002", patientId: "P1004", dos: "2026-08-05", provider: providers[2], cpt: "99214", desc: "Office visit, established patient (moderate complexity)", charge: 165, paid: 0, writeoff: 0, memos: [{ date: "2026-08-06", text: "Claim denied for missing modifier. Follow up with Aetna." }] },
-  { id: "C5003", patientId: "P1004", dos: "2026-08-05", provider: providers[2], cpt: "80053", desc: "Comprehensive metabolic panel", charge: 48, paid: 0, writeoff: 0, memos: [] },
-  { id: "C5004", patientId: "P1003", dos: "2026-08-15", provider: providers[0], cpt: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, paid: 65, writeoff: 0, memos: [] },
-  { id: "C5005", patientId: "P1002", dos: "2026-08-01", provider: providers[1], cpt: "99385", desc: "Preventive visit, new patient (18-39y)", charge: 190, paid: 190, writeoff: 0, memos: [] },
-  { id: "C5006", patientId: "P1006", dos: "2026-08-18", provider: providers[1], cpt: "90471", desc: "Immunization administration", charge: 35, paid: 0, writeoff: 0, memos: [{ date: "2026-08-19", text: "Call patient re: self-pay balance next visit." }] },
+  { id: "C5001", patientId: "P1001", dos: "2026-08-10", provider: providers[0], referralPhysician: "", cpt: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, paid: 0, writeoff: 0, credits: 0, memos: [], postings: [], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[0]], diagnosisCodes: ["M54.5", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
+  { id: "C5002", patientId: "P1004", dos: "2026-08-05", provider: providers[2], referralPhysician: "Dr. K. Nunez", cpt: "99214", desc: "Office visit, established patient (moderate complexity)", charge: 165, paid: 0, writeoff: 0, credits: 0, memos: [{ date: "2026-08-06", text: "Claim denied for missing modifier. Follow up with Aetna.", user: "System (seed)", type: "Note", status: "Open", nextFollowUpDate: "2026-08-13" }], postings: [], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[2]], diagnosisCodes: ["E11.9", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
+  { id: "C5003", patientId: "P1004", dos: "2026-08-05", provider: providers[2], referralPhysician: "Dr. K. Nunez", cpt: "80053", desc: "Comprehensive metabolic panel", charge: 48, paid: 0, writeoff: 0, credits: 0, memos: [], postings: [], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[2]], diagnosisCodes: ["E11.9", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
+  { id: "C5004", patientId: "P1003", dos: "2026-08-15", provider: providers[0], referralPhysician: "", cpt: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, paid: 65, writeoff: 0, credits: 0, memos: [], postings: [{ id: "PST-9001", type: "Patient Credit", amount: 65, debited: 0, date: "2026-08-15", method: "Credit Card", reference: "TXN-88213", notes: "", postedBy: "Front Desk User", postedAt: "2026-08-15T10:00:00" }], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[0]], diagnosisCodes: ["J06.9", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
+  { id: "C5005", patientId: "P1002", dos: "2026-08-01", provider: providers[1], referralPhysician: "", cpt: "99385", desc: "Preventive visit, new patient (18-39y)", charge: 190, paid: 190, writeoff: 0, credits: 0, memos: [], postings: [{ id: "PST-9002", type: "Insurance Credit", amount: 190, debited: 0, date: "2026-08-02", insuranceName: "UnitedHealthcare", checkNumber: "", depositDate: "2026-08-03", reference: "EFT00293841", copay: "0", coinsurance: "0", deductible: "0", allowedAmount: "190", notes: "", postedBy: "System (seed)", postedAt: "2026-08-02T09:00:00" }], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[1]], diagnosisCodes: ["Z00.00", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
+  { id: "C5006", patientId: "P1006", dos: "2026-08-18", provider: providers[1], referralPhysician: "", cpt: "90471", desc: "Immunization administration", charge: 35, paid: 0, writeoff: 0, credits: 0, memos: [{ date: "2026-08-19", text: "Call patient re: self-pay balance next visit.", user: "System (seed)", type: "Call", status: "Open", nextFollowUpDate: "2026-08-26" }], postings: [], chargeInsuranceId: null, payerOverride: "self", facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[1]], diagnosisCodes: ["Z23", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
 ];
 
 const seedClaims = [
@@ -262,13 +286,19 @@ function printReport() {
 const money = (n) => Number(n || 0).toLocaleString("en-US", { style: "currency", currency: "USD" });
 const maskSSN = (ssn) => ssn ? `***-**-${ssn.slice(-4)}` : "—";
 const uid = (prefix) => `${prefix}${Math.floor(1000 + Math.random() * 9000)}`;
-const balanceOf = (c) => c.charge - c.paid - c.writeoff;
+const adjustedOf = (c) => c.paid + c.writeoff + (c.credits || 0);
+const balanceOf = (c) => c.charge - c.paid - c.writeoff - (c.credits || 0);
 const chargeStatus = (c) => {
   const bal = balanceOf(c);
-  if (bal <= 0 && c.writeoff > 0 && c.paid === 0) return "Written off";
+  if (bal <= 0 && c.writeoff > 0 && c.paid === 0 && (c.credits || 0) === 0) return "Written off";
   if (bal <= 0) return "Paid";
-  if (c.paid > 0 || c.writeoff > 0) return "Partial";
+  if (c.paid > 0 || c.writeoff > 0 || (c.credits || 0) > 0) return "Partial";
   return "Open";
+};
+const payerLabel = (c, policies) => {
+  if (c.payerOverride === "self") return "Self / Patient";
+  const pol = c.chargeInsuranceId ? policies.find(p => p.id === c.chargeInsuranceId) : null;
+  return pol ? pol.insuranceCompany : "Unassigned";
 };
 
 function nowIso() { return TODAY + "T" + new Date().toTimeString().slice(0, 8); }
@@ -580,25 +610,159 @@ function Forbidden({ onBack }) {
   );
 }
 
+// ---------- Storage adapter ----------
+// window.storage only exists inside the claude.ai artifact preview. A real deployment
+// (e.g. this file dropped into your own Vite project) has no such API — there, we fall
+// back to plain localStorage, which works fine in an actual browser.
+const storageAdapter = {
+  async get(key) {
+    if (typeof window !== "undefined" && window.storage && typeof window.storage.get === "function") {
+      try {
+        const r = await window.storage.get(key, false);
+        return r ? r.value : null;
+      } catch (e) { return null; }
+    }
+    try { return window.localStorage.getItem(key); } catch (e) { return null; }
+  },
+  async set(key, value) {
+    if (typeof window !== "undefined" && window.storage && typeof window.storage.set === "function") {
+      try { await window.storage.set(key, value, false); return; } catch (e) { /* fall through */ }
+    }
+    try { window.localStorage.setItem(key, value); } catch (e) { /* storage unavailable */ }
+  },
+  async remove(key) {
+    if (typeof window !== "undefined" && window.storage && typeof window.storage.delete === "function") {
+      try { await window.storage.delete(key, false); return; } catch (e) { /* fall through */ }
+    }
+    try { window.localStorage.removeItem(key); } catch (e) { /* storage unavailable */ }
+  },
+};
+
+const SESSION_KEY = "clinic_session";
+const NAV_KEY = "clinic_nav";
+const IDLE_LIMIT_MS = 2 * 60 * 60 * 1000; // 2 hours
+const SESSION_WRITE_THROTTLE_MS = 60 * 1000; // don't hammer storage on every click/keystroke
+
 export default function ClinicBilling() {
   const [session, setSession] = useState(null);
+  const [checkingSession, setCheckingSession] = useState(true); // avoids a login-page flash on refresh
   const [loginAudit, setLoginAudit] = useState([]); // lightweight system-level log (login/logout aren't tied to a patient)
+  const lastActivityRef = useRef(Date.now());
+  const lastWriteRef = useRef(0);
+
+  // Top-level navigation state lives here (not inside ClinicApp) so it can be persisted
+  // and restored on refresh — "keep me where I was," not just "keep me logged in."
+  const [tab, setTab] = useState("dashboard");
+  const [billingPatientId, setBillingPatientId] = useState(null);
+  const [billingMode, setBillingMode] = useState("search");
+  const [clinicalPatientId, setClinicalPatientId] = useState(null);
+  const navRestored = useRef(false);
+
+  // On mount: restore a still-valid session AND the last navigation position from storage.
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await storageAdapter.get(SESSION_KEY);
+        if (raw) {
+          const saved = JSON.parse(raw);
+          if (saved?.lastActivity && Date.now() - saved.lastActivity < IDLE_LIMIT_MS) {
+            setSession(saved);
+            lastActivityRef.current = Date.now();
+          } else {
+            await storageAdapter.remove(SESSION_KEY);
+          }
+        }
+      } catch (e) { /* no valid session — show login */ }
+
+      try {
+        const rawNav = await storageAdapter.get(NAV_KEY);
+        if (rawNav) {
+          const nav = JSON.parse(rawNav);
+          if (nav.tab) setTab(nav.tab);
+          if (nav.billingPatientId !== undefined) setBillingPatientId(nav.billingPatientId);
+          if (nav.billingMode) setBillingMode(nav.billingMode);
+          if (nav.clinicalPatientId !== undefined) setClinicalPatientId(nav.clinicalPatientId);
+        }
+      } catch (e) { /* no saved position — default to Dashboard */ }
+      navRestored.current = true;
+
+      setCheckingSession(false);
+    })();
+  }, []);
+
+  // Persist navigation position whenever it changes (skip the very first render so we
+  // don't immediately overwrite a just-restored position with the pre-restore defaults).
+  useEffect(() => {
+    if (!navRestored.current) return;
+    storageAdapter.set(NAV_KEY, JSON.stringify({ tab, billingPatientId, billingMode, clinicalPatientId }));
+  }, [tab, billingPatientId, billingMode, clinicalPatientId]);
+
+  async function persistSession(sess) {
+    await storageAdapter.set(SESSION_KEY, JSON.stringify(sess));
+  }
 
   function handleLogin(user) {
-    setSession(user);
+    const sess = { email: user.email, name: user.name, role: user.role, loginAt: Date.now(), lastActivity: Date.now() };
+    setSession(sess);
+    lastActivityRef.current = Date.now();
+    lastWriteRef.current = Date.now();
+    persistSession(sess);
     setLoginAudit(prev => [{ id: uid("SYS"), action: "Login", user: user.name, role: user.role, timestamp: nowIso() }, ...prev]);
   }
-  function handleLogout() {
-    setLoginAudit(prev => [{ id: uid("SYS"), action: "Logout", user: session?.name, role: session?.role, timestamp: nowIso() }, ...prev]);
+
+  async function handleLogout(reason) {
+    setLoginAudit(prev => [{ id: uid("SYS"), action: reason === "timeout" ? "Session expired (2h inactivity)" : "Logout", user: session?.name, role: session?.role, timestamp: nowIso() }, ...prev]);
     setSession(null);
+    await storageAdapter.remove(SESSION_KEY);
+    // Deliberately keep NAV_KEY on manual logout/timeout so the next login for this browser
+    // returns to the same place — only a fresh "start over" would need to clear it.
   }
 
+  // Track activity (click/keydown/mousemove/scroll) and check idle time every 30s.
+  useEffect(() => {
+    if (!session) return;
+    function markActivity() {
+      lastActivityRef.current = Date.now();
+      if (Date.now() - lastWriteRef.current > SESSION_WRITE_THROTTLE_MS) {
+        lastWriteRef.current = Date.now();
+        persistSession({ ...session, lastActivity: lastActivityRef.current });
+      }
+    }
+    const events = ["click", "keydown", "mousemove", "scroll"];
+    events.forEach(ev => window.addEventListener(ev, markActivity, { passive: true }));
+
+    const idleCheck = setInterval(() => {
+      if (Date.now() - lastActivityRef.current >= IDLE_LIMIT_MS) {
+        handleLogout("timeout");
+      }
+    }, 30 * 1000);
+
+    return () => {
+      events.forEach(ev => window.removeEventListener(ev, markActivity));
+      clearInterval(idleCheck);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
+
+  if (checkingSession) {
+    return <div className="min-h-[700px] flex items-center justify-center bg-slate-50 text-slate-400 text-sm font-sans">Loading…</div>;
+  }
   if (!session) return <LoginPage onLogin={handleLogin} />;
-  return <ClinicApp session={session} onLogout={handleLogout} />;
+  return (
+    <ClinicApp
+      session={session} onLogout={() => handleLogout("manual")}
+      tab={tab} setTab={setTab}
+      billingPatientId={billingPatientId} setBillingPatientId={setBillingPatientId}
+      billingMode={billingMode} setBillingMode={setBillingMode}
+      clinicalPatientId={clinicalPatientId} setClinicalPatientId={setClinicalPatientId}
+    />
+  );
 }
 
-function ClinicApp({ session, onLogout }) {
-  const [tab, setTab] = useState("dashboard");
+function ClinicApp({
+  session, onLogout,
+  tab, setTab, billingPatientId, setBillingPatientId, billingMode, setBillingMode, clinicalPatientId, setClinicalPatientId,
+}) {
   const [patients, setPatients] = useState(seedPatients);
   const [appointments, setAppointments] = useState(seedAppointments);
   const [charges, setCharges] = useState(seedCharges);
@@ -607,6 +771,10 @@ function ClinicApp({ session, onLogout }) {
   const [policies, setPolicies] = useState(seedInsurancePolicies);
   const [auditLogs, setAuditLogs] = useState(seedAuditLogs);
   const [idDocuments, setIdDocuments] = useState(seedIdDocuments);
+  const [patientMemos, setPatientMemos] = useState(seedPatientMemos);
+  // Credit balance pools created by "Credit Balance"-type debits — usable against any patient's charges.
+  const [patientCreditBalances, setPatientCreditBalances] = useState([]);
+  const [insuranceCreditBalances, setInsuranceCreditBalances] = useState([]);
   const [vitals, setVitals] = useState(seedVitals);
   const [allergies, setAllergies] = useState(seedAllergies);
   const [medications, setMedications] = useState(seedMedications);
@@ -616,13 +784,6 @@ function ClinicApp({ session, onLogout }) {
   const [showAddPatient, setShowAddPatient] = useState(false);
   const [showAddAppt, setShowAddAppt] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState(null);
-
-  // Billing drill-down: null = list view, otherwise a patientId
-  const [billingPatientId, setBillingPatientId] = useState(null);
-  // Billing sub-view when no patient is selected: 'search' or 'post'
-  const [billingMode, setBillingMode] = useState("search");
-  // Clinical drill-down: null = patient list, otherwise a patientId
-  const [clinicalPatientId, setClinicalPatientId] = useState(null);
 
   const patientById = useMemo(() => Object.fromEntries(patients.map(p => [p.id, p])), [patients]);
   const chargeById = useMemo(() => Object.fromEntries(charges.map(c => [c.id, c])), [charges]);
@@ -749,6 +910,159 @@ function ClinicApp({ session, onLogout }) {
     addAudit(patientId, "ID uploaded", "document", id, null, `${doc.idType} ${doc.idNumber || ""}`.trim());
   }
 
+  // ----- Patient-level memos (billing/admin notes, separate from per-charge follow-ups) -----
+  function addPatientMemo(patientId, text) {
+    const id = uid("PMEMO");
+    setPatientMemos(prev => [...prev, { id, patientId, text, user: session.name, date: TODAY }]);
+    addAudit(patientId, "Memo added", "memo", id, null, text);
+  }
+
+  // ----- Claim / Ledger: posting a transaction onto a specific DOS charge -----
+  // Shared apply step: bump paid/writeoff/credits, push a detailed posting record, log a global
+  // transaction (for Reports) and an audit entry. Never overwrites prior postings — append-only.
+  function postToCharge(chargeId, { field, amount, posting, txnType, auditLabel }) {
+    const target = charges.find(c => c.id === chargeId);
+    if (!target) return;
+    const room = Math.max(0, target.charge - target.paid - target.writeoff - (target.credits || 0));
+    const applied = Math.min(room, amount);
+    if (applied <= 0) return;
+    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, [field]: (c[field] || 0) + applied, postings: [...(c.postings || []), { id: uid("PST"), amount: applied, debited: 0, postedBy: session.name, postedAt: nowIso(), ...posting }] } : c));
+    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId, patientId: target.patientId, type: txnType, amount: applied, date: posting.date || TODAY, source: posting.insuranceName || posting.payer || posting.method || "Manual", reference: posting.reference || posting.checkNumber || "" }]);
+    addAudit(target.patientId, auditLabel, "charge", chargeId, null, `${money(applied)} — ${posting.notes || posting.type || ""}`.trim());
+  }
+
+  function postCheckPayment(chargeId, form) {
+    postToCharge(chargeId, {
+      field: "paid", amount: Number(form.amount) || 0, txnType: "payment", auditLabel: "Check payment posted",
+      posting: { type: "Check", payer: form.payer, insuranceName: form.insurance, checkNumber: form.checkNumber, checkDate: form.checkDate, depositDate: form.depositDate, date: form.paymentDate, notes: form.notes },
+    });
+  }
+  function postCreditCardPayment(chargeId, form) {
+    postToCharge(chargeId, {
+      field: "paid", amount: Number(form.amount) || 0, txnType: "payment", auditLabel: "Card payment posted",
+      posting: { type: "Credit Card", payer: form.payer, reference: form.reference, date: form.paymentDate, notes: form.notes },
+    });
+  }
+  function postInsuranceCredit(chargeId, form) {
+    postToCharge(chargeId, {
+      field: "paid", amount: Number(form.amount) || 0, txnType: "payment", auditLabel: "Insurance payment posted",
+      posting: { type: "Insurance Credit", insuranceName: form.insuranceName, reference: form.reference, depositDate: form.depositDate, date: form.paymentDate, notes: form.notes, copay: form.copay, coinsurance: form.coinsurance, deductible: form.deductible, allowedAmount: form.allowedAmount },
+    });
+  }
+  function postPatientCredit(chargeId, form) {
+    postToCharge(chargeId, {
+      field: "paid", amount: Number(form.amount) || 0, txnType: "payment", auditLabel: "Patient payment posted",
+      posting: { type: "Patient Credit", method: form.method, reference: form.reference, date: form.date, notes: form.notes },
+    });
+  }
+  function writeOffDOS(chargeId, form) {
+    postToCharge(chargeId, {
+      field: "writeoff", amount: Number(form.amount) || 0, txnType: "writeoff", auditLabel: "Write-off posted",
+      posting: { type: "Write-off", reason: form.reason, date: form.date, notes: form.notes },
+    });
+  }
+  function creditDOS(chargeId, form) {
+    postToCharge(chargeId, {
+      field: "credits", amount: Number(form.amount) || 0, txnType: "writeoff", auditLabel: "DOS credit posted",
+      posting: { type: "Credit", reason: form.reason, date: form.date, notes: form.notes },
+    });
+  }
+
+  function selectInsuranceForCharge(chargeId, policyId) {
+    const target = charges.find(c => c.id === chargeId);
+    if (!target) return;
+    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, chargeInsuranceId: policyId, payerOverride: null } : c));
+    const pol = policies.find(p => p.id === policyId);
+    addAudit(target.patientId, "Claim payer changed", "charge", chargeId, payerLabel(target, policies), pol ? pol.insuranceCompany : "Unassigned");
+  }
+  function setSelfPayForCharge(chargeId) {
+    const target = charges.find(c => c.id === chargeId);
+    if (!target) return;
+    // Insurance association is preserved, not cleared — only the payer display/override changes.
+    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, payerOverride: "self" } : c));
+    addAudit(target.patientId, "Claim payer changed", "charge", chargeId, payerLabel(target, policies), "Self / Patient");
+  }
+  function editClaimFields(chargeId, updates) {
+    const target = charges.find(c => c.id === chargeId);
+    if (!target) return;
+    const changed = Object.keys(updates).filter(k => target[k] !== updates[k]);
+    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, ...updates } : c));
+    if (changed.length) addAudit(target.patientId, "Claim updated", "charge", chargeId, changed.map(k => `${k}: ${target[k]}`).join("; "), changed.map(k => `${k}: ${updates[k]}`).join("; "));
+  }
+  function addFollowUp(chargeId, entry) {
+    const target = charges.find(c => c.id === chargeId);
+    if (!target) return;
+    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, memos: [...c.memos, { ...entry, user: session.name }] } : c));
+    addAudit(target.patientId, "Follow-up added", "charge", chargeId, null, `${entry.type}: ${entry.text}`);
+  }
+
+  // Debits (reverses) part or all of a previously posted payment. Never edits the original
+  // posting — appends a linked "Debit" posting and reduces paid/balance accordingly.
+  function debitPosting(chargeId, postingId, form) {
+    const target = charges.find(c => c.id === chargeId);
+    const posting = target?.postings.find(p => p.id === postingId);
+    if (!target || !posting) return;
+    const debitable = Math.max(0, posting.amount - (posting.debited || 0));
+    const applied = Math.min(debitable, Number(form.amount) || 0);
+    if (applied <= 0) return;
+
+    const debitId = uid("PST");
+    setCharges(prev => prev.map(c => {
+      if (c.id !== chargeId) return c;
+      return {
+        ...c,
+        paid: Math.max(0, c.paid - applied),
+        postings: [
+          ...c.postings.map(p => p.id === postingId ? { ...p, debited: (p.debited || 0) + applied } : p),
+          { id: debitId, type: "Debit", debitType: form.debitType, reason: form.reason, amount: applied, date: form.date, notes: form.notes, reversalOf: postingId, postedBy: session.name, postedAt: nowIso() },
+        ],
+      };
+    }));
+    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId, patientId: target.patientId, type: "debit", amount: applied, date: form.date || TODAY, source: form.debitType, reference: form.reason }]);
+    addAudit(target.patientId, "Payment debited", "charge", chargeId, `${posting.type} ${money(posting.amount)}`, `${money(applied)} debited — ${form.reason} (${form.debitType})`);
+
+    // "Credit Balance" debits keep the money in the practice as an applicable credit pool;
+    // "Refund" debits pay it back out and create no pool entry.
+    if (form.debitType === "Patient Credit Balance") {
+      setPatientCreditBalances(prev => [...prev, { id: uid("PCB"), patientId: target.patientId, amount: applied, remaining: applied, reason: form.reason, date: form.date, sourceChargeId: chargeId, sourcePostingId: debitId, createdBy: session.name, createdAt: nowIso() }]);
+    }
+    if (form.debitType === "Insurance Credit Balance") {
+      const insuranceName = posting.insuranceName || "Unspecified insurer";
+      setInsuranceCreditBalances(prev => [...prev, { id: uid("ICB"), insuranceName, patientId: target.patientId, amount: applied, remaining: applied, reason: form.reason, date: form.date, sourceChargeId: chargeId, sourcePostingId: debitId, createdBy: session.name, createdAt: nowIso() }]);
+    }
+  }
+
+  // Applies an existing credit-balance pool entry (patient- or insurance-sourced) as a payment
+  // toward any patient's open charge — including a different patient than the one who generated it.
+  function applyCreditBalance(poolType, creditId, targetChargeId, amount) {
+    const pool = poolType === "patient" ? patientCreditBalances : insuranceCreditBalances;
+    const credit = pool.find(c => c.id === creditId);
+    const targetCharge = charges.find(c => c.id === targetChargeId);
+    if (!credit || !targetCharge) return;
+    const room = Math.max(0, targetCharge.charge - targetCharge.paid - targetCharge.writeoff - (targetCharge.credits || 0));
+    const applied = Math.min(credit.remaining, room, Number(amount) || 0);
+    if (applied <= 0) return;
+
+    const setPool = poolType === "patient" ? setPatientCreditBalances : setInsuranceCreditBalances;
+    setPool(prev => prev.map(c => c.id === creditId ? { ...c, remaining: c.remaining - applied } : c));
+
+    const postingId = uid("PST");
+    setCharges(prev => prev.map(c => c.id === targetChargeId ? {
+      ...c, paid: c.paid + applied,
+      postings: [...(c.postings || []), {
+        id: postingId, type: poolType === "patient" ? "Patient Credit" : "Insurance Credit", amount: applied, debited: 0,
+        notes: `Applied from ${poolType === "patient" ? "patient" : credit.insuranceName} credit balance (${credit.reason}, originally on charge ${credit.sourceChargeId})`,
+        insuranceName: poolType === "insurance" ? credit.insuranceName : undefined,
+        date: TODAY, postedBy: session.name, postedAt: nowIso(),
+      }],
+    } : c));
+    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId: targetChargeId, patientId: targetCharge.patientId, type: "payment", amount: applied, date: TODAY, source: poolType === "patient" ? "Patient credit balance" : `${credit.insuranceName} credit balance`, reference: credit.id }]);
+    addAudit(targetCharge.patientId, "Credit balance applied", "charge", targetChargeId, null, `${money(applied)} applied from ${poolType} credit balance (source: ${patientById[credit.patientId]?.name || credit.patientId})`);
+    if (credit.patientId !== targetCharge.patientId) {
+      addAudit(credit.patientId, "Credit balance used elsewhere", "credit", creditId, null, `${money(applied)} of this patient's credit balance applied to ${patientById[targetCharge.patientId]?.name || targetCharge.patientId}'s account`);
+    }
+  }
+
   // ----- Clinical charting -----
   function addVital(patientId, entry) {
     const id = uid("VIT");
@@ -814,7 +1128,13 @@ function ClinicApp({ session, onLogout }) {
 
   function addCharge(patientId, entry) {
     const id = uid("C");
-    setCharges(prev => [...prev, { id, patientId, paid: 0, writeoff: 0, memos: [], ...entry }]);
+    setCharges(prev => [...prev, {
+      id, patientId, paid: 0, writeoff: 0, credits: 0, memos: [], postings: [],
+      chargeInsuranceId: primaryPolicyByPatient[patientId]?.id || null, payerOverride: null, referralPhysician: "",
+      facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId,
+      npi: "", diagnosisCodes: emptyDxCodes(), ndc: "", units: 1, time: "",
+      ...entry,
+    }]);
     setTransactions(prev => [...prev, { id: uid("TXN"), chargeId: id, patientId, type: "charge", amount: entry.charge, date: entry.dos, source: "", reference: "" }]);
   }
 
@@ -853,9 +1173,12 @@ function ClinicApp({ session, onLogout }) {
   function generateClaimFromCharge(charge) {
     if (claims.some(c => c.chargeId === charge.id)) return;
     const primary = primaryPolicyByPatient[charge.patientId];
+    const primaryDx = (charge.diagnosisCodes || []).find(d => d) || "";
     const newClaim = {
       id: uid("CLM-7"), patientId: charge.patientId, chargeId: charge.id,
-      payer: primary ? primary.insuranceCompany : "Self-pay", cpt: charge.cpt, dx: "", amount: charge.charge, submitted: "", status: "Draft",
+      payer: primary ? primary.insuranceCompany : "Self-pay", cpt: charge.cpt, dx: primaryDx, amount: charge.charge, submitted: "", status: "Draft",
+      npi: charge.npi || "", facilityName: charge.facilityName || PRACTICE_INFO.name, taxId: charge.taxId || PRACTICE_INFO.taxId,
+      units: charge.units || 1, diagnosisCodes: charge.diagnosisCodes || emptyDxCodes(),
     };
     setClaims(prev => [...prev, newClaim]);
     setTab("claims");
@@ -1068,6 +1391,14 @@ function ClinicApp({ session, onLogout }) {
             policies={policies.filter(p => p.patientId === billingPatientId)}
             idDocuments={idDocuments.filter(d => d.patientId === billingPatientId)}
             auditLogs={auditLogs.filter(a => a.patientId === billingPatientId)}
+            patientMemos={patientMemos.filter(m => m.patientId === billingPatientId)}
+            appointments={appointments.filter(a => a.patientId === billingPatientId)}
+            allPatients={patients}
+            allCharges={charges}
+            patientById={patientById}
+            patientCreditBalances={patientCreditBalances}
+            insuranceCreditBalances={insuranceCreditBalances}
+            session={session}
             onBack={() => setBillingPatientId(null)}
             onUpdatePatient={(updates) => updatePatient(billingPatientId, updates)}
             onAddCharge={(entry) => addCharge(billingPatientId, entry)}
@@ -1082,6 +1413,20 @@ function ClinicApp({ session, onLogout }) {
             onEndCoverage={endCoverage}
             onUploadCard={uploadInsuranceCard}
             onUploadIdDoc={(doc) => uploadIdDocument(billingPatientId, doc)}
+            onAddPatientMemo={(text) => addPatientMemo(billingPatientId, text)}
+            onAddAppointment={addAppointment}
+            onPostCheck={postCheckPayment}
+            onPostCard={postCreditCardPayment}
+            onPostInsuranceCredit={postInsuranceCredit}
+            onPostPatientCredit={postPatientCredit}
+            onWriteOffDOS={writeOffDOS}
+            onCreditDOS={creditDOS}
+            onSelectChargeInsurance={selectInsuranceForCharge}
+            onSetSelfPay={setSelfPayForCharge}
+            onEditClaimFields={editClaimFields}
+            onAddFollowUp={addFollowUp}
+            onDebitPosting={debitPosting}
+            onApplyCreditBalance={applyCreditBalance}
           />
         )}
 
@@ -1610,23 +1955,23 @@ function ElectronicRemittance({ claims, patientById, chargeById, onPostERA }) {
 
 // ---------- Billing: individual patient account ----------
 
-function PatientBilling({ patient, charges, claims, policies, idDocuments, auditLogs, onBack, onUpdatePatient, onAddCharge, onRecordPayment, onWriteOff, onRecode, onAddMemo, onGenerateClaim, onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc }) {
-  const [pageTab, setPageTab] = useState("ledger");
-  const [editingDemo, setEditingDemo] = useState(false);
-  const [demoForm, setDemoForm] = useState(patient);
-  const [showAddCharge, setShowAddCharge] = useState(false);
-  const [manageChargeId, setManageChargeId] = useState(null);
-
+function PatientBilling({
+  patient, charges, claims, policies, idDocuments, auditLogs, patientMemos, appointments, allPatients, allCharges, patientById, patientCreditBalances, insuranceCreditBalances, session,
+  onBack, onUpdatePatient, onAddCharge, onRecordPayment, onWriteOff, onRecode, onAddMemo, onGenerateClaim,
+  onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc,
+  onAddPatientMemo, onAddAppointment, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit,
+  onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp, onDebitPosting, onApplyCreditBalance,
+}) {
+  const [pageTab, setPageTab] = useState("demography");
   const totalBalance = charges.reduce((s, c) => s + Math.max(0, balanceOf(c)), 0);
-  const hasClaim = (chargeId) => claims.some(cl => cl.chargeId === chargeId);
-  const manageCharge = charges.find(c => c.id === manageChargeId);
   const activePolicies = policies.filter(p => p.status === "Active").sort((a, b) => a.priority.localeCompare(b.priority));
 
-  function saveDemo() { onUpdatePatient(demoForm); setEditingDemo(false); }
-
   const pageTabs = [
-    { id: "ledger", label: "Ledger & demographics", icon: Receipt },
+    { id: "demography", label: "Demography", icon: Users },
     { id: "insurance", label: "Insurance", icon: Shield },
+    { id: "memo", label: "Memo", icon: MessageSquarePlus },
+    { id: "claimledger", label: "Claim / Ledger", icon: Receipt },
+    { id: "appointment", label: "Appointment", icon: CalendarDays },
     { id: "documents", label: "ID Documents", icon: IdCard },
     { id: "audit", label: "Audit History", icon: History },
   ];
@@ -1637,10 +1982,12 @@ function PatientBilling({ patient, charges, claims, policies, idDocuments, audit
         <ChevronLeft size={15} /> Back to billing search
       </button>
 
+      {/* Patient context header — stays visible across every secondary-nav section */}
       <div className="flex items-start justify-between mb-4">
         <div>
+          <div className="text-xs text-slate-400 mb-0.5">Patient</div>
           <h1 className="text-xl font-semibold text-slate-800">{patient.name}</h1>
-          <p className="text-xs text-slate-500">{patient.id} · DOB {patient.dob}</p>
+          <p className="text-xs text-slate-500">MRN {patient.id} · DOB {patient.dob}</p>
           <div className="flex gap-1.5 mt-1.5">
             {activePolicies.map(pol => (
               <span key={pol.id} className="flex items-center gap-1 text-xs bg-slate-50 border border-slate-200 rounded-full px-2 py-0.5">
@@ -1656,113 +2003,19 @@ function PatientBilling({ patient, charges, claims, policies, idDocuments, audit
         </div>
       </div>
 
-      <div className="flex items-center gap-1 mb-5 border border-slate-200 bg-white rounded-lg p-1 w-fit">
+      {/* Secondary navigation — belongs to the selected patient */}
+      <div className="flex items-center gap-1 mb-5 border border-slate-200 bg-white rounded-lg p-1 w-fit flex-wrap">
         {pageTabs.map(t => {
           const Icon = t.icon;
           return (
-            <button key={t.id} onClick={() => setPageTab(t.id)} className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md ${pageTab === t.id ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>
+            <button key={t.id} onClick={() => setPageTab(t.id)} className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md whitespace-nowrap ${pageTab === t.id ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>
               <Icon size={14} /> {t.label}
             </button>
           );
         })}
       </div>
 
-      {pageTab === "ledger" && (
-        <div>
-          <Card className="p-4 mb-6">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-medium text-slate-700">Demographics</h3>
-              {!editingDemo ? (
-                <button onClick={() => { setDemoForm(patient); setEditingDemo(true); }} className="text-xs text-teal-700 flex items-center gap-1"><Pencil size={12} /> Edit</button>
-              ) : (
-                <div className="flex gap-2">
-                  <button onClick={saveDemo} className="text-xs text-teal-700 font-medium">Save</button>
-                  <button onClick={() => setEditingDemo(false)} className="text-xs text-slate-400">Cancel</button>
-                </div>
-              )}
-            </div>
-            {!editingDemo ? (
-              <div className="grid grid-cols-4 gap-y-3 text-sm">
-                <div><span className="text-slate-400 text-xs block">Name</span>{patient.name}</div>
-                <div><span className="text-slate-400 text-xs block">DOB</span>{patient.dob}</div>
-                <div><span className="text-slate-400 text-xs block">Phone</span>{patient.phone}</div>
-                <div><span className="text-slate-400 text-xs block">Email</span>{patient.email}</div>
-                <div><span className="text-slate-400 text-xs block">SSN</span>{maskSSN(patient.ssn)}</div>
-                <div><span className="text-slate-400 text-xs block">Address</span>{patient.address}, {patient.city}, {patient.state} {patient.zip}</div>
-                <div><span className="text-slate-400 text-xs block">Emergency contact</span>{patient.emergencyContact?.name} ({patient.emergencyContact?.relationship}) {patient.emergencyContact?.phone}</div>
-                <div><span className="text-slate-400 text-xs block">Guarantor</span>{patient.guarantor?.name} · {patient.guarantor?.employer}</div>
-              </div>
-            ) : (
-              <div className="grid grid-cols-4 gap-3">
-                <Field label="Name"><input className={inputCls} value={demoForm.name} onChange={(e) => setDemoForm({ ...demoForm, name: e.target.value })} /></Field>
-                <Field label="DOB"><input type="date" className={inputCls} value={demoForm.dob} onChange={(e) => setDemoForm({ ...demoForm, dob: e.target.value })} /></Field>
-                <Field label="Phone"><input className={inputCls} value={demoForm.phone} onChange={(e) => setDemoForm({ ...demoForm, phone: e.target.value })} /></Field>
-                <Field label="Email"><input className={inputCls} value={demoForm.email} onChange={(e) => setDemoForm({ ...demoForm, email: e.target.value })} /></Field>
-                <Field label="SSN"><input className={inputCls} value={demoForm.ssn || ""} onChange={(e) => setDemoForm({ ...demoForm, ssn: e.target.value })} /></Field>
-                <Field label="Address"><input className={inputCls} value={demoForm.address || ""} onChange={(e) => setDemoForm({ ...demoForm, address: e.target.value })} /></Field>
-                <Field label="City"><input className={inputCls} value={demoForm.city || ""} onChange={(e) => setDemoForm({ ...demoForm, city: e.target.value })} /></Field>
-                <Field label="State"><input className={inputCls} value={demoForm.state || ""} onChange={(e) => setDemoForm({ ...demoForm, state: e.target.value })} /></Field>
-              </div>
-            )}
-          </Card>
-
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="font-medium text-slate-700">Charge ledger</h3>
-            <button onClick={() => setShowAddCharge(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700">
-              <Plus size={13} /> Add charge
-            </button>
-          </div>
-
-          <Card>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
-                  <th className="px-4 py-2.5 font-medium">DOS</th>
-                  <th className="px-4 py-2.5 font-medium">CPT</th>
-                  <th className="px-4 py-2.5 font-medium">Description</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Charge</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Paid</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Write-off</th>
-                  <th className="px-4 py-2.5 font-medium text-right">Balance</th>
-                  <th className="px-4 py-2.5 font-medium">Status</th>
-                  <th className="px-4 py-2.5 font-medium">Memo</th>
-                  <th className="px-4 py-2.5 font-medium">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {charges.sort((a, b) => b.dos.localeCompare(a.dos)).map(c => {
-                  const bal = balanceOf(c);
-                  const lastMemo = c.memos[c.memos.length - 1];
-                  return (
-                    <tr key={c.id} className="border-b border-slate-100 last:border-0 align-top">
-                      <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{c.dos}</td>
-                      <td className="px-4 py-2.5 font-medium text-slate-800">{c.cpt}</td>
-                      <td className="px-4 py-2.5 text-slate-600 max-w-[160px]">{c.desc}</td>
-                      <td className="px-4 py-2.5 text-right">{money(c.charge)}</td>
-                      <td className="px-4 py-2.5 text-right text-emerald-700">{money(c.paid)}</td>
-                      <td className="px-4 py-2.5 text-right text-slate-500">{money(c.writeoff)}</td>
-                      <td className={`px-4 py-2.5 text-right font-medium ${bal > 0 ? "text-rose-600" : "text-slate-700"}`}>{money(bal)}</td>
-                      <td className="px-4 py-2.5"><StatusPill status={chargeStatus(c)} /></td>
-                      <td className="px-4 py-2.5 text-xs text-slate-500 max-w-[140px]">{lastMemo ? lastMemo.text : "—"}</td>
-                      <td className="px-4 py-2.5">
-                        <div className="flex flex-col gap-1">
-                          <button onClick={() => setManageChargeId(c.id)} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 hover:bg-teal-100 text-left">Manage</button>
-                          {!hasClaim(c.id) && (
-                            <button onClick={() => onGenerateClaim(c)} className="text-xs text-sky-700 border border-sky-200 bg-sky-50 rounded-lg px-2 py-1 hover:bg-sky-100 text-left">Generate claim</button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {charges.length === 0 && (
-                  <tr><td colSpan={10} className="px-4 py-6 text-center text-slate-400">No charges on file yet.</td></tr>
-                )}
-              </tbody>
-            </table>
-          </Card>
-        </div>
-      )}
+      {pageTab === "demography" && <DemographyTab patient={patient} onUpdatePatient={onUpdatePatient} />}
 
       {pageTab === "insurance" && (
         <PatientInsuranceTab
@@ -1772,30 +2025,915 @@ function PatientBilling({ patient, charges, claims, policies, idDocuments, audit
         />
       )}
 
+      {pageTab === "memo" && <MemoTab memos={patientMemos} onAdd={onAddPatientMemo} />}
+
+      {pageTab === "claimledger" && (
+        <ClaimLedgerTab
+          patientId={patient.id} charges={charges} allCharges={allCharges} allPatients={allPatients} patientById={patientById}
+          claims={claims} policies={policies} session={session}
+          patientCreditBalances={patientCreditBalances} insuranceCreditBalances={insuranceCreditBalances}
+          onAddCharge={onAddCharge} onGenerateClaim={onGenerateClaim}
+          onPostCheck={onPostCheck} onPostCard={onPostCard} onPostInsuranceCredit={onPostInsuranceCredit} onPostPatientCredit={onPostPatientCredit}
+          onWriteOffDOS={onWriteOffDOS} onCreditDOS={onCreditDOS}
+          onSelectChargeInsurance={onSelectChargeInsurance} onSetSelfPay={onSetSelfPay}
+          onEditClaimFields={onEditClaimFields} onAddFollowUp={onAddFollowUp} onDebitPosting={onDebitPosting} onApplyCreditBalance={onApplyCreditBalance}
+        />
+      )}
+
+      {pageTab === "appointment" && (
+        <AppointmentTab appointments={appointments} patient={patient} allPatients={allPatients} onAdd={onAddAppointment} />
+      )}
+
       {pageTab === "documents" && (
         <PatientIdDocuments documents={idDocuments} onUpload={onUploadIdDoc} />
       )}
 
       {pageTab === "audit" && <AuditHistory auditLogs={auditLogs} />}
+    </div>
+  );
+}
+
+// ---------- Patient billing: Demography tab ----------
+
+function DemographyTab({ patient, onUpdatePatient }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState(patient);
+  function save() { onUpdatePatient(form); setEditing(false); }
+
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-medium text-slate-700">Demographics</h3>
+        {!editing ? (
+          <button onClick={() => { setForm(patient); setEditing(true); }} className="text-xs text-teal-700 flex items-center gap-1"><Pencil size={12} /> Edit</button>
+        ) : (
+          <div className="flex gap-2">
+            <button onClick={save} className="text-xs text-teal-700 font-medium">Save</button>
+            <button onClick={() => setEditing(false)} className="text-xs text-slate-400">Cancel</button>
+          </div>
+        )}
+      </div>
+      {!editing ? (
+        <div className="grid grid-cols-4 gap-y-3 text-sm">
+          <div><span className="text-slate-400 text-xs block">Name</span>{patient.name}</div>
+          <div><span className="text-slate-400 text-xs block">DOB</span>{patient.dob}</div>
+          <div><span className="text-slate-400 text-xs block">Phone</span>{patient.phone}</div>
+          <div><span className="text-slate-400 text-xs block">Email</span>{patient.email}</div>
+          <div><span className="text-slate-400 text-xs block">SSN</span>{maskSSN(patient.ssn)}</div>
+          <div><span className="text-slate-400 text-xs block">Address</span>{patient.address}, {patient.city}, {patient.state} {patient.zip}</div>
+          <div><span className="text-slate-400 text-xs block">Emergency contact</span>{patient.emergencyContact?.name} ({patient.emergencyContact?.relationship}) {patient.emergencyContact?.phone}</div>
+          <div><span className="text-slate-400 text-xs block">Guarantor</span>{patient.guarantor?.name} · {patient.guarantor?.employer}</div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-4 gap-3">
+          <Field label="Name"><input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
+          <Field label="DOB"><input type="date" className={inputCls} value={form.dob} onChange={(e) => setForm({ ...form, dob: e.target.value })} /></Field>
+          <Field label="Phone"><input className={inputCls} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
+          <Field label="Email"><input className={inputCls} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+          <Field label="SSN"><input className={inputCls} value={form.ssn || ""} onChange={(e) => setForm({ ...form, ssn: e.target.value })} /></Field>
+          <Field label="Address"><input className={inputCls} value={form.address || ""} onChange={(e) => setForm({ ...form, address: e.target.value })} /></Field>
+          <Field label="City"><input className={inputCls} value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} /></Field>
+          <Field label="State"><input className={inputCls} value={form.state || ""} onChange={(e) => setForm({ ...form, state: e.target.value })} /></Field>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ---------- Patient billing: Memo tab (patient-level, distinct from per-DOS follow-ups) ----------
+
+function MemoTab({ memos, onAdd }) {
+  const [text, setText] = useState("");
+  const sorted = [...memos].sort((a, b) => b.date.localeCompare(a.date));
+  function submit() {
+    if (!text.trim()) return;
+    onAdd(text.trim());
+    setText("");
+  }
+  return (
+    <div>
+      <Card className="p-4 mb-4">
+        <h3 className="font-medium text-slate-700 mb-2">Add a memo</h3>
+        <textarea className={`${inputCls} h-20 resize-none`} placeholder="Billing/administrative note about this patient…" value={text} onChange={(e) => setText(e.target.value)} />
+        <button onClick={submit} className="mt-2 bg-teal-600 text-white text-sm font-medium px-4 py-2 rounded-lg hover:bg-teal-700">Save memo</button>
+      </Card>
+      <div className="space-y-2">
+        {sorted.map(m => (
+          <Card key={m.id} className="p-3">
+            <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+              <span>{m.user}</span><span>{m.date}</span>
+            </div>
+            <p className="text-sm text-slate-700">{m.text}</p>
+          </Card>
+        ))}
+        {sorted.length === 0 && <p className="text-sm text-slate-400">No memos on file for this patient.</p>}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Patient billing: Appointment tab ----------
+
+function AppointmentTab({ appointments, patient, allPatients, onAdd }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const sorted = [...appointments].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-medium text-slate-700">Appointments</h3>
+        <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Plus size={13} /> New appointment</button>
+      </div>
+      <Card>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+              <th className="px-4 py-2.5 font-medium">Date</th><th className="px-4 py-2.5 font-medium">Time</th>
+              <th className="px-4 py-2.5 font-medium">Provider</th><th className="px-4 py-2.5 font-medium">Type</th><th className="px-4 py-2.5 font-medium">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(a => (
+              <tr key={a.id} className="border-b border-slate-100 last:border-0">
+                <td className="px-4 py-2.5 text-slate-600">{a.date}</td>
+                <td className="px-4 py-2.5 text-slate-600">{a.time}</td>
+                <td className="px-4 py-2.5 text-slate-600">{a.provider}</td>
+                <td className="px-4 py-2.5 text-slate-600">{a.type}</td>
+                <td className="px-4 py-2.5"><StatusPill status={a.status} /></td>
+              </tr>
+            ))}
+            {sorted.length === 0 && <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-400">No appointments on file.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+      {showAdd && (
+        <Modal title="New appointment" onClose={() => setShowAdd(false)}>
+          <AddApptForm patients={[patient, ...allPatients.filter(p => p.id !== patient.id)]} onSubmit={(entry) => { onAdd(entry); setShowAdd(false); }} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------- Patient billing: Claim / Ledger tab ----------
+// Div 1 = DOS/claim summary table (left-click selects, right-click opens the custom context menu).
+// Div 2 = per-DOS posting/payment/follow-up detail for whichever charge is selected.
+
+function ClaimLedgerTab({
+  patientId, charges, allCharges, allPatients, patientById, claims, policies, session, onAddCharge, onGenerateClaim,
+  onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit,
+  onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp, onDebitPosting,
+  patientCreditBalances, insuranceCreditBalances, onApplyCreditBalance,
+}) {
+  const [selectedId, setSelectedId] = useState(charges[0]?.id || null);
+  const [menu, setMenu] = useState(null); // { x, y, chargeId }
+  const [showAddCharge, setShowAddCharge] = useState(false);
+  const [dialog, setDialog] = useState(null); // { type, chargeId }
+  const [applyPool, setApplyPool] = useState(null); // 'patient' | 'insurance' | null
+
+  const sorted = [...charges].sort((a, b) => b.dos.localeCompare(a.dos));
+  const selected = charges.find(c => c.id === selectedId) || sorted[0];
+  const hasClaim = (chargeId) => claims.some(cl => cl.chargeId === chargeId);
+
+  const totalCharge = charges.reduce((s, c) => s + c.charge, 0);
+  const totalBalanceDue = charges.reduce((s, c) => s + Math.max(0, balanceOf(c)), 0);
+  const myPatientCredits = patientCreditBalances.filter(c => c.patientId === patientId && c.remaining > 0);
+  const relevantInsurerNames = new Set(policies.map(p => p.insuranceCompany));
+  const myInsuranceCredits = insuranceCreditBalances.filter(c => relevantInsurerNames.has(c.insuranceName) && c.remaining > 0);
+  const patientCreditTotal = myPatientCredits.reduce((s, c) => s + c.remaining, 0);
+  const insuranceCreditTotal = myInsuranceCredits.reduce((s, c) => s + c.remaining, 0);
+
+  function openMenu(e, chargeId) {
+    e.preventDefault();
+    const wrapWidth = 220, wrapHeight = 340;
+    const x = Math.min(e.clientX, window.innerWidth - wrapWidth - 12);
+    const y = Math.min(e.clientY, window.innerHeight - wrapHeight - 12);
+    setMenu({ x, y, chargeId });
+  }
+
+  function closeMenuAnd(fn) { setMenu(null); if (fn) fn(); }
+
+  return (
+    <div onClick={() => menu && setMenu(null)}>
+      {/* ---------- DIV 1: DOS / claim summary ---------- */}
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-medium text-slate-700">DOS / claim summary</h3>
+        <button onClick={() => setShowAddCharge(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Plus size={13} /> Add charge</button>
+      </div>
+      <Card className="mb-6">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200 sticky top-0 bg-white">
+              <th className="px-4 py-2.5 font-medium">DOS</th>
+              <th className="px-4 py-2.5 font-medium">CPT</th>
+              <th className="px-4 py-2.5 font-medium text-right">Charge</th>
+              <th className="px-4 py-2.5 font-medium text-right">Adjusted</th>
+              <th className="px-4 py-2.5 font-medium text-right">Remaining balance</th>
+              <th className="px-4 py-2.5 font-medium">Physician</th>
+              <th className="px-4 py-2.5 font-medium">Referral physician</th>
+              <th className="px-4 py-2.5 font-medium">Payer</th>
+              <th className="px-4 py-2.5 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(c => {
+              const bal = balanceOf(c);
+              const isSelected = selected && c.id === selected.id;
+              return (
+                <tr
+                  key={c.id}
+                  onClick={() => setSelectedId(c.id)}
+                  onContextMenu={(e) => { e.stopPropagation(); openMenu(e, c.id); }}
+                  className={`border-b border-slate-100 last:border-0 cursor-pointer select-none ${isSelected ? "bg-teal-50/70" : "hover:bg-slate-50"}`}
+                >
+                  <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{c.dos}</td>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{c.cpt}</td>
+                  <td className="px-4 py-2.5 text-right">{money(c.charge)}</td>
+                  <td className="px-4 py-2.5 text-right text-emerald-700">{money(adjustedOf(c))}</td>
+                  <td className={`px-4 py-2.5 text-right font-medium ${bal > 0 ? "text-rose-600" : "text-slate-700"}`}>{money(bal)}</td>
+                  <td className="px-4 py-2.5 text-slate-600">{c.provider}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{c.referralPhysician || "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-600">{payerLabel(c, policies)}</td>
+                  <td className="px-4 py-2.5">
+                    <button onClick={(e) => { e.stopPropagation(); openMenu(e, c.id); }} className="text-slate-400 hover:text-slate-700 px-1" title="More actions (or right-click the row)">⋯</button>
+                  </td>
+                </tr>
+              );
+            })}
+            {sorted.length === 0 && <tr><td colSpan={9} className="px-4 py-6 text-center text-slate-400">No charges on file yet.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+
+      {/* ---------- DIV 2: per-DOS details ---------- */}
+      {selected && <PerDosDetails charge={selected} claims={claims} policies={policies} hasClaim={hasClaim(selected.id)} onGenerateClaim={onGenerateClaim} onDebitPosting={onDebitPosting} />}
+
+      {/* ---------- Bottom summary: totals + applicable credit balances ---------- */}
+      <div className="grid grid-cols-4 gap-3 mt-6">
+        <Card className="p-3">
+          <div className="text-xs text-slate-400">Total charge</div>
+          <div className="text-lg font-semibold text-slate-800">{money(totalCharge)}</div>
+        </Card>
+        <Card className="p-3">
+          <div className="text-xs text-slate-400">Balance due</div>
+          <div className={`text-lg font-semibold ${totalBalanceDue > 0 ? "text-rose-600" : "text-slate-800"}`}>{money(totalBalanceDue)}</div>
+        </Card>
+        <Card className="p-3">
+          <div className="text-xs text-slate-400">Patient credit balance</div>
+          <div className="flex items-center justify-between">
+            <div className="text-lg font-semibold text-emerald-700">{money(patientCreditTotal)}</div>
+            {patientCreditTotal > 0 && <button onClick={() => setApplyPool("patient")} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 hover:bg-teal-100">Apply</button>}
+          </div>
+        </Card>
+        <Card className="p-3">
+          <div className="text-xs text-slate-400">Insurance credit balance</div>
+          <div className="flex items-center justify-between">
+            <div className="text-lg font-semibold text-emerald-700">{money(insuranceCreditTotal)}</div>
+            {insuranceCreditTotal > 0 && <button onClick={() => setApplyPool("insurance")} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 hover:bg-teal-100">Apply</button>}
+          </div>
+        </Card>
+      </div>
+
+      {menu && (
+        <DOSContextMenu
+          x={menu.x} y={menu.y}
+          onClose={() => setMenu(null)}
+          onAction={(type) => closeMenuAnd(() => setDialog({ type, chargeId: menu.chargeId }))}
+        />
+      )}
 
       {showAddCharge && (
-        <Modal title="Add charge" onClose={() => setShowAddCharge(false)}>
+        <Modal title="Add charge" onClose={() => setShowAddCharge(false)} wide>
           <AddChargeForm onSubmit={(entry) => { onAddCharge(entry); setShowAddCharge(false); }} />
         </Modal>
       )}
 
-      {manageCharge && (
-        <Modal title={`Manage charge · ${manageCharge.cpt} on ${manageCharge.dos}`} onClose={() => setManageChargeId(null)}>
-          <ManageChargeForm
-            charge={manageCharge}
-            onRecordPayment={(amt) => onRecordPayment(manageCharge.id, amt)}
-            onWriteOff={(amt) => onWriteOff(manageCharge.id, amt)}
-            onRecode={(code) => onRecode(manageCharge.id, code)}
-            onAddMemo={(text) => onAddMemo(manageCharge.id, text)}
-            onClose={() => setManageChargeId(null)}
+      {dialog && (
+        <ChargeActionDialog
+          dialog={dialog}
+          charge={charges.find(c => c.id === dialog.chargeId)}
+          policies={policies}
+          onClose={() => setDialog(null)}
+          onPostCheck={onPostCheck} onPostCard={onPostCard} onPostInsuranceCredit={onPostInsuranceCredit} onPostPatientCredit={onPostPatientCredit}
+          onWriteOffDOS={onWriteOffDOS} onCreditDOS={onCreditDOS}
+          onSelectChargeInsurance={onSelectChargeInsurance} onSetSelfPay={onSetSelfPay} onEditClaimFields={onEditClaimFields} onAddFollowUp={onAddFollowUp}
+        />
+      )}
+
+      {applyPool && (
+        <Modal title={`Apply ${applyPool === "patient" ? "patient" : "insurance"} credit balance`} onClose={() => setApplyPool(null)} wide>
+          <ApplyCreditBalanceForm
+            poolType={applyPool}
+            credits={applyPool === "patient" ? myPatientCredits : myInsuranceCredits}
+            allCharges={allCharges} allPatients={allPatients} patientById={patientById}
+            onSubmit={(creditId, targetChargeId, amount) => { onApplyCreditBalance(applyPool, creditId, targetChargeId, amount); setApplyPool(null); }}
+            onClose={() => setApplyPool(null)}
           />
         </Modal>
       )}
+    </div>
+  );
+}
+
+function DOSContextMenu({ x, y, onClose, onAction }) {
+  const [paymentOpen, setPaymentOpen] = useState(true);
+
+  React.useEffect(() => {
+    function handleKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [onClose]);
+
+  const itemCls = "w-full text-left px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50 rounded-md flex items-center gap-2";
+
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      style={{ position: "fixed", left: x, top: y, width: 220, zIndex: 100 }}
+      className="bg-white border border-slate-200 rounded-xl shadow-xl p-1.5"
+    >
+      <button onClick={() => setPaymentOpen(o => !o)} className={itemCls + " font-medium justify-between"}>
+        <span className="flex items-center gap-2"><CreditCard size={13} /> Post Payment</span>
+        <span className="text-slate-400">{paymentOpen ? "▾" : "▸"}</span>
+      </button>
+      {paymentOpen && (
+        <div className="pl-4 border-l border-slate-100 ml-3 mb-1">
+          <button onClick={() => onAction("check")} className={itemCls}>Check</button>
+          <button onClick={() => onAction("card")} className={itemCls}>Credit Card</button>
+          <button onClick={() => onAction("insurance")} className={itemCls}>Insurance Credit</button>
+          <button onClick={() => onAction("patient")} className={itemCls}>Patient Credit</button>
+        </div>
+      )}
+      <div className="border-t border-slate-100 my-1" />
+      <button onClick={() => onAction("writeoff")} className={itemCls}><ScissorsLineDashed size={13} /> Write Off</button>
+      <button onClick={() => onAction("creditdos")} className={itemCls}><TrendingDown size={13} /> Credit Date of Service</button>
+      <button onClick={() => onAction("selectinsurance")} className={itemCls}><Shield size={13} /> Select Insurance</button>
+      <button onClick={() => onAction("self")} className={itemCls}><Users size={13} /> Self</button>
+      <div className="border-t border-slate-100 my-1" />
+      <button onClick={() => onAction("editclaim")} className={itemCls}><Pencil size={13} /> Edit Claim</button>
+      <button onClick={() => onAction("followup")} className={itemCls}><MessageSquarePlus size={13} /> Add Follow-Up</button>
+    </div>
+  );
+}
+
+function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, onDebitPosting }) {
+  const latestPosting = charge.postings && charge.postings.length ? charge.postings[charge.postings.length - 1] : null;
+  const followUps = [...(charge.memos || [])].reverse();
+  const linkedClaim = claims.find(cl => cl.chargeId === charge.id);
+  const [debitTarget, setDebitTarget] = useState(null); // posting being debited
+
+  const debitablePostings = new Set(["Check", "Credit Card", "Insurance Credit", "Patient Credit"]);
+  function remainingDebitable(p) { return Math.max(0, p.amount - (p.debited || 0)); }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-medium text-slate-700">Per-DOS details — {charge.dos} · {charge.cpt}</h3>
+        {!hasClaim && <button onClick={() => onGenerateClaim(charge)} className="text-xs text-sky-700 border border-sky-200 bg-sky-50 rounded-lg px-2.5 py-1.5 hover:bg-sky-100">Generate claim</button>}
+        {linkedClaim && <StatusPill status={linkedClaim.status} />}
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <Card className="p-4">
+          <SectionTitle>Latest posting</SectionTitle>
+          {latestPosting ? (
+            <div className="grid grid-cols-2 gap-y-2 text-sm">
+              <div><span className="text-slate-400 text-xs block">Type</span>{latestPosting.type}</div>
+              <div><span className="text-slate-400 text-xs block">Amount</span>{money(latestPosting.amount)}</div>
+              {latestPosting.checkNumber && <div><span className="text-slate-400 text-xs block">Check number</span>{latestPosting.checkNumber}</div>}
+              {latestPosting.depositDate && <div><span className="text-slate-400 text-xs block">Deposit date</span>{latestPosting.depositDate}</div>}
+              {latestPosting.insuranceName && <div><span className="text-slate-400 text-xs block">Insurance</span>{latestPosting.insuranceName}</div>}
+              {latestPosting.reference && <div><span className="text-slate-400 text-xs block">Reference</span>{latestPosting.reference}</div>}
+              <div><span className="text-slate-400 text-xs block">Posted by</span>{latestPosting.postedBy}</div>
+              <div><span className="text-slate-400 text-xs block">Posted at</span>{latestPosting.postedAt?.slice(0, 16).replace("T", " ")}</div>
+            </div>
+          ) : <p className="text-xs text-slate-400">No postings recorded for this DOS yet.</p>}
+
+          {(latestPosting?.copay || latestPosting?.coinsurance || latestPosting?.deductible || latestPosting?.allowedAmount) && (
+            <>
+              <SectionTitle>Financial posting</SectionTitle>
+              <div className="grid grid-cols-2 gap-y-2 text-sm">
+                <div><span className="text-slate-400 text-xs block">Copay</span>{money(Number(latestPosting.copay || 0))}</div>
+                <div><span className="text-slate-400 text-xs block">Coinsurance</span>{money(Number(latestPosting.coinsurance || 0))}</div>
+                <div><span className="text-slate-400 text-xs block">Deductible</span>{money(Number(latestPosting.deductible || 0))}</div>
+                <div><span className="text-slate-400 text-xs block">Allowed amount</span>{money(Number(latestPosting.allowedAmount || 0))}</div>
+              </div>
+            </>
+          )}
+
+          <SectionTitle>Claim details</SectionTitle>
+          <div className="grid grid-cols-2 gap-y-2 text-sm mb-1">
+            <div><span className="text-slate-400 text-xs block">Practice / facility</span>{charge.facilityName || "—"}</div>
+            <div><span className="text-slate-400 text-xs block">Physician NPI</span>{charge.npi || "—"}</div>
+            <div className="col-span-2"><span className="text-slate-400 text-xs block">Facility address</span>{charge.facilityAddress || "—"}</div>
+            <div><span className="text-slate-400 text-xs block">Tax ID</span>{charge.taxId || "—"}</div>
+            <div><span className="text-slate-400 text-xs block">Units / Time</span>{charge.units || 1}{charge.time ? ` · ${charge.time} min` : ""}</div>
+            {charge.ndc && <div><span className="text-slate-400 text-xs block">NDC</span>{charge.ndc}</div>}
+          </div>
+          {charge.diagnosisCodes?.some(d => d) && (
+            <div className="mb-1">
+              <span className="text-slate-400 text-xs block mb-1">Diagnosis codes</span>
+              <div className="flex flex-wrap gap-1">
+                {charge.diagnosisCodes.filter(d => d).map((d, i) => (
+                  <span key={i} className="text-xs bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5">{d}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <SectionTitle>Totals</SectionTitle>
+          <div className="grid grid-cols-2 gap-y-2 text-sm">
+            <div><span className="text-slate-400 text-xs block">Charge</span>{money(charge.charge)}</div>
+            <div><span className="text-slate-400 text-xs block">Adjusted (paid + write-off + credit)</span>{money(adjustedOf(charge))}</div>
+            <div><span className="text-slate-400 text-xs block">Remaining balance</span><span className={balanceOf(charge) > 0 ? "text-rose-600 font-medium" : ""}>{money(balanceOf(charge))}</span></div>
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <SectionTitle>Follow-up history</SectionTitle>
+          <div className="space-y-1.5 max-h-56 overflow-y-auto">
+            {followUps.map((f, i) => (
+              <div key={i} className="text-xs border border-slate-100 rounded-lg px-2.5 py-2">
+                <div className="flex items-center justify-between text-slate-400 mb-0.5">
+                  <span>{f.type || "Note"} · {f.user}</span><span>{f.date}</span>
+                </div>
+                <div className="text-slate-700">{f.text}</div>
+                {f.nextFollowUpDate && <div className="text-slate-400 mt-1">Next follow-up: {f.nextFollowUpDate}</div>}
+              </div>
+            ))}
+            {followUps.length === 0 && <p className="text-xs text-slate-400">No follow-ups recorded.</p>}
+          </div>
+
+          <SectionTitle>Posting history</SectionTitle>
+          <div className="space-y-1.5 max-h-48 overflow-y-auto">
+            {(charge.postings || []).slice().reverse().map(p => {
+              const canDebit = debitablePostings.has(p.type) && remainingDebitable(p) > 0;
+              return (
+                <div key={p.id} className="border border-slate-100 rounded-lg px-2.5 py-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className={p.type === "Debit" ? "text-rose-600 font-medium" : ""}>{p.type}{p.type === "Debit" ? ` — ${p.reason}` : ""}</span>
+                    <span className={`font-medium ${p.type === "Debit" ? "text-rose-600" : "text-emerald-700"}`}>{p.type === "Debit" ? "-" : ""}{money(p.amount)}</span>
+                    <span className="text-slate-400">{p.date}</span>
+                  </div>
+                  {canDebit && (
+                    <button onClick={() => setDebitTarget(p)} className="mt-1 text-[11px] text-rose-600 border border-rose-200 bg-rose-50 rounded-md px-2 py-0.5 hover:bg-rose-100">
+                      Debit {(p.debited || 0) > 0 ? `(${money(remainingDebitable(p))} left)` : ""}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+            {(!charge.postings || charge.postings.length === 0) && <p className="text-xs text-slate-400">No postings yet.</p>}
+          </div>
+        </Card>
+      </div>
+
+      {debitTarget && (
+        <Modal title={`Debit posting · ${debitTarget.type} on ${charge.dos}`} onClose={() => setDebitTarget(null)}>
+          <DebitPostingForm
+            posting={debitTarget}
+            max={remainingDebitable(debitTarget)}
+            onSubmit={(form) => { onDebitPosting(charge.id, debitTarget.id, form); setDebitTarget(null); }}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function DebitPostingForm({ posting, max, onSubmit }) {
+  const kind = postingPayerKind(posting);
+  const debitTypeOptions = kind === "insurance" ? ["Insurance Refund", "Insurance Credit Balance"] : ["Patient Refund", "Patient Credit Balance"];
+  const [f, setF] = useState({ amount: String(max), debitType: debitTypeOptions[0], reason: debitReasons[0], date: TODAY, notes: "" });
+  const [error, setError] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+
+  function requestSubmit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a debit amount greater than 0."); return; }
+    if (amt > max) { setError(`Cannot debit more than ${money(max)} — the remaining amount on this posting.`); return; }
+    setError("");
+    setConfirming(true);
+  }
+
+  if (confirming) {
+    return (
+      <div>
+        <div className="flex items-center gap-2 text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5 mb-4 text-sm">
+          <AlertTriangle size={16} className="shrink-0" />
+          <span>You're about to debit <strong>{money(Number(f.amount))}</strong> as <strong>{f.debitType}</strong> ({f.reason}). This reduces the recorded payment on this posting and cannot be undone. Continue?</span>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => setConfirming(false)} className="flex-1 border border-slate-200 text-slate-600 text-sm font-medium py-2 rounded-lg hover:bg-slate-50">Go back</button>
+          <button onClick={() => onSubmit(f)} className="flex-1 bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">Confirm debit</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
+        Debiting <strong>{posting.type}</strong> posted {posting.date} for {money(posting.amount)}. Up to <strong>{money(max)}</strong> is available to debit from this posting.
+      </div>
+      <AmountField label={`Debit amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <Field label="Debit type">
+        <select className={inputCls} value={f.debitType} onChange={set("debitType")}>{debitTypeOptions.map(o => <option key={o}>{o}</option>)}</select>
+      </Field>
+      <Field label="Reason">
+        <select className={inputCls} value={f.reason} onChange={set("reason")}>{debitReasons.map(r => <option key={r}>{r}</option>)}</select>
+      </Field>
+      <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={requestSubmit} className="w-full bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700">Review debit</button>
+    </div>
+  );
+}
+
+
+// ---------- Charge action dialogs (opened from the DOS context menu) ----------
+
+function ChargeActionDialog({ dialog, charge, policies, onClose, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit, onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp }) {
+  if (!charge) return null;
+  const bal = balanceOf(charge);
+
+  const titles = {
+    check: "Post payment — Check", card: "Post payment — Credit card", insurance: "Post payment — Insurance credit",
+    patient: "Post payment — Patient credit", writeoff: "Write off", creditdos: "Credit date of service",
+    selectinsurance: "Select insurance", self: "Change payer to Self / Patient", editclaim: "Edit claim", followup: "Add follow-up",
+  };
+
+  return (
+    <Modal title={`${titles[dialog.type]} · ${charge.dos}`} onClose={onClose} wide={dialog.type === "editclaim"}>
+      <div className="flex items-center justify-between text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
+        <span>Charge {money(charge.charge)}</span>
+        <span>Adjusted {money(adjustedOf(charge))}</span>
+        <span className={bal > 0 ? "text-rose-600 font-medium" : "font-medium"}>Remaining {money(bal)}</span>
+      </div>
+
+      {dialog.type === "check" && <CheckPaymentForm max={bal} onSubmit={(f) => { onPostCheck(charge.id, f); onClose(); }} />}
+      {dialog.type === "card" && <CardPaymentForm max={bal} onSubmit={(f) => { onPostCard(charge.id, f); onClose(); }} />}
+      {dialog.type === "insurance" && <InsuranceCreditForm max={bal} policies={policies} onSubmit={(f) => { onPostInsuranceCredit(charge.id, f); onClose(); }} />}
+      {dialog.type === "patient" && <PatientCreditForm max={bal} onSubmit={(f) => { onPostPatientCredit(charge.id, f); onClose(); }} />}
+      {dialog.type === "writeoff" && <WriteOffDOSForm max={bal} onSubmit={(f) => { onWriteOffDOS(charge.id, f); onClose(); }} />}
+      {dialog.type === "creditdos" && <CreditDOSForm max={bal} onSubmit={(f) => { onCreditDOS(charge.id, f); onClose(); }} />}
+      {dialog.type === "selectinsurance" && <SelectInsuranceForm policies={policies} current={charge.chargeInsuranceId} onSubmit={(id) => { onSelectChargeInsurance(charge.id, id); onClose(); }} />}
+      {dialog.type === "self" && <SelfPayConfirm onConfirm={() => { onSetSelfPay(charge.id); onClose(); }} onCancel={onClose} />}
+      {dialog.type === "editclaim" && <EditClaimForm charge={charge} onSubmit={(f) => { onEditClaimFields(charge.id, f); onClose(); }} />}
+      {dialog.type === "followup" && <FollowUpForm onSubmit={(f) => { onAddFollowUp(charge.id, f); onClose(); }} />}
+    </Modal>
+  );
+}
+
+function ApplyCreditBalanceForm({ poolType, credits, allCharges, allPatients, patientById, onSubmit, onClose }) {
+  const [creditId, setCreditId] = useState(credits[0]?.id || "");
+  const [targetPatientId, setTargetPatientId] = useState("");
+  const [targetChargeId, setTargetChargeId] = useState("");
+  const [amount, setAmount] = useState("");
+  const [error, setError] = useState("");
+
+  const credit = credits.find(c => c.id === creditId);
+  const targetOpenCharges = allCharges.filter(c => c.patientId === targetPatientId && balanceOf(c) > 0);
+  const targetCharge = allCharges.find(c => c.id === targetChargeId);
+  const maxApply = credit && targetCharge ? Math.min(credit.remaining, balanceOf(targetCharge)) : 0;
+
+  function submit() {
+    const amt = Number(amount);
+    if (!credit) { setError("Select a credit balance to apply."); return; }
+    if (!targetCharge) { setError("Select a patient and a charge to apply the credit toward."); return; }
+    if (!amt || amt <= 0) { setError("Enter an amount greater than 0."); return; }
+    if (amt > maxApply) { setError(`Cannot apply more than ${money(maxApply)} (limited by remaining credit and target balance).`); return; }
+    setError("");
+    onSubmit(creditId, targetChargeId, amt);
+  }
+
+  return (
+    <div>
+      <SectionTitle>Credit balance to apply</SectionTitle>
+      <div className="space-y-2 mb-4">
+        {credits.map(c => (
+          <label key={c.id} className={`flex items-center justify-between border rounded-lg px-3 py-2 text-sm cursor-pointer ${creditId === c.id ? "border-teal-400 bg-teal-50/50" : "border-slate-200 hover:bg-slate-50"}`}>
+            <span className="flex items-center gap-2">
+              <input type="radio" name="credit" checked={creditId === c.id} onChange={() => setCreditId(c.id)} />
+              <span>
+                {poolType === "insurance" ? c.insuranceName : `From ${patientById[c.patientId]?.name || c.patientId}`} — {c.reason} · {c.date}
+              </span>
+            </span>
+            <span className="font-medium text-emerald-700">{money(c.remaining)} available</span>
+          </label>
+        ))}
+      </div>
+
+      <SectionTitle>Apply to</SectionTitle>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Patient">
+          <select className={inputCls} value={targetPatientId} onChange={(e) => { setTargetPatientId(e.target.value); setTargetChargeId(""); }}>
+            <option value="">Select a patient…</option>
+            {allPatients.map(p => <option key={p.id} value={p.id}>{p.name}{credit && p.id === credit.patientId ? " (originating patient)" : ""}</option>)}
+          </select>
+        </Field>
+        <Field label="Open charge">
+          <select className={inputCls} value={targetChargeId} onChange={(e) => setTargetChargeId(e.target.value)} disabled={!targetPatientId}>
+            <option value="">Select a charge…</option>
+            {targetOpenCharges.map(c => <option key={c.id} value={c.id}>{c.dos} · {c.cpt} — balance {money(balanceOf(c))}</option>)}
+          </select>
+        </Field>
+      </div>
+      {targetPatientId && targetOpenCharges.length === 0 && <p className="text-xs text-slate-400 mb-3">This patient has no open balance to apply credit toward.</p>}
+
+      <AmountField label={`Amount to apply${maxApply ? ` (max ${money(maxApply)})` : ""}`} value={amount} onChange={(e) => setAmount(e.target.value)} />
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <p className="text-xs text-slate-400 mb-3">Applying credit generated by one patient to another patient's account is intentionally supported here (e.g. family accounts) — it's logged to both patients' audit history.</p>
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Apply credit</button>
+    </div>
+  );
+}
+
+function AmountField({ label, value, onChange, hint }) {
+  return <Field label={label} hint={hint}><input type="number" min="0" step="0.01" className={inputCls} value={value} onChange={onChange} placeholder="0.00" /></Field>;
+}
+
+function CheckPaymentForm({ max, onSubmit }) {
+  const [f, setF] = useState({ amount: "", checkNumber: "", checkDate: TODAY, payer: "", insurance: "", depositDate: TODAY, paymentDate: TODAY, notes: "" });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function submit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a payment amount greater than 0."); return; }
+    if (!f.checkNumber.trim()) { setError("Check number is required."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Check number"><input className={inputCls} value={f.checkNumber} onChange={set("checkNumber")} /></Field>
+        <Field label="Check date"><input type="date" className={inputCls} value={f.checkDate} onChange={set("checkDate")} /></Field>
+        <Field label="Payer"><input className={inputCls} value={f.payer} onChange={set("payer")} placeholder="Payer or patient name" /></Field>
+        <Field label="Insurance"><input className={inputCls} value={f.insurance} onChange={set("insurance")} placeholder="If applicable" /></Field>
+        <Field label="Deposit date"><input type="date" className={inputCls} value={f.depositDate} onChange={set("depositDate")} /></Field>
+        <Field label="Payment date"><input type="date" className={inputCls} value={f.paymentDate} onChange={set("paymentDate")} /></Field>
+      </div>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Post check payment</button>
+    </div>
+  );
+}
+
+function CardPaymentForm({ max, onSubmit }) {
+  const [f, setF] = useState({ amount: "", paymentDate: TODAY, payer: "", reference: "", notes: "" });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function submit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a payment amount greater than 0."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <p className="text-xs text-slate-400 mb-3">Only a reference/transaction number is stored — never a card number or CVV.</p>
+      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Payment date"><input type="date" className={inputCls} value={f.paymentDate} onChange={set("paymentDate")} /></Field>
+        <Field label="Payer"><input className={inputCls} value={f.payer} onChange={set("payer")} /></Field>
+        <Field label="Reference / transaction #"><input className={inputCls} value={f.reference} onChange={set("reference")} /></Field>
+      </div>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Post card payment</button>
+    </div>
+  );
+}
+
+function InsuranceCreditForm({ max, policies, onSubmit }) {
+  const [f, setF] = useState({ insuranceName: policies[0]?.insuranceCompany || "", amount: "", reference: "", depositDate: TODAY, paymentDate: TODAY, copay: "", coinsurance: "", deductible: "", allowedAmount: "", notes: "" });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function submit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a payment amount greater than 0."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <Field label="Insurance company">
+        <select className={inputCls} value={f.insuranceName} onChange={set("insuranceName")}>
+          {policies.map(p => <option key={p.id}>{p.insuranceCompany}</option>)}
+          {policies.length === 0 && <option value="">No policies on file</option>}
+        </select>
+      </Field>
+      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Check / EFT / ERA reference"><input className={inputCls} value={f.reference} onChange={set("reference")} /></Field>
+        <Field label="Deposit date"><input type="date" className={inputCls} value={f.depositDate} onChange={set("depositDate")} /></Field>
+        <Field label="Payment date"><input type="date" className={inputCls} value={f.paymentDate} onChange={set("paymentDate")} /></Field>
+      </div>
+      <SectionTitle>Claim posting</SectionTitle>
+      <div className="grid grid-cols-4 gap-3">
+        <AmountField label="Copay" value={f.copay} onChange={set("copay")} />
+        <AmountField label="Coinsurance" value={f.coinsurance} onChange={set("coinsurance")} />
+        <AmountField label="Deductible" value={f.deductible} onChange={set("deductible")} />
+        <AmountField label="Allowed amount" value={f.allowedAmount} onChange={set("allowedAmount")} />
+      </div>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Post insurance credit</button>
+    </div>
+  );
+}
+
+function PatientCreditForm({ max, onSubmit }) {
+  const [f, setF] = useState({ amount: "", method: "Cash", date: TODAY, reference: "", notes: "" });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function submit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a payment amount greater than 0."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <AmountField label={`Payment amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Method">
+          <select className={inputCls} value={f.method} onChange={set("method")}><option>Cash</option><option>Check</option><option>Credit Card</option><option>Debit Card</option><option>Online Payment</option></select>
+        </Field>
+        <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
+        <Field label="Reference #"><input className={inputCls} value={f.reference} onChange={set("reference")} /></Field>
+      </div>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Post patient payment</button>
+    </div>
+  );
+}
+
+function WriteOffDOSForm({ max, onSubmit }) {
+  const [f, setF] = useState({ amount: "", reason: "", date: TODAY, notes: "" });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function submit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a write-off amount greater than 0."); return; }
+    if (!f.reason.trim()) { setError("A reason is required for the audit trail."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <div className="flex gap-2 mb-3">
+        <AmountField label={`Write-off amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+        <button onClick={() => setF({ ...f, amount: String(max) })} className="h-9 mt-5 text-xs text-slate-500 border border-slate-200 rounded-lg px-2 whitespace-nowrap">Full balance</button>
+      </div>
+      <Field label="Reason"><input className={inputCls} value={f.reason} onChange={set("reason")} placeholder="Contractual adjustment, timely filing, etc." /></Field>
+      <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-slate-800 text-white text-sm font-medium py-2 rounded-lg hover:bg-slate-900">Post write-off</button>
+    </div>
+  );
+}
+
+function CreditDOSForm({ max, onSubmit }) {
+  const [f, setF] = useState({ amount: "", reason: "", date: TODAY, notes: "" });
+  const [error, setError] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function submit() {
+    const amt = Number(f.amount);
+    if (!amt || amt <= 0) { setError("Enter a credit amount greater than 0."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <AmountField label={`Credit amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
+      <Field label="Reason"><input className={inputCls} value={f.reason} onChange={set("reason")} placeholder="Courtesy credit, billing error correction, etc." /></Field>
+      <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
+      <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-slate-800 text-white text-sm font-medium py-2 rounded-lg hover:bg-slate-900">Post credit</button>
+    </div>
+  );
+}
+
+function SelectInsuranceForm({ policies, current, onSubmit }) {
+  const [choice, setChoice] = useState(current || "");
+  return (
+    <div>
+      <p className="text-xs text-slate-400 mb-3">Only insurance records belonging to this patient are shown. This associates a specific policy with this date of service — useful when billing to coverage that was active at the time of service.</p>
+      <div className="space-y-2 mb-4">
+        {policies.map(p => (
+          <label key={p.id} className="flex items-center gap-2 border border-slate-200 rounded-lg px-3 py-2 text-sm cursor-pointer hover:bg-slate-50">
+            <input type="radio" name="ins" checked={choice === p.id} onChange={() => setChoice(p.id)} />
+            <span className="flex-1">{p.insuranceCompany} — <PriorityBadge priority={p.priority} /></span>
+            <StatusPill status={p.status} />
+          </label>
+        ))}
+        {policies.length === 0 && <p className="text-xs text-slate-400">This patient has no insurance on file.</p>}
+      </div>
+      <button onClick={() => onSubmit(choice || null)} disabled={!choice} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-40">Save</button>
+    </div>
+  );
+}
+
+function SelfPayConfirm({ onConfirm, onCancel }) {
+  return (
+    <div>
+      <p className="text-sm text-slate-600 mb-4">Change payer to Self / Patient for this date of service? The existing insurance association on this claim is preserved in history — it will not be deleted.</p>
+      <div className="flex gap-2">
+        <button onClick={onCancel} className="flex-1 border border-slate-200 text-slate-600 text-sm font-medium py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+        <button onClick={onConfirm} className="flex-1 bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Confirm</button>
+      </div>
+    </div>
+  );
+}
+
+function EditClaimForm({ charge, onSubmit }) {
+  const [f, setF] = useState({
+    dos: charge.dos, cpt: charge.cpt, provider: charge.provider, referralPhysician: charge.referralPhysician || "",
+    facilityName: charge.facilityName || PRACTICE_INFO.name, facilityAddress: charge.facilityAddress || PRACTICE_INFO.address,
+    taxId: charge.taxId || PRACTICE_INFO.taxId, npi: charge.npi || "", ndc: charge.ndc || "",
+    units: charge.units || 1, time: charge.time || "",
+    diagnosisCodes: charge.diagnosisCodes && charge.diagnosisCodes.length === 10 ? [...charge.diagnosisCodes] : emptyDxCodes(),
+  });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  function setDx(i, val) {
+    const next = [...f.diagnosisCodes];
+    next[i] = val.toUpperCase();
+    setF({ ...f, diagnosisCodes: next });
+  }
+  function setProviderAndNPI(p) { setF({ ...f, provider: p, npi: providerNPI[p] || f.npi }); }
+  function submit() {
+    const entry = cptCatalog.find(c => c.code === f.cpt);
+    onSubmit({
+      dos: f.dos, cpt: f.cpt, desc: entry ? entry.desc : charge.desc, provider: f.provider, referralPhysician: f.referralPhysician,
+      facilityName: f.facilityName, facilityAddress: f.facilityAddress, taxId: f.taxId, npi: f.npi, ndc: f.ndc,
+      units: Number(f.units) || 1, time: f.time, diagnosisCodes: f.diagnosisCodes,
+    });
+  }
+  return (
+    <div>
+      <SectionTitle>Service</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Date of service"><input type="date" className={inputCls} value={f.dos} onChange={set("dos")} /></Field>
+        <Field label="CPT code">
+          <select className={inputCls} value={f.cpt} onChange={set("cpt")}>{cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
+        </Field>
+        <Field label="Units"><input type="number" min="1" className={inputCls} value={f.units} onChange={set("units")} /></Field>
+        <Field label="Time (minutes)"><input className={inputCls} value={f.time} onChange={set("time")} /></Field>
+        <Field label="National Drug Code (NDC)"><input className={inputCls} value={f.ndc} onChange={set("ndc")} /></Field>
+      </div>
+      <SectionTitle>Providers</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Physician">
+          <select className={inputCls} value={f.provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providers.map(p => <option key={p}>{p}</option>)}</select>
+        </Field>
+        <Field label="Physician NPI"><input className={inputCls} value={f.npi} onChange={set("npi")} /></Field>
+        <Field label="Referral physician"><input className={inputCls} value={f.referralPhysician} onChange={set("referralPhysician")} placeholder="Optional" /></Field>
+      </div>
+      <SectionTitle>Facility &amp; billing entity</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Practice name"><input className={inputCls} value={f.facilityName} onChange={set("facilityName")} /></Field>
+        <Field label="Facility address"><input className={inputCls} value={f.facilityAddress} onChange={set("facilityAddress")} /></Field>
+        <Field label="Tax ID"><input className={inputCls} value={f.taxId} onChange={set("taxId")} /></Field>
+      </div>
+      <SectionTitle>Diagnosis codes (ICD-10, up to 10)</SectionTitle>
+      <div className="grid grid-cols-5 gap-2 mb-3">
+        {f.diagnosisCodes.map((code, i) => (
+          <input key={i} className={`${inputCls} text-center`} value={code} onChange={(e) => setDx(i, e.target.value)} placeholder={`Dx ${i + 1}`} />
+        ))}
+      </div>
+      <p className="text-xs text-slate-400 mb-3">Changing the CPT here updates the claim's coding fields only — use "Recode" from the ledger if you also need the charge amount to change.</p>
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Save claim edits</button>
+    </div>
+  );
+}
+
+function FollowUpForm({ onSubmit }) {
+  const [f, setF] = useState({ type: followUpTypes[0], text: "", date: TODAY, nextFollowUpDate: "", status: "Open" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const [error, setError] = useState("");
+  function submit() {
+    if (!f.text.trim()) { setError("Follow-up note can't be empty."); return; }
+    setError(""); onSubmit(f);
+  }
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Type">
+          <select className={inputCls} value={f.type} onChange={set("type")}>{followUpTypes.map(t => <option key={t}>{t}</option>)}</select>
+        </Field>
+        <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
+      </div>
+      <Field label="Note"><textarea className={`${inputCls} h-20 resize-none`} value={f.text} onChange={set("text")} placeholder="e.g. Called insurance, claim under review" /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Next follow-up date"><input type="date" className={inputCls} value={f.nextFollowUpDate} onChange={set("nextFollowUpDate")} /></Field>
+        <Field label="Status">
+          <select className={inputCls} value={f.status} onChange={set("status")}>{followUpStatuses.map(s => <option key={s}>{s}</option>)}</select>
+        </Field>
+      </div>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Save follow-up</button>
     </div>
   );
 }
@@ -2176,26 +3314,76 @@ function AddChargeForm({ onSubmit }) {
   const [dos, setDos] = useState("2026-08-24");
   const [cpt, setCpt] = useState(cptCatalog[0].code);
   const [provider, setProvider] = useState(providers[0]);
+  const [referralPhysician, setReferralPhysician] = useState("");
+  const [facilityName, setFacilityName] = useState(PRACTICE_INFO.name);
+  const [facilityAddress, setFacilityAddress] = useState(PRACTICE_INFO.address);
+  const [taxId, setTaxId] = useState(PRACTICE_INFO.taxId);
+  const [npi, setNpi] = useState(providerNPI[providers[0]] || "");
+  const [ndc, setNdc] = useState("");
+  const [units, setUnits] = useState("1");
+  const [time, setTime] = useState("");
+  const [dxCodes, setDxCodes] = useState(emptyDxCodes());
   const [error, setError] = useState("");
+
+  function setProviderAndNPI(p) {
+    setProvider(p);
+    setNpi(providerNPI[p] || "");
+  }
+  function setDx(i, val) {
+    const next = [...dxCodes];
+    next[i] = val.toUpperCase();
+    setDxCodes(next);
+  }
 
   function submit() {
     if (!dos) { setError("Date of service is required."); return; }
     const entry = cptCatalog.find(c => c.code === cpt);
     setError("");
-    onSubmit({ dos, provider, cpt: entry.code, desc: entry.desc, charge: entry.charge });
+    onSubmit({
+      dos, provider, referralPhysician, cpt: entry.code, desc: entry.desc, charge: entry.charge,
+      facilityName, facilityAddress, taxId, npi, ndc, units: Number(units) || 1, time,
+      diagnosisCodes: dxCodes,
+    });
   }
 
   return (
     <div>
-      <Field label="Date of service"><input type="date" className={inputCls} value={dos} onChange={(e) => setDos(e.target.value)} /></Field>
-      <Field label="Provider">
-        <select className={inputCls} value={provider} onChange={(e) => setProvider(e.target.value)}>{providers.map(p => <option key={p}>{p}</option>)}</select>
-      </Field>
-      <Field label="CPT code">
-        <select className={inputCls} value={cpt} onChange={(e) => setCpt(e.target.value)}>
-          {cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc} ({money(c.charge)})</option>)}
-        </select>
-      </Field>
+      <SectionTitle>Service</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Date of service"><input type="date" className={inputCls} value={dos} onChange={(e) => setDos(e.target.value)} /></Field>
+        <Field label="CPT code">
+          <select className={inputCls} value={cpt} onChange={(e) => setCpt(e.target.value)}>
+            {cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc} ({money(c.charge)})</option>)}
+          </select>
+        </Field>
+        <Field label="Units"><input type="number" min="1" className={inputCls} value={units} onChange={(e) => setUnits(e.target.value)} /></Field>
+        <Field label="Time (minutes)" hint="For time-based CPT codes"><input className={inputCls} value={time} onChange={(e) => setTime(e.target.value)} placeholder="Optional" /></Field>
+        <Field label="National Drug Code (NDC)" hint="If applicable"><input className={inputCls} value={ndc} onChange={(e) => setNdc(e.target.value)} placeholder="e.g. 0069-0420-01" /></Field>
+      </div>
+
+      <SectionTitle>Providers</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Physician">
+          <select className={inputCls} value={provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providers.map(p => <option key={p}>{p}</option>)}</select>
+        </Field>
+        <Field label="Physician NPI"><input className={inputCls} value={npi} onChange={(e) => setNpi(e.target.value)} /></Field>
+        <Field label="Referral physician"><input className={inputCls} value={referralPhysician} onChange={(e) => setReferralPhysician(e.target.value)} placeholder="Optional" /></Field>
+      </div>
+
+      <SectionTitle>Facility &amp; billing entity</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Practice name"><input className={inputCls} value={facilityName} onChange={(e) => setFacilityName(e.target.value)} /></Field>
+        <Field label="Facility address" className="col-span-2"><input className={inputCls} value={facilityAddress} onChange={(e) => setFacilityAddress(e.target.value)} /></Field>
+        <Field label="Tax ID"><input className={inputCls} value={taxId} onChange={(e) => setTaxId(e.target.value)} /></Field>
+      </div>
+
+      <SectionTitle>Diagnosis codes (ICD-10, up to 10)</SectionTitle>
+      <div className="grid grid-cols-5 gap-2 mb-3">
+        {dxCodes.map((code, i) => (
+          <input key={i} className={`${inputCls} text-center`} value={code} onChange={(e) => setDx(i, e.target.value)} placeholder={`Dx ${i + 1}`} />
+        ))}
+      </div>
+
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
       <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Add charge</button>
     </div>
@@ -2340,13 +3528,14 @@ function ReportCenter({ charges, patientById, transactions, patients, policies }
   const debitRows = useMemo(() => {
     if (reportType !== "debit") return [];
     return transactions
-      .filter(t => t.type === "charge")
+      .filter(t => t.type === "charge" || t.type === "debit")
       .filter(t => (!fromDate || t.date >= fromDate) && (!toDate || t.date <= toDate))
       .map(t => {
         const charge = charges.find(c => c.id === t.chargeId);
+        const isDebit = t.type === "debit";
         return {
           Date: t.date, Patient: patientById[t.patientId]?.name || "", Physician: charge?.provider || "",
-          CPT: charge?.cpt || "", Description: charge?.desc || "", Amount: t.amount,
+          CPT: charge?.cpt || "", Description: isDebit ? `Debit — ${t.reference} (${t.source})` : (charge?.desc || ""), Amount: t.amount,
         };
       })
       .sort((a, b) => b.Date.localeCompare(a.Date));
@@ -2392,11 +3581,18 @@ function ReportCenter({ charges, patientById, transactions, patients, policies }
         }
       `}</style>
 
+      <div className="flex items-center gap-2 mb-3 print:hidden">
+        <span className="text-xs text-slate-400">Quick generate:</span>
+        <button onClick={() => setReportType("debit")} className={`text-xs px-3 py-1.5 rounded-lg border ${reportType === "debit" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>Debit report</button>
+        <button onClick={() => setReportType("credit")} className={`text-xs px-3 py-1.5 rounded-lg border ${reportType === "credit" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>Credit report</button>
+        <button onClick={() => setReportType("aging")} className={`text-xs px-3 py-1.5 rounded-lg border ${reportType === "aging" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>Aging report</button>
+      </div>
+
       <div className="flex flex-wrap items-end gap-3 mb-4 print:hidden">
         <Field label="Report type">
           <select className={inputCls} value={reportType} onChange={(e) => setReportType(e.target.value)}>
             <option value="aging">Aging report</option>
-            <option value="debit">Debit report (charges)</option>
+            <option value="debit">Debit report (charges + debited payments)</option>
             <option value="credit">Credit report (payments &amp; write-offs)</option>
           </select>
         </Field>
