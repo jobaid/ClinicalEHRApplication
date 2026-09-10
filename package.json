@@ -11,10 +11,21 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "api": "server\\medbill-server.exe",
+    "api:build": "tools\\go\\bin\\go.exe build -C server -o medbill-server.exe .",
+    "db:export": "node scripts/exportFirestore.mjs",
+    "db:migrate": "server\\medbill-server.exe migrate migration-export",
+    "db:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start",
+    "db:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 stop",
+    "db:psql": "tools\\pgsql\\bin\\psql.exe -h 127.0.0.1 -p 5433 -U postgres -d medbill",
+    "api:test": "tools\\go\\bin\\go.exe test -C server ./...",
+    "db:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 status"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "firebase": "^12.18.0",
+    "firebase-admin": "^14.3.0",
     "lucide-react": "^1.34.0",
     "papaparse": "^5.7.0",
     "react": "^19.2.8",
@@ -31,6 +42,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.4",
     "globals": "^17.11.0",
+    "playwright": "^1.62.1",
     "vite": "^8.2.2"
   }
 }

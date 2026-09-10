@@ -1,129 +1,218 @@
-# EHR Practice — Medical Billing & Practice Management Platform
+# Jobaid Clinic — Medical Billing & EHR
 
-A full-stack-scoped, single-page **medical billing, EHR, and practice management prototype** built with React. It models the actual operational complexity of a clinic's revenue cycle — versioned insurance history, a real X12 835 electronic remittance parser, a double-entry-style financial ledger, and role-gated clinical/billing workflows — not just a CRUD dashboard with health-themed labels.
+Software for running a medical clinic: patient records, appointments, insurance, billing,
+payments, claims, and reports.
 
-> **Status:** Frontend prototype (in-memory data). Architecture is designed to drop onto a Node/Express + PostgreSQL/Prisma backend without a rewrite. See [Roadmap](#roadmap).
-
----
-
-## Why this project
-
-Healthcare billing software is a genuinely hard domain — it's not "patients table + invoices table." This project exists to demonstrate that the following can be modeled correctly, not just described:
-
-- **Insurance is never overwritten.** Every coverage change creates a new, timestamped record; the old one is marked terminated and stays permanently queryable. This is a hard compliance requirement in real practice management systems, and it's enforced in the data layer here, not just the UI copy.
-- **Every financial and clinical change is audited.** Insurance edits, priority changes, payment postings, and signed clinical notes all write to an append-only audit log with before/after values, actor, and timestamp.
-- **A real EDI parser, not a mock.** The electronic remittance (835) importer parses actual X12 segments — `BPR`, `TRN`, `N1`, `CLP`, `SVC`, `CAS` — reconciles them against open claims, and flags unmatched rows for manual review instead of silently guessing.
-- **Signed clinical notes are immutable.** Once a SOAP note is signed, it can only be amended (append-only), never silently edited — the same rule real EHRs enforce for legal defensibility.
-- **Money is never floating-point soup.** Every charge line tracks charge / paid / write-off as explicit fields with a single source of truth for balance, feeding a real debit/credit transaction ledger for reporting.
+**Repository:** [github.com/jobaid/ClinicalEHRApplication](https://github.com/jobaid/ClinicalEHRApplication)
 
 ---
 
-## Feature highlights
+## Start the application
 
-**Scheduling & Patients**
-- Day-grouped appointment scheduling with status workflow (Scheduled → Checked out)
-- Patient registration with duplicate-detection (name+DOB, phone+DOB, email+DOB, SSN matching) before a new chart is created
-- Full demographics: emergency contact, guarantor/responsible party, address — SSN masked everywhere it's displayed or exported
+**The easy way — double-click `start-app.cmd`**
 
-**Insurance (the centerpiece)**
-- Primary / Secondary / Tertiary coverage with a dedicated history table
-- Adding new insurance at an occupied priority auto-terminates the prior record and links the transition — nothing is deleted
-- Field-level edit history per policy, separate from full-record supersession ("save changes" vs. "save as new coverage record")
-- Insurance card upload (front/back), ID document upload with automatic archiving of superseded documents
+That's it. It starts everything and tells you when it's ready.
 
-**Billing & Claims**
-- Per-CPT charge ledger (not invoice-level) with payment, write-off, recode/credit, and follow-up memo actions per line
-- Manual batch payment posting and **electronic 835 remittance import** with a payer-name/check-EFT-aware reconciliation screen
-- Claim lifecycle: Draft → Submitted → Paid/Denied, generated directly from a charge line
+Two black windows will open and stay open. **Leave them open** — that's the application running.
+When you see `Ready`, open your browser to:
 
-**Clinical / EHR**
-- Vitals, allergies (with active/resolved status and a chart-header allergy banner), medications, problem list (ICD-10)
-- SOAP note authoring with a **Draft → Signed → Amended** workflow — signed notes are never mutated in place
-
-**Reporting**
-- Aging report — grouped by physician, insurance payer, or self-pay, with full patient/account/insurance detail per line
-- Debit (charges) and credit (payments/write-offs) transaction reports with date-range filters
-- CSV and print-to-PDF export on every report
-
-**Auth / Access Control**
-- Login with role-based navigation (Super Admin, Manager, Nurse, Receptionist, Biller) matching a real permission matrix
-- Runtime "Access Denied" guard, not just hidden buttons — defense in depth even if UI state gets out of sync
+### http://localhost:5173
 
 ---
 
-## Tech stack
+## Log in
 
-| Layer | Technology |
+Use any of these accounts:
+
+| Email | Password | What they can see |
+|---|---|---|
+| `admin@medbill.local` | `Admin@12345` | Everything, including user management |
+| `manager@medbill.local` | `Manager@12345` | Everything except user management |
+| `biller@medbill.local` | `Biller@12345` | Billing, claims, reports, patients |
+| `nurse@medbill.local` | `Nurse@12345` | Clinical charts, schedule, patients |
+| `reception@medbill.local` | `Reception@12345` | Schedule and patients |
+
+Start with **admin@medbill.local** if you just want to look around — it can see every screen.
+
+---
+
+## Stop the application
+
+1. Close the two black windows.
+2. Open a terminal in this folder and run:
+
+```
+npm run db:stop
+```
+
+The second step stops the database. If you skip it, the database just keeps running quietly in
+the background — harmless, but it will still be running next time you start.
+
+---
+
+## What you can do
+
+**Patients**
+Add patients, search them, and open a full chart: contact details, emergency contact,
+guarantor, ID documents, and notes. The system warns you if a patient looks like a duplicate
+before creating a second chart.
+
+**Schedule**
+Book appointments by day and move them through Scheduled → In progress → Checked out.
+
+**Insurance**
+Record Primary, Secondary, and Tertiary coverage. Old insurance is never deleted — when
+coverage changes, the previous record is kept and marked terminated, so you always have the
+full history.
+
+**Billing**
+Post charges per procedure code, then record payments: cash, check, credit card, insurance
+credits, patient credits, write-offs, and adjustments. You can also import an electronic
+remittance (835) file from an insurer and match it against open claims.
+
+**Claims**
+Create a claim from a charge and track it: Draft → Submitted → Paid or Denied.
+
+**Clinical charts**
+Vitals, allergies, medications, problem list, and SOAP notes. Once a note is signed it can't be
+edited — only amended, with the change recorded.
+
+**Batches**
+Open a batch before posting payments and close it at the end of the day. Closed batches stay
+available to look at later.
+
+**Reports**
+- **Daily Transaction** — every charge and payment for a date range, filtered by doctor, user,
+  batch, or procedure code
+- **Aging** — outstanding balances by physician, insurance, or self-pay
+- **Debit / Credit** — charges posted, and payments and write-offs posted
+
+Every report can be exported to CSV or printed.
+
+**Reminders and support**
+Ticklers (follow-up reminders assigned to staff) and an internal support-ticket system.
+
+---
+
+## If something goes wrong
+
+**"Invalid email or password" for every account**
+
+Usually this means the application isn't fully running, not that the password is wrong.
+
+1. Make sure both black windows are still open.
+2. Open a terminal in this folder and run `npm run db:status` — it should say PostgreSQL is
+   running.
+3. If it isn't, close everything and run `start-app.cmd` again.
+
+**The page won't load at all**
+
+The application needs a moment to start. Wait about 10 seconds after `Ready` appears, then
+refresh the browser.
+
+**A window closed by itself**
+
+Something failed to start. Run `start-app.cmd` again and read the message before the window
+closes.
+
+**You changed something and want a clean start**
+
+Close both windows, run `npm run db:stop`, then run `start-app.cmd` again.
+
+---
+
+## Starting it manually (optional)
+
+If you'd rather not use `start-app.cmd`, the application is three pieces. Start them in this
+order, each in its own terminal:
+
+```
+npm run db:start     the database
+npm run api          the server
+npm run dev          the website
+```
+
+| Piece | Address | What it does |
+|---|---|---|
+| Database | port 5433 | Stores all the data |
+| Server | port 8080 | Handles logins and all reading/writing |
+| Website | port 5173 | What you see in the browser |
+
+---
+
+## Important: your data
+
+All data lives on **this computer**, in the `tools/pgdata` folder. Nothing is stored online.
+
+**There is no backup.** If this computer's disk fails or that folder is deleted, the data is
+gone permanently.
+
+To make a backup, run this in a terminal in this folder:
+
+```
+tools\pgsql\bin\pg_dump.exe -h 127.0.0.1 -p 5433 -U postgres -d medbill -Fc -f backup.dump
+```
+
+Password: `medbill_dev_pw`. Keep the resulting `backup.dump` file somewhere safe — another
+drive or a USB stick. Do this regularly.
+
+---
+
+## Who can use it over the network
+
+Anyone on the same Wi-Fi can reach the application. When you start it, the window shows two
+addresses — use the second one from another device:
+
+```
+Local:   http://localhost:5173      <- this computer
+Network: http://192.168.1.183:5173  <- any device on the same Wi-Fi
+```
+
+The Network address changes when you connect to a different Wi-Fi, so always read it from that
+window rather than memorising it.
+
+This is handy for testing on a phone or another laptop, but it also means the login page is
+visible to everyone on that network. It is **not** reachable from the internet.
+
+---
+
+## For developers
+
+Technical documentation — the Go API, the PostgreSQL schema, and the Firebase migration — is in
+**[README-MIGRATION.md](README-MIGRATION.md)**.
+
+Quick reference:
+
+| Command | What it does |
 |---|---|
-| UI | React (hooks-based, no class components) |
-| Styling | Tailwind CSS |
-| Icons | lucide-react |
-| Charts | Recharts |
-| CSV export | PapaParse |
-| EDI parsing | Custom X12 835 segment parser (no external library) |
+| `npm run dev` | Start the website (development) |
+| `npm run api` | Start the Go server |
+| `npm run db:start` / `db:stop` / `db:status` | Control the database |
+| `npm run db:psql` | Open a SQL prompt on the database |
+| `npm run build` | Build the website for production |
+| `npm run lint` | Check code style |
+| `npm run api:build` | Rebuild the Go server after changing Go code |
+| `npm run api:test` | Run the Go tests |
 
----
+**Built with:** React 19 + Vite (frontend), Go (API), PostgreSQL 17 (database), Tailwind CSS.
 
-## Architecture notes
+Go and PostgreSQL are bundled in the `tools/` folder — you don't need to install them
+separately.
 
-- **Versioned records over mutation.** Insurance policies, ID documents, and signed clinical notes all follow an append/supersede pattern rather than update-in-place, mirroring how compliant healthcare systems actually have to behave.
-- **Single source of truth for money.** `balanceOf(charge)` and a running transaction ledger (`type: charge | payment | writeoff`) drive every dollar figure in the app — the dashboard, the patient ledger, and the reports all read from the same computation instead of maintaining parallel totals that can drift.
-- **RBAC modeled at the route level, not just the sidebar.** Navigation is filtered by role *and* the content area independently verifies the current tab is permitted before rendering — so a stale tab state can't leak a restricted view.
-- **Deliberately honest about its own limits.** The app surfaces its own scope boundaries in-product (e.g., the login screen's dev-credentials panel is explicitly labeled non-production, OCR fields are manual-entry-only rather than faked) — because pretending a demo is production-grade is a worse engineering habit than admitting the boundary.
+### Get the code
 
----
-<img src="clinicGIF.gif" alt="Medical Billing Demo" width="800">
-## Getting started
-
-```bash
-npm create vite@latest harborview-clinic -- --template react
-cd harborview-clinic
-npm install tailwindcss @tailwindcss/vite lucide-react recharts papaparse
+```
+git clone https://github.com/jobaid/ClinicalEHRApplication.git
+cd ClinicalEHRApplication
+npm install
 ```
 
-Add the Tailwind plugin to `vite.config.js`:
-
-```js
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
-
-export default defineConfig({
-  plugins: [react(), tailwindcss()],
-})
-```
-
-Replace `src/index.css` with `@import "tailwindcss";`, drop `ClinicBilling.jsx` into `src/`, import it from `App.jsx`, then:
-
-```bash
-npm run dev
-```
-
-Sign in with any of the demo accounts shown on the login screen (e.g. `manager@medbill.local` / `Manager@12345`).
+Note that `tools/` (Go and PostgreSQL) and the database itself are not stored in the repository,
+so a fresh clone needs them set up before the app will run — see
+[README-MIGRATION.md](README-MIGRATION.md).
 
 ---
 
-## Roadmap
+## Author
 
-This prototype is scoped intentionally — the next milestones are architectural, not cosmetic:
-
-- [ ] Node.js + Express API with Prisma/PostgreSQL, mirroring the current data model 1:1
-- [ ] Real authentication (bcrypt + JWT) with server-side permission checks on every route — the current RBAC is UI-only and explicitly documented as such
-- [ ] BAA-covered cloud hosting, encryption at rest, and a formal risk assessment before any real PHI touches the system
-- [ ] Claims clearinghouse integration (837 outbound) to complement the existing 835 inbound parser
-- [ ] Expand EHR to orders, results, and care plans
-
----
-
-## About this build
-
-This project was built collaboratively with **Claude** (Anthropic) as an engineering exercise in modeling a genuinely complex regulated domain end-to-end — from data architecture through UI — rather than shipping a template with a healthcare skin on it.
-
-**Jobaid Azim**
- · https://www.linkedin.com/in/jobaidazim/ · https://github.com/jobaid/
-
----
-
-## License
-
-MIT — see `LICENSE`. Demo data only; contains no real patient information.
+**Jobaid** — [github.com/jobaid](https://github.com/jobaid)

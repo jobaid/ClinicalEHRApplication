@@ -12,6 +12,16 @@ dist
 dist-ssr
 *.local
 
+# Firebase
+.env
+serviceAccountKey.json
+*firebase-adminsdk*.json
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.firebase/
+.tools/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -22,3 +32,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.scratch/
+tools/
+migration-export/
+server/medbill-server.exe
+server/firebase-hash-config.json

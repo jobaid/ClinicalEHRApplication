@@ -1,5 +1,7 @@
-import React, { useState, useMemo, useEffect, useRef } from "react";
+import React, { useState, useMemo, useEffect, useRef, useContext, createContext } from "react";
 import Papa from "papaparse";
+import { signIn, signOutUser, fetchUserProfile, createUserAccount } from "./firebase/authService";
+import { useFirestoreCollection, setDocument, updateDocument, addDocument, newBatch, docRef } from "./firebase/firestoreService";
 import {
   LayoutDashboard, CalendarDays, Users, Receipt, FileStack, BarChart3,
   Plus, X, Search, ChevronRight, ChevronLeft, AlertCircle, CheckCircle2, Clock,
@@ -7,7 +9,7 @@ import {
   ScissorsLineDashed, CreditCard, Upload, FileCheck2, Landmark, Wand2,
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
-  Activity, Pill, ClipboardList, FileSignature, AlertTriangle, HeartPulse
+  Activity, Pill, ClipboardList, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -16,32 +18,11 @@ import {
 
 // ---------- Seed data ----------
 
-const seedPatients = [
-  { id: "P1001", name: "Maria Alvarez", dob: "1985-03-14", phone: "(516) 555-0142", email: "maria.a@email.com", ssn: "123-45-6781",
-    address: "12 Oak St", city: "Bellerose", state: "NY", zip: "11426",
-    emergencyContact: { name: "Rosa Alvarez", relationship: "Spouse", phone: "(516) 555-0143" },
-    guarantor: { name: "Maria Alvarez", relationship: "Self", employer: "Northwell Health" } },
-  { id: "P1002", name: "James Whitfield", dob: "1972-11-02", phone: "(516) 555-0198", email: "j.whitfield@email.com", ssn: "234-56-7892",
-    address: "45 Elm St", city: "Floral Park", state: "NY", zip: "11001",
-    emergencyContact: { name: "Karen Whitfield", relationship: "Spouse", phone: "(516) 555-0199" },
-    guarantor: { name: "James Whitfield", relationship: "Self", employer: "Bank of America" } },
-  { id: "P1003", name: "Priya Natarajan", dob: "1990-07-22", phone: "(631) 555-0110", email: "priya.n@email.com", ssn: "345-67-8903",
-    address: "88 Cedar Ave", city: "Huntington", state: "NY", zip: "11743",
-    emergencyContact: { name: "Raj Natarajan", relationship: "Sibling", phone: "(631) 555-0198" },
-    guarantor: { name: "Priya Natarajan", relationship: "Self", employer: "Self-employed" } },
-  { id: "P1004", name: "Deshawn Carter", dob: "1965-01-09", phone: "(631) 555-0173", email: "d.carter@email.com", ssn: "456-78-9014",
-    address: "300 Maple Dr", city: "Huntington", state: "NY", zip: "11743",
-    emergencyContact: { name: "Tanya Carter", relationship: "Child", phone: "(631) 555-0174" },
-    guarantor: { name: "Deshawn Carter", relationship: "Self", employer: "Suffolk County" } },
-  { id: "P1005", name: "Linda Kowalski", dob: "1958-09-30", phone: "(516) 555-0221", email: "l.kowalski@email.com", ssn: "567-89-0125",
-    address: "9 Birch Ln", city: "Bellerose", state: "NY", zip: "11426",
-    emergencyContact: { name: "Mark Kowalski", relationship: "Child", phone: "(516) 555-0222" },
-    guarantor: { name: "Linda Kowalski", relationship: "Self", employer: "Retired" } },
-  { id: "P1006", name: "Omar Haddad", dob: "1999-04-17", phone: "(646) 555-0109", email: "omar.h@email.com", ssn: "678-90-1236",
-    address: "210 5th Ave", city: "New York", state: "NY", zip: "10010",
-    emergencyContact: { name: "Layla Haddad", relationship: "Sibling", phone: "(646) 555-0111" },
-    guarantor: { name: "Omar Haddad", relationship: "Self", employer: "Freelance" } },
-];
+// Patient demography, CPT catalog, insurance, charges/claims, clinical data, ID documents, and
+// user accounts all live in Firestore now (see src/firebase/ and scripts/seedFirestore.mjs) —
+// nothing here is hardcoded app data any more. What's left below are small reference constants
+// (role/permission tables, dropdown option lists, providers) that aren't "data" so much as UI
+// vocabulary, plus pure helper functions.
 
 const providers = ["Dr. S. Reyes", "Dr. A. Okafor", "Dr. M. Lin"];
 
@@ -50,18 +31,21 @@ const PRACTICE_INFO = { name: "Jobaid Clinic", address: "400 Harbor Way, Bellero
 const providerNPI = { "Dr. S. Reyes": "1912345678", "Dr. A. Okafor": "1923456789", "Dr. M. Lin": "1934567890" };
 const emptyDxCodes = () => Array(10).fill("");
 
-// ---------- Auth / RBAC (demo only — see LoginPage/Forbidden for the honesty caveat) ----------
-// This gates the UI so each role sees the right nav, matching the permission matrix in the spec.
-// It is NOT real security: there is no backend here to enforce it against direct API calls,
-// Postman, curl, etc. Real enforcement has to live in the Express API layer.
+// ---------- Auth / RBAC ----------
+// Real authentication now goes through Firebase Auth (src/firebase/authService.js) — role and
+// display name are read from the users/{uid} Firestore doc after sign-in, not from a local list.
+// This gates the UI so each role sees the right nav; the actual write-permission enforcement
+// lives in firestore.rules / storage.rules, not just in this client-side tab filter.
 
-
-const DEMO_USERS = [
-  { email: "admin@medbill.local", password: "Admin@12345", name: "Obaidul", role: "SUPER_ADMIN" },
-  { email: "manager@medbill.local", password: "Manager@12345", name: "Anowara", role: "MANAGER" },
-  { email: "nurse@medbill.local", password: "Nurse@12345", name: "Dana Ruiz", role: "NURSE" },
-  { email: "reception@medbill.local", password: "Reception@12345", name: "Leah Ford", role: "RECEPTIONIST" },
-  { email: "biller@medbill.local", password: "Biller@12345", name: "Marcus Webb", role: "BILLER" },
+// Display-only convenience for the login screen's "quick fill" panel — these are the accounts
+// scripts/seedFirestore.mjs creates in Firebase Auth. Never used to authenticate; real sign-in
+// always goes through signIn() in src/firebase/authService.js.
+const DEMO_LOGIN_HINTS = [
+  { email: "admin@medbill.local", password: "Admin@12345", role: "SUPER_ADMIN" },
+  { email: "manager@medbill.local", password: "Manager@12345", role: "MANAGER" },
+  { email: "nurse@medbill.local", password: "Nurse@12345", role: "NURSE" },
+  { email: "reception@medbill.local", password: "Reception@12345", role: "RECEPTIONIST" },
+  { email: "biller@medbill.local", password: "Biller@12345", role: "BILLER" },
 ];
 const ROLE_LABELS = {
   SUPER_ADMIN: "Super Admin", MANAGER: "Manager", NURSE: "Nurse", RECEPTIONIST: "Receptionist", BILLER: "Biller",
@@ -70,88 +54,23 @@ const ROLE_LABELS = {
 // Which top-nav tabs each role may open. Nurse/Receptionist never see Billing/Claims/Reports;
 // Biller never sees Clinical; Manager/Super Admin see everything.
 const ROLE_TABS = {
-  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports"],
+  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "users"],
   MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports"],
   NURSE: ["dashboard", "schedule", "patients", "clinical"],
   RECEPTIONIST: ["dashboard", "schedule", "patients"],
   BILLER: ["dashboard", "patients", "billing", "claims", "reports"],
 };
 
-const cptCatalog = [
-  { code: "99213", desc: "Office visit, established patient (low complexity)", charge: 110 },
-  { code: "99214", desc: "Office visit, established patient (moderate complexity)", charge: 165 },
-  { code: "99385", desc: "Preventive visit, new patient (18-39y)", charge: 190 },
-  { code: "90471", desc: "Immunization administration", charge: 35 },
-  { code: "80053", desc: "Comprehensive metabolic panel", charge: 48 },
-  { code: "93000", desc: "Electrocardiogram, complete", charge: 72 },
-];
+// CPT catalog now lives in Firestore's cptCatalog collection (loaded once in ClinicApp) and is
+// handed down through this context rather than prop-drilled through every intermediate form —
+// it's read from several unrelated leaf components (AddChargeForm, EditClaimForm, AddApptForm...).
+const CptCatalogContext = createContext([]);
 
 // ---------- Insurance (versioned — never overwritten, see addInsurance/editInsurance) ----------
 
 const insuranceTypes = ["Commercial", "Medicare", "Medicaid", "Tricare", "Workers' Comp", "Other"];
 const priorities = ["Primary", "Secondary", "Tertiary"];
 const idTypes = ["Driver's License", "State ID", "Passport", "Other Government ID"];
-
-// One row per coverage period. Adding new insurance at an occupied priority terminates
-// the old row (status + terminationDate) instead of overwriting it — full history stays queryable.
-const seedInsurancePolicies = [
-  { id: "POL-1001", patientId: "P1001", insuranceCompany: "Aetna", planName: "Aetna Choice POS II", insuranceType: "Commercial",
-    memberId: "AET-88213", subscriberId: "AET-88213", groupNumber: "GRP-4471", payerId: "60054",
-    effectiveDate: "2025-01-01", terminationDate: "2025-12-31", status: "Terminated", priority: "Primary",
-    subscriberName: "Maria Alvarez", subscriberDob: "1985-03-14", subscriberRelationship: "Self",
-    copay: "25", deductible: "1500", coinsurance: "20%", authRequired: false, referralRequired: false, notes: "",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2025-01-01T09:00:00", updatedAt: "2026-01-01T09:00:00" },
-  { id: "POL-1002", patientId: "P1001", insuranceCompany: "UnitedHealthcare", planName: "UHC Choice Plus", insuranceType: "Commercial",
-    memberId: "UHC-40217", subscriberId: "UHC-40217", groupNumber: "GRP-1190", payerId: "87726",
-    effectiveDate: "2026-01-01", terminationDate: "", status: "Active", priority: "Primary",
-    subscriberName: "Maria Alvarez", subscriberDob: "1985-03-14", subscriberRelationship: "Self",
-    copay: "20", deductible: "1000", coinsurance: "10%", authRequired: false, referralRequired: true, notes: "Referral required for specialists.",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2026-01-01T09:05:00", updatedAt: "2026-01-01T09:05:00" },
-  { id: "POL-1003", patientId: "P1002", insuranceCompany: "UnitedHealthcare", planName: "UHC Choice Plus", insuranceType: "Commercial",
-    memberId: "UHC-33920", subscriberId: "UHC-33920", groupNumber: "GRP-1190", payerId: "87726",
-    effectiveDate: "2025-06-01", terminationDate: "", status: "Active", priority: "Primary",
-    subscriberName: "James Whitfield", subscriberDob: "1972-11-02", subscriberRelationship: "Self",
-    copay: "20", deductible: "1000", coinsurance: "10%", authRequired: false, referralRequired: false, notes: "",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2025-06-01T09:00:00", updatedAt: "2025-06-01T09:00:00" },
-  { id: "POL-1004", patientId: "P1003", insuranceCompany: "Cigna", planName: "Cigna Open Access", insuranceType: "Commercial",
-    memberId: "CIG-77410", subscriberId: "CIG-77410", groupNumber: "GRP-2201", payerId: "62308",
-    effectiveDate: "2025-09-01", terminationDate: "", status: "Active", priority: "Primary",
-    subscriberName: "Priya Natarajan", subscriberDob: "1990-07-22", subscriberRelationship: "Self",
-    copay: "30", deductible: "2000", coinsurance: "20%", authRequired: false, referralRequired: false, notes: "",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2025-09-01T09:00:00", updatedAt: "2025-09-01T09:00:00" },
-  { id: "POL-1005", patientId: "P1004", insuranceCompany: "Aetna", planName: "Aetna Choice POS II", insuranceType: "Commercial",
-    memberId: "AET-91004", subscriberId: "AET-91004", groupNumber: "GRP-4471", payerId: "60054",
-    effectiveDate: "2025-03-01", terminationDate: "", status: "Active", priority: "Primary",
-    subscriberName: "Deshawn Carter", subscriberDob: "1965-01-09", subscriberRelationship: "Self",
-    copay: "25", deductible: "1500", coinsurance: "20%", authRequired: true, referralRequired: false, notes: "",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2025-03-01T09:00:00", updatedAt: "2025-03-01T09:00:00" },
-  { id: "POL-1006", patientId: "P1005", insuranceCompany: "Medicare", planName: "Medicare Part B", insuranceType: "Medicare",
-    memberId: "MED-10029", subscriberId: "MED-10029", groupNumber: "-", payerId: "00590",
-    effectiveDate: "2023-10-01", terminationDate: "", status: "Active", priority: "Primary",
-    subscriberName: "Linda Kowalski", subscriberDob: "1958-09-30", subscriberRelationship: "Self",
-    copay: "0", deductible: "240", coinsurance: "20%", authRequired: false, referralRequired: false, notes: "",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2023-10-01T09:00:00", updatedAt: "2023-10-01T09:00:00" },
-  { id: "POL-1007", patientId: "P1006", insuranceCompany: "Cigna", planName: "Cigna Open Access", insuranceType: "Commercial",
-    memberId: "CIG-50213", subscriberId: "CIG-50213", groupNumber: "GRP-2201", payerId: "62308",
-    effectiveDate: "2026-02-01", terminationDate: "", status: "Active", priority: "Primary",
-    subscriberName: "Omar Haddad", subscriberDob: "1999-04-17", subscriberRelationship: "Self",
-    copay: "30", deductible: "2000", coinsurance: "20%", authRequired: false, referralRequired: false, notes: "",
-    cardFront: null, cardBack: null, fieldHistory: [], createdBy: "System (seed)", createdAt: "2026-02-01T09:00:00", updatedAt: "2026-02-01T09:00:00" },
-];
-
-const seedAuditLogs = [
-  { id: "AUD-1001", patientId: "P1001", user: "System (seed)", action: "Patient created", entityType: "patient", entityId: "P1001", oldValues: null, newValues: "Maria Alvarez registered", timestamp: "2025-01-01T09:00:00" },
-  { id: "AUD-1002", patientId: "P1001", user: "System (seed)", action: "Insurance added", entityType: "insurance", entityId: "POL-1001", oldValues: null, newValues: "Aetna Choice POS II, Member AET-88213, Primary, effective 2025-01-01", timestamp: "2025-01-01T09:00:00" },
-  { id: "AUD-1003", patientId: "P1001", user: "System (seed)", action: "Insurance terminated", entityType: "insurance", entityId: "POL-1001", oldValues: "Active", newValues: "Terminated 2025-12-31 (superseded by UnitedHealthcare)", timestamp: "2026-01-01T09:05:00" },
-  { id: "AUD-1004", patientId: "P1001", user: "System (seed)", action: "Insurance added", entityType: "insurance", entityId: "POL-1002", oldValues: null, newValues: "UnitedHealthcare Choice Plus, Member UHC-40217, Primary, effective 2026-01-01", timestamp: "2026-01-01T09:05:00" },
-];
-
-const seedIdDocuments = [];
-
-// Patient-level billing/admin memos (distinct from per-charge follow-ups)
-const seedPatientMemos = [
-  { id: "PMEMO-1001", patientId: "P1004", text: "Patient requested itemized statement for tax purposes.", user: "Marcus Webb", date: "2026-08-12" },
-];
 
 const followUpTypes = ["Call", "Note", "Letter", "Portal message", "Other"];
 const followUpStatuses = ["Open", "Resolved"];
@@ -175,59 +94,6 @@ const medicationStatuses = ["Active", "Discontinued", "Completed", "Historical"]
 const problemStatuses = ["Active", "Resolved", "Historical"];
 const noteTypes = ["SOAP Note", "Progress Note", "Consultation", "Procedure Note", "Discharge Note", "Telephone Note"];
 
-const seedVitals = [
-  { id: "VIT-1001", patientId: "P1001", date: "2026-08-10", height: "165 cm", weight: "68 kg", bmi: "25.0", bp: "118/76", pulse: "72", resp: "16", temp: "98.4°F", spo2: "99%", pain: "0", recordedBy: "Dr. S. Reyes" },
-  { id: "VIT-1002", patientId: "P1004", date: "2026-08-05", height: "178 cm", weight: "92 kg", bmi: "29.0", bp: "138/88", pulse: "80", resp: "18", temp: "98.6°F", spo2: "97%", pain: "2", recordedBy: "Dr. M. Lin" },
-];
-
-const seedAllergies = [
-  { id: "ALG-1001", patientId: "P1001", substance: "Penicillin", reaction: "Hives, difficulty breathing", severity: "Severe", status: "Active", notes: "Confirmed on prior admission.", recordedDate: "2025-02-10", recordedBy: "Dr. S. Reyes" },
-  { id: "ALG-1002", patientId: "P1004", substance: "Sulfa drugs", reaction: "Rash", severity: "Moderate", status: "Active", notes: "", recordedDate: "2025-03-05", recordedBy: "Dr. M. Lin" },
-];
-
-const seedMedications = [
-  { id: "MED-1001", patientId: "P1001", name: "Lisinopril", dose: "10mg", route: "Oral", frequency: "Once daily", quantity: "30", refills: "3", startDate: "2026-01-05", endDate: "", status: "Active", prescriber: "Dr. S. Reyes", instructions: "Take in the morning with water." },
-  { id: "MED-1002", patientId: "P1004", name: "Metformin", dose: "500mg", route: "Oral", frequency: "Twice daily", quantity: "60", refills: "5", startDate: "2025-03-10", endDate: "", status: "Active", prescriber: "Dr. M. Lin", instructions: "Take with meals." },
-];
-
-const seedProblems = [
-  { id: "PRB-1001", patientId: "P1001", diagnosis: "Essential hypertension", icd10: "I10", description: "Diagnosed 2026, well controlled on Lisinopril.", onsetDate: "2026-01-05", status: "Active", notes: "" },
-  { id: "PRB-1002", patientId: "P1004", diagnosis: "Type 2 diabetes mellitus", icd10: "E11.9", description: "Diet and Metformin controlled.", onsetDate: "2025-03-10", status: "Active", notes: "Recheck A1c in 3 months." },
-];
-
-const seedClinicalNotes = [
-  { id: "NOTE-1001", patientId: "P1001", type: "SOAP Note", date: "2026-08-10", provider: "Dr. S. Reyes",
-    subjective: "Patient reports occasional mild headaches, otherwise feeling well.", objective: "BP 118/76, HR 72. No acute distress.",
-    assessment: "Hypertension, well controlled.", plan: "Continue Lisinopril 10mg daily. Follow up in 3 months.",
-    status: "Signed", signedBy: "Dr. S. Reyes", signedAt: "2026-08-10T11:20:00", amendments: [] },
-];
-
-const seedAppointments = [
-  { id: "A1", patientId: "P1001", date: "2026-08-24", time: "09:00", provider: providers[0], type: "Follow-up", status: "Checked out", cpt: "99213" },
-  { id: "A2", patientId: "P1002", date: "2026-08-24", time: "09:30", provider: providers[1], type: "Annual physical", status: "In progress", cpt: "99385" },
-  { id: "A3", patientId: "P1003", date: "2026-08-24", time: "10:15", provider: providers[0], type: "New complaint", status: "Scheduled", cpt: "99214" },
-  { id: "A4", patientId: "P1004", date: "2026-08-24", time: "11:00", provider: providers[2], type: "Lab review", status: "Scheduled", cpt: "80053" },
-  { id: "A5", patientId: "P1005", date: "2026-08-25", time: "09:00", provider: providers[0], type: "Follow-up", status: "Scheduled", cpt: "99213" },
-  { id: "A6", patientId: "P1006", date: "2026-08-25", time: "13:30", provider: providers[1], type: "Vaccination", status: "Scheduled", cpt: "90471" },
-];
-
-// Charges = the patient ledger. One row per CPT code / date of service.
-const seedCharges = [
-  { id: "C5001", patientId: "P1001", dos: "2026-08-10", provider: providers[0], referralPhysician: "", cpt: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, paid: 0, writeoff: 0, credits: 0, memos: [], postings: [], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[0]], diagnosisCodes: ["M54.5", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
-  { id: "C5002", patientId: "P1004", dos: "2026-08-05", provider: providers[2], referralPhysician: "Dr. K. Nunez", cpt: "99214", desc: "Office visit, established patient (moderate complexity)", charge: 165, paid: 0, writeoff: 0, credits: 0, memos: [{ date: "2026-08-06", text: "Claim denied for missing modifier. Follow up with Aetna.", user: "System (seed)", type: "Note", status: "Open", nextFollowUpDate: "2026-08-13" }], postings: [], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[2]], diagnosisCodes: ["E11.9", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
-  { id: "C5003", patientId: "P1004", dos: "2026-08-05", provider: providers[2], referralPhysician: "Dr. K. Nunez", cpt: "80053", desc: "Comprehensive metabolic panel", charge: 48, paid: 0, writeoff: 0, credits: 0, memos: [], postings: [], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[2]], diagnosisCodes: ["E11.9", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
-  { id: "C5004", patientId: "P1003", dos: "2026-08-15", provider: providers[0], referralPhysician: "", cpt: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, paid: 65, writeoff: 0, credits: 0, memos: [], postings: [{ id: "PST-9001", type: "Patient Credit", amount: 65, debited: 0, date: "2026-08-15", method: "Credit Card", reference: "TXN-88213", notes: "", postedBy: "Front Desk User", postedAt: "2026-08-15T10:00:00" }], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[0]], diagnosisCodes: ["J06.9", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
-  { id: "C5005", patientId: "P1002", dos: "2026-08-01", provider: providers[1], referralPhysician: "", cpt: "99385", desc: "Preventive visit, new patient (18-39y)", charge: 190, paid: 190, writeoff: 0, credits: 0, memos: [], postings: [{ id: "PST-9002", type: "Insurance Credit", amount: 190, debited: 0, date: "2026-08-02", insuranceName: "UnitedHealthcare", checkNumber: "", depositDate: "2026-08-03", reference: "EFT00293841", copay: "0", coinsurance: "0", deductible: "0", allowedAmount: "190", notes: "", postedBy: "System (seed)", postedAt: "2026-08-02T09:00:00" }], chargeInsuranceId: null, payerOverride: null, facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[1]], diagnosisCodes: ["Z00.00", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
-  { id: "C5006", patientId: "P1006", dos: "2026-08-18", provider: providers[1], referralPhysician: "", cpt: "90471", desc: "Immunization administration", charge: 35, paid: 0, writeoff: 0, credits: 0, memos: [{ date: "2026-08-19", text: "Call patient re: self-pay balance next visit.", user: "System (seed)", type: "Call", status: "Open", nextFollowUpDate: "2026-08-26" }], postings: [], chargeInsuranceId: null, payerOverride: "self", facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId, npi: providerNPI[providers[1]], diagnosisCodes: ["Z23", "", "", "", "", "", "", "", "", ""], ndc: "", units: 1, time: "" },
-];
-
-const seedClaims = [
-  { id: "CLM-7001", patientId: "P1001", chargeId: "C5001", payer: "Aetna", cpt: "99213", dx: "M54.5", amount: 110, submitted: "2026-08-11", status: "Submitted" },
-  { id: "CLM-7002", patientId: "P1004", chargeId: "C5002", payer: "Aetna", cpt: "99214", dx: "E11.9", amount: 165, submitted: "2026-08-06", status: "Denied" },
-  { id: "CLM-7003", patientId: "P1003", chargeId: "C5004", payer: "Cigna", cpt: "99213", dx: "J06.9", amount: 110, submitted: "2026-08-16", status: "Paid" },
-  { id: "CLM-7004", patientId: "P1002", chargeId: "C5005", payer: "UnitedHealthcare", cpt: "99385", dx: "Z00.00", amount: 190, submitted: "2026-08-02", status: "Paid" },
-];
-
 const revenueByMonth = [
   { month: "Mar", revenue: 8200 }, { month: "Apr", revenue: 9100 }, { month: "May", revenue: 8700 },
   { month: "Jun", revenue: 10250 }, { month: "Jul", revenue: 11020 }, { month: "Aug", revenue: 6480 },
@@ -237,7 +103,10 @@ const COLORS = ["#0d9488", "#f59e0b", "#e11d48", "#0ea5e9", "#84cc16"];
 
 // ---------- Helpers ----------
 
-const TODAY = "2026-08-24";
+function localDateString(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+const TODAY = localDateString(new Date());
 
 function daysBetween(dateStr, todayStr) {
   const d1 = new Date(dateStr + "T00:00");
@@ -250,18 +119,6 @@ function agingBucket(days) {
   if (days <= 60) return "31-60";
   if (days <= 90) return "61-90";
   return "90+";
-}
-
-// Builds an initial transaction ledger (debits = charges, credits = payments/write-offs)
-// from the seed charges, so the report center has real data to show on first load.
-function buildSeedTransactions(seedCharges) {
-  const txns = [];
-  seedCharges.forEach(c => {
-    txns.push({ id: uid("TXN"), chargeId: c.id, patientId: c.patientId, type: "charge", amount: c.charge, date: c.dos, source: "", reference: "" });
-    if (c.paid > 0) txns.push({ id: uid("TXN"), chargeId: c.id, patientId: c.patientId, type: "payment", amount: c.paid, date: c.dos, source: "Insurance", reference: "" });
-    if (c.writeoff > 0) txns.push({ id: uid("TXN"), chargeId: c.id, patientId: c.patientId, type: "writeoff", amount: c.writeoff, date: c.dos, source: "Contractual adjustment", reference: "" });
-  });
-  return txns;
 }
 
 // ---------- Export helpers (CSV / print-to-PDF) ----------
@@ -355,6 +212,266 @@ function formatFileSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// ---------- Daily Transaction report engine ----------
+//
+// Everything below is pure: the modal preview, the CSV export and the print view all call
+// generateDailyTransactionReport() and dailyTxnColumns() with the same filters, so the three
+// can never disagree about which rows or which columns a report contains.
+//
+// The app has no `receipts` collection. Money-received records live on charge.postings[], while
+// the flat `transactions` ledger is the only thing carrying batchId. So the first step is to
+// normalise those two sources into one row list, joining batches back on via posting id.
+//
+// The three date fields the report can pivot on are genuinely different columns:
+//   Service Date     charge.dos        — when care was delivered
+//   Deposit Date     posting.depositDate — when money reached the bank (payments only)
+//   Transaction Date posting.postedAt / charge.postedAt — when a human keyed it in
+// A charge has no deposit date at all, which is why DEPOSIT_DATE reports are receipts-only.
+
+const DAILY_TXN_PAGE_SIZE = 25;
+
+// Charges created before this feature shipped carry no postedBy/batchId (addCharge only started
+// stamping them later), so those columns render as "—" rather than guessing an operator.
+const UNATTRIBUTED = "—";
+
+// posting.type is an internal posting kind, not a payment method. Map it onto the payment types
+// billing staff expect to see on a receipt report.
+function receiptPaymentType(posting) {
+  switch (posting.type) {
+    case "Check": return "Check";
+    case "Credit Card": return "Credit Card";
+    case "Insurance Credit": return "Insurance";
+    // A Patient Credit records how the patient actually paid in posting.method.
+    case "Patient Credit": return posting.method || "Patient Credit";
+    case "Debit": return `Debit — ${posting.debitType || "Reversal"}`;
+    default: return posting.type || "Other";
+  }
+}
+
+// Flattens charges + their postings into one uniform row shape. Both row kinds carry every field
+// the report can filter or group on, so downstream filtering never has to branch on kind.
+function buildDailyTransactionRows({ charges, patientById, transactions }) {
+  // posting id -> batchId. Only payment-side transactions carry postingId (see addCharge and the
+  // posting handlers in ClinicApp), which is the only link from a posting back to its batch.
+  const batchByPostingId = new Map();
+  (transactions || []).forEach(t => { if (t.postingId && t.batchId) batchByPostingId.set(t.postingId, t.batchId); });
+
+  const rows = [];
+  (charges || []).forEach(c => {
+    const p = patientById[c.patientId] || {};
+    const patientName = p.name || "";
+    const patientAccount = c.patientId || "";
+
+    rows.push({
+      kind: "charge",
+      key: `chg-${c.id}`,
+      chargeId: c.id,
+      patientId: c.patientId, patientName, patientAccount,
+      serviceDate: c.dos || "",
+      receiptDate: "",
+      depositDate: "",
+      transactionDate: (c.postedAt || "").slice(0, 10) || c.dos || "",
+      cpt: c.cpt || "", desc: c.desc || "",
+      doctor: c.provider || "",
+      paymentType: "", receiptNumber: "",
+      charge: Number(c.charge) || 0,
+      adjustment: (Number(c.writeoff) || 0) + (Number(c.credits) || 0),
+      receipt: 0,
+      balance: balanceOf(c),
+      user: c.postedBy || "",
+      batchId: c.batchId || "",
+    });
+
+    // field === "paid" is money actually received. Write-off and DOS-credit postings are
+    // adjustments and are already reflected in the parent charge's `adjustment`, so counting
+    // them here as well would double-count them.
+    (c.postings || []).forEach(pt => {
+      if (pt.field !== "paid") return;
+      const isDebit = pt.type === "Debit";
+      rows.push({
+        kind: "receipt",
+        key: `rct-${c.id}-${pt.id}`,
+        chargeId: c.id, postingId: pt.id,
+        patientId: c.patientId, patientName, patientAccount,
+        serviceDate: c.dos || "",
+        receiptDate: pt.date || "",
+        depositDate: pt.depositDate || "",
+        transactionDate: (pt.postedAt || "").slice(0, 10) || pt.date || "",
+        cpt: c.cpt || "", desc: c.desc || "",
+        doctor: c.provider || "",
+        paymentType: receiptPaymentType(pt),
+        receiptNumber: pt.checkNumber || pt.reference || "",
+        charge: 0, adjustment: 0,
+        // A debit reverses a payment, so it lands on a receipt report as a negative amount.
+        receipt: (Number(pt.amount) || 0) * (isDebit ? -1 : 1),
+        balance: 0,
+        user: pt.postedBy || "",
+        batchId: batchByPostingId.get(pt.id) || "",
+      });
+    });
+  });
+  return rows;
+}
+
+// Which date column a row is filtered on. Returns "" when the row has no such date — the caller
+// treats that as "cannot match this date filter".
+function dailyTxnDateOf(row, basedOn) {
+  if (basedOn === "deposit") return row.depositDate;
+  if (basedOn === "transaction") return row.transactionDate;
+  return row.serviceDate;
+}
+
+const DAILY_TXN_DEFAULTS = {
+  patientDisplay: "name",     // "name" | "total"
+  printWithName: "both",      // "both" | "charge" | "receipt"
+  procedureMode: "all",       // "all" | "specific"
+  procedureCodes: [],
+  reportFrom: "dateSpan",     // "dateSpan" | "closing"
+  closingBatchIds: [],
+  basedOn: "service",         // "service" | "deposit" | "transaction"
+  startDate: "",
+  endDate: "",
+  doctorMode: "all",
+  doctors: [],
+  userMode: "all",
+  users: [],
+  batchMode: "all",
+  batchIds: [],
+  includeCharges: true,
+  includeReceipts: true,
+};
+
+function validateDailyTxnFilters(f) {
+  const errors = {};
+  if (f.reportFrom === "dateSpan") {
+    if (!f.startDate) errors.startDate = "Start date is required.";
+    if (!f.endDate) errors.endDate = "End date is required.";
+    if (f.startDate && f.endDate && f.endDate < f.startDate) errors.endDate = "End date cannot be before start date.";
+  } else if (!f.closingBatchIds.length) {
+    errors.closingBatchIds = "Select at least one closed batch.";
+  }
+  if (!f.includeCharges && !f.includeReceipts) errors.include = "Include charges, receipts, or both.";
+  if (f.procedureMode === "specific" && !f.procedureCodes.length) errors.procedureCodes = "Select at least one procedure code.";
+  if (f.doctorMode === "specific" && !f.doctors.length) errors.doctors = "Select at least one doctor.";
+  if (f.userMode === "specific" && !f.users.length) errors.users = "Select at least one user.";
+  if (f.batchMode === "specific" && !f.batchIds.length) errors.batchIds = "Select at least one batch.";
+  // Deposit date only exists on payments, so a charges-only deposit-date report can never match.
+  if (f.basedOn === "deposit" && !f.includeReceipts) errors.basedOn = "Deposit date applies to receipts only — include receipts to use it.";
+  return errors;
+}
+
+// The single filtering pipeline (spec §22). `rows` comes from buildDailyTransactionRows so the
+// expensive flatten can be memoised once and re-filtered cheaply.
+function generateDailyTransactionReport(filters, rows) {
+  const f = { ...DAILY_TXN_DEFAULTS, ...filters };
+  let out = rows;
+
+  // 1. charge / receipt inclusion, and the Print-With-Name narrowing (which only applies when
+  //    patient names are being shown — it is a print/export scope, not a separate filter).
+  const nameScope = f.patientDisplay === "name" ? f.printWithName : "both";
+  out = out.filter(r => {
+    if (r.kind === "charge" && !f.includeCharges) return false;
+    if (r.kind === "receipt" && !f.includeReceipts) return false;
+    if (nameScope === "charge" && r.kind !== "charge") return false;
+    if (nameScope === "receipt" && r.kind !== "receipt") return false;
+    return true;
+  });
+
+  // 2. Report source. A closing report is scoped by batch membership instead of a date span.
+  if (f.reportFrom === "closing") {
+    const ids = new Set(f.closingBatchIds);
+    out = out.filter(r => r.batchId && ids.has(r.batchId));
+  } else {
+    // 3. Date range on whichever date field was selected. Charges have no deposit date, so a
+    //    deposit-date report is receipts-only by definition.
+    if (f.basedOn === "deposit") out = out.filter(r => r.kind === "receipt");
+    out = out.filter(r => {
+      const d = dailyTxnDateOf(r, f.basedOn);
+      if (!d) return false;
+      return (!f.startDate || d >= f.startDate) && (!f.endDate || d <= f.endDate);
+    });
+  }
+
+  // 4-7. Doctor / user / batch / procedure. Specific-value filters drop unattributed rows,
+  //      since a row with no user or batch cannot be claimed to match a named one.
+  if (f.doctorMode === "specific") { const s = new Set(f.doctors); out = out.filter(r => s.has(r.doctor)); }
+  if (f.userMode === "specific") { const s = new Set(f.users); out = out.filter(r => r.user && s.has(r.user)); }
+  if (f.batchMode === "specific") { const s = new Set(f.batchIds); out = out.filter(r => r.batchId && s.has(r.batchId)); }
+  if (f.procedureMode === "specific") { const s = new Set(f.procedureCodes); out = out.filter(r => s.has(r.cpt)); }
+
+  out = [...out].sort((a, b) =>
+    (dailyTxnDateOf(a, f.basedOn) || "").localeCompare(dailyTxnDateOf(b, f.basedOn) || "") ||
+    a.patientName.localeCompare(b.patientName) ||
+    a.kind.localeCompare(b.kind)
+  );
+
+  // 8. Totals, always from the filtered set — never hard-coded.
+  const totals = {
+    totalPatients: new Set(out.map(r => r.patientId)).size,
+    totalTransactions: out.length,
+    totalCharges: out.reduce((s, r) => s + r.charge, 0),
+    totalAdjustments: out.reduce((s, r) => s + r.adjustment, 0),
+    totalReceipts: out.reduce((s, r) => s + r.receipt, 0),
+    remainingBalance: out.reduce((s, r) => s + r.balance, 0),
+  };
+
+  return { rows: out, totals, filters: f };
+}
+
+// Column visibility is derived once here and consumed by the preview table, the CSV and the
+// print view (spec §25), so a hidden column can never leak into an export.
+function dailyTxnColumns(filters) {
+  const f = { ...DAILY_TXN_DEFAULTS, ...filters };
+  const showNames = f.patientDisplay === "name";
+  const scope = showNames ? f.printWithName : "both";
+  const wantCharge = scope !== "receipt" && f.includeCharges;
+  const wantReceipt = scope !== "charge" && f.includeReceipts;
+
+  const cols = [];
+  if (showNames) {
+    cols.push({ key: "patientName", label: "Patient Name", get: r => r.patientName || UNATTRIBUTED });
+    cols.push({ key: "patientAccount", label: "Patient ID", get: r => r.patientAccount });
+  }
+  cols.push({ key: "kind", label: "Transaction", get: r => (r.kind === "charge" ? "Charge" : "Receipt") });
+  cols.push({ key: "serviceDate", label: "Service Date", get: r => r.serviceDate || UNATTRIBUTED });
+  cols.push({ key: "transactionDate", label: "Transaction Date", get: r => r.transactionDate || UNATTRIBUTED });
+  if (wantReceipt) cols.push({ key: "depositDate", label: "Deposit Date", get: r => r.depositDate || UNATTRIBUTED });
+  cols.push({ key: "cpt", label: "Procedure Code", get: r => r.cpt || UNATTRIBUTED });
+  cols.push({ key: "doctor", label: "Doctor", get: r => r.doctor || UNATTRIBUTED });
+  if (wantReceipt) {
+    cols.push({ key: "paymentType", label: "Payment Type", get: r => r.paymentType || UNATTRIBUTED });
+    cols.push({ key: "receiptNumber", label: "Receipt Number", get: r => r.receiptNumber || UNATTRIBUTED });
+  }
+  if (wantCharge) {
+    cols.push({ key: "charge", label: "Charge", get: r => r.charge, money: true, align: "right" });
+    cols.push({ key: "adjustment", label: "Adjustment", get: r => r.adjustment, money: true, align: "right" });
+  }
+  if (wantReceipt) cols.push({ key: "receipt", label: "Receipt", get: r => r.receipt, money: true, align: "right" });
+  if (wantCharge) cols.push({ key: "balance", label: "Remaining Balance", get: r => r.balance, money: true, align: "right" });
+  cols.push({ key: "user", label: "User", get: r => r.user || UNATTRIBUTED });
+  cols.push({ key: "batch", label: "Batch", get: r => r.batchId || UNATTRIBUTED });
+  return cols;
+}
+
+// CSV rows are built from the same column list as the on-screen table, so "do not export records
+// or columns excluded by the filters" holds automatically.
+function dailyTxnCsvRows(rows, columns) {
+  return rows.map(r => Object.fromEntries(columns.map(c => {
+    const v = c.get(r);
+    return [c.label, c.money ? (Number(v) || 0).toFixed(2) : v];
+  })));
+}
+
+function dailyTxnFilename(filters, batchLabelById = {}) {
+  const f = { ...DAILY_TXN_DEFAULTS, ...filters };
+  const safe = (s) => String(s).replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  let scope = "";
+  if (f.doctorMode === "specific" && f.doctors.length === 1) scope = `_${safe(f.doctors[0])}`;
+  else if (f.batchMode === "specific" && f.batchIds.length === 1) scope = `_Batch_${safe(batchLabelById[f.batchIds[0]] || f.batchIds[0])}`;
+  const span = f.reportFrom === "closing" ? "Closing" : `${f.startDate || "all"}_to_${f.endDate || "all"}`;
+  return `Daily_Transaction_Report${scope}_${span}.csv`;
 }
 
 // Opens an uploaded ID document in a separate, small popup window — never a same-tab navigation
@@ -571,10 +688,12 @@ function Card({ children, className = "" }) {
   return <div className={`bg-white border border-slate-200 rounded-xl ${className}`}>{children}</div>;
 }
 
-function Modal({ title, onClose, children, wide }) {
+// `size` is an optional Tailwind max-width escape hatch for reports that need more room than
+// `wide` gives; omitting it keeps the original md/2xl behaviour every existing caller relies on.
+function Modal({ title, onClose, children, wide, size }) {
   return (
-    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center z-50 p-4">
-      <div className={`bg-white rounded-xl shadow-xl w-full ${wide ? "max-w-2xl" : "max-w-md"} max-h-[85vh] overflow-y-auto`}>
+    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center z-50 p-4 print:hidden">
+      <div className={`bg-white rounded-xl shadow-xl w-full ${size || (wide ? "max-w-2xl" : "max-w-md")} max-h-[85vh] overflow-y-auto`}>
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 sticky top-0 bg-white">
           <h3 className="font-semibold text-slate-800">{title}</h3>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
@@ -651,20 +770,31 @@ function LoginPage({ onLogin }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  function submit(e) {
+  async function submit(e) {
     e.preventDefault();
     setLoading(true);
-    setTimeout(() => {
-      const user = DEMO_USERS.find(u => u.email.toLowerCase() === email.trim().toLowerCase() && u.password === password);
-      if (!user) {
-        setError("Invalid email or password.");
+    setError("");
+    try {
+      const credential = await signIn(email.trim(), password);
+      const profile = await fetchUserProfile(credential.user.uid);
+      if (!profile) {
+        await signOutUser();
+        setError("No profile found for this account. Ask an admin to provision your access.");
         setLoading(false);
         return;
       }
-      setError("");
+      if (profile.disabled) {
+        await signOutUser();
+        setError("This account has been deactivated. Contact an administrator.");
+        setLoading(false);
+        return;
+      }
       setLoading(false);
-      onLogin(user);
-    }, 350); // simulated request latency
+      onLogin({ uid: credential.user.uid, email: credential.user.email, name: profile.name, role: profile.role });
+    } catch {
+      setError("Invalid email or password.");
+      setLoading(false);
+    }
   }
 
   return (
@@ -709,14 +839,14 @@ function LoginPage({ onLogin }) {
         <Card className="p-4 mt-4 bg-amber-50 border-amber-200">
           <p className="text-xs font-medium text-amber-800 mb-2 flex items-center gap-1.5"><AlertTriangle size={13} /> Development-only credentials</p>
           <div className="space-y-1 text-xs text-amber-700">
-            {DEMO_USERS.map(u => (
+            {DEMO_LOGIN_HINTS.map(u => (
               <div key={u.email} className="flex justify-between">
                 <span>{ROLE_LABELS[u.role]}</span>
                 <button onClick={() => { setEmail(u.email); setPassword(u.password); }} className="underline hover:no-underline">{u.email}</button>
               </div>
             ))}
           </div>
-          <p className="text-[11px] text-amber-600 mt-2">Shown here because this is a demo build — a real deployment must hide this panel outside development and never ship hardcoded passwords.</p>
+          <p className="text-[11px] text-amber-600 mt-2">These accounts are created by scripts/seedFirestore.mjs — shown here only because this is a demo build. Sign-in itself goes through Firebase Auth, not this list.</p>
         </Card>
       </div>
     </div>
@@ -766,13 +896,12 @@ const storageAdapter = {
 
 const SESSION_KEY = "clinic_session";
 const NAV_KEY = "clinic_nav";
-const IDLE_LIMIT_MS = 2 * 60 * 60 * 1000; // 2 hours
+const IDLE_LIMIT_MS = 2 * 60 * 30 * 1000; // 2 hours
 const SESSION_WRITE_THROTTLE_MS = 60 * 1000; // don't hammer storage on every click/keystroke
 
 export default function ClinicBilling() {
   const [session, setSession] = useState(null);
   const [checkingSession, setCheckingSession] = useState(true); // avoids a login-page flash on refresh
-  const [loginAudit, setLoginAudit] = useState([]); // lightweight system-level log (login/logout aren't tied to a patient)
   const lastActivityRef = useRef(Date.now());
   const lastWriteRef = useRef(0);
 
@@ -828,17 +957,18 @@ export default function ClinicBilling() {
   }
 
   function handleLogin(user) {
-    const sess = { email: user.email, name: user.name, role: user.role, loginAt: Date.now(), lastActivity: Date.now() };
+    const sess = { uid: user.uid, email: user.email, name: user.name, role: user.role, loginAt: Date.now(), lastActivity: Date.now() };
     setSession(sess);
     lastActivityRef.current = Date.now();
     lastWriteRef.current = Date.now();
     persistSession(sess);
-    setLoginAudit(prev => [{ id: uid("SYS"), action: "Login", user: user.name, role: user.role, timestamp: nowIso() }, ...prev]);
+    addDocument("loginAudit", { action: "Login", user: user.name, role: user.role, timestamp: nowIso() });
   }
 
   async function handleLogout(reason) {
-    setLoginAudit(prev => [{ id: uid("SYS"), action: reason === "timeout" ? "Session expired (2h inactivity)" : "Logout", user: session?.name, role: session?.role, timestamp: nowIso() }, ...prev]);
+    addDocument("loginAudit", { action: reason === "timeout" ? "Session expired (2h inactivity)" : "Logout", user: session?.name, role: session?.role, timestamp: nowIso() });
     setSession(null);
+    await signOutUser();
     await storageAdapter.remove(SESSION_KEY);
     // Deliberately keep NAV_KEY on manual logout/timeout so the next login for this browser
     // returns to the same place — only a fresh "start over" would need to clear it.
@@ -889,27 +1019,50 @@ function ClinicApp({
   session, onLogout,
   tab, setTab, billingPatientId, setBillingPatientId, billingMode, setBillingMode, clinicalPatientId, setClinicalPatientId,
 }) {
-  const [patients, setPatients] = useState(seedPatients);
-  const [appointments, setAppointments] = useState(seedAppointments);
-  const [charges, setCharges] = useState(seedCharges);
-  const [claims, setClaims] = useState(seedClaims);
-  const [transactions, setTransactions] = useState(() => buildSeedTransactions(seedCharges));
-  const [policies, setPolicies] = useState(seedInsurancePolicies);
-  const [auditLogs, setAuditLogs] = useState(seedAuditLogs);
-  const [idDocuments, setIdDocuments] = useState(seedIdDocuments);
-  const [patientMemos, setPatientMemos] = useState(seedPatientMemos);
+  // Every collection below is a real-time Firestore read (src/firebase/firestoreService.js) —
+  // writes go out via the handler functions further down and this array updates automatically
+  // once Firestore confirms them, the same way the old setPatients(prev => ...) calls used to
+  // update local state immediately.
+  const [patients, lPatients] = useFirestoreCollection("patients");
+  const [appointments, lAppointments] = useFirestoreCollection("appointments");
+  const [charges, lCharges] = useFirestoreCollection("charges");
+  const [claims, lClaims] = useFirestoreCollection("claims");
+  const [transactions, lTransactions] = useFirestoreCollection("transactions");
+  const [policies, lPolicies] = useFirestoreCollection("insurancePolicies");
+  const [auditLogs, lAuditLogs] = useFirestoreCollection("auditLogs");
+  const [idDocuments, lIdDocuments] = useFirestoreCollection("idDocuments");
+  const [patientMemos, lPatientMemos] = useFirestoreCollection("patientMemos");
+  const [cptCatalog, lCptCatalog] = useFirestoreCollection("cptCatalog");
   // Credit balance pools created by "Credit Balance"-type debits — usable against any patient's charges.
-  const [patientCreditBalances, setPatientCreditBalances] = useState([]);
-  const [insuranceCreditBalances, setInsuranceCreditBalances] = useState([]);
-  const [vitals, setVitals] = useState(seedVitals);
-  const [allergies, setAllergies] = useState(seedAllergies);
-  const [medications, setMedications] = useState(seedMedications);
-  const [problems, setProblems] = useState(seedProblems);
-  const [clinicalNotes, setClinicalNotes] = useState(seedClinicalNotes);
+  const [patientCreditBalances, lPatientCreditBalances] = useFirestoreCollection("patientCreditBalances");
+  const [insuranceCreditBalances, lInsuranceCreditBalances] = useFirestoreCollection("insuranceCreditBalances");
+  const [vitals, lVitals] = useFirestoreCollection("vitals");
+  const [allergies, lAllergies] = useFirestoreCollection("allergies");
+  const [medications, lMedications] = useFirestoreCollection("medications");
+  const [problems, lProblems] = useFirestoreCollection("problems");
+  const [clinicalNotes, lClinicalNotes] = useFirestoreCollection("clinicalNotes");
+  // Every signed-in user can read the users collection now (see firestore.rules) — needed for
+  // the Tickler "Assign To" picker, not just the SUPER_ADMIN-only User Management screen.
+  const [userAccounts, lUserAccounts] = useFirestoreCollection("users");
+  const [batches, lBatches] = useFirestoreCollection("batches");
+  const [ticklers, lTicklers] = useFirestoreCollection("ticklers");
+  const [supportTickets, lSupportTickets] = useFirestoreCollection("supportTickets");
+
+  // First Firestore snapshot for every collection hasn't landed yet — hold off rendering the
+  // real UI so nothing briefly flashes "no data" (or a cptCatalog[0] lookup crashes) before the
+  // seeded data actually arrives.
+  const dataLoading = lPatients || lAppointments || lCharges || lClaims || lTransactions || lPolicies ||
+    lAuditLogs || lIdDocuments || lPatientMemos || lCptCatalog || lPatientCreditBalances ||
+    lInsuranceCreditBalances || lVitals || lAllergies || lMedications || lProblems || lClinicalNotes ||
+    lUserAccounts || lBatches || lTicklers || lSupportTickets;
 
   const [showAddPatient, setShowAddPatient] = useState(false);
   const [showAddAppt, setShowAddAppt] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState(null);
+  const [showBatchManagement, setShowBatchManagement] = useState(false);
+  const [showSupportPanel, setShowSupportPanel] = useState(false);
+  const [showTicklerPanel, setShowTicklerPanel] = useState(false);
+  const [ticklerPrefill, setTicklerPrefill] = useState(null); // set to open the Tickler panel pre-filled from a charge
 
   const patientById = useMemo(() => Object.fromEntries(patients.map(p => [p.id, p])), [patients]);
   const chargeById = useMemo(() => Object.fromEntries(charges.map(c => [c.id, c])), [charges]);
@@ -947,15 +1100,23 @@ function ClinicApp({
     { id: "billing", label: "Billing", icon: Receipt },
     { id: "claims", label: "Claims", icon: FileStack },
     { id: "reports", label: "Reports", icon: BarChart3 },
+    { id: "users", label: "Users", icon: UserCog },
   ];
   const allowedTabs = ROLE_TABS[session.role] || ["dashboard"];
   const nav = allNav.filter(item => allowedTabs.includes(item.id));
   const tabAllowed = allowedTabs.includes(tab);
 
+  // The batch this user currently has open, if any — a user can only ever have one (batches are
+  // keyed by userId+date, see openBatch), so there's at most one OPEN doc for this uid at a time.
+  const myOpenBatch = batches.find(b => b.userId === session.uid && b.status === "OPEN") || null;
+  const isBillingOversightRole = session.role === "SUPER_ADMIN" || session.role === "MANAGER";
+  // Badge on the floating Tickler button: open items assigned to me that are due today or overdue.
+  const ticklerBadgeCount = ticklers.filter(t => t.assignedToUid === session.uid && t.status === "Open" && t.reminderDate <= TODAY).length;
+
   // ---------- Handlers ----------
 
   function addAudit(patientId, action, entityType, entityId, oldValues, newValues) {
-    setAuditLogs(prev => [{ id: uid("AUD"), patientId, user: "Front Desk User", action, entityType, entityId, oldValues, newValues, timestamp: nowIso() }, ...prev]);
+    addDocument("auditLogs", { patientId, user: session.name, action, entityType, entityId, oldValues, newValues, timestamp: nowIso() }, uid("AUD"));
   }
 
   function addPatient(form) {
@@ -967,7 +1128,7 @@ function ClinicApp({
     const id = uid("P");
     const patient = { ...form, id };
     delete patient._forceCreate;
-    setPatients(prev => [...prev, patient]);
+    setDocument("patients", id, patient);
     addAudit(id, "Patient created", "patient", id, null, `${patient.name} registered`);
     setShowAddPatient(false);
     setDuplicateWarning(null);
@@ -975,7 +1136,7 @@ function ClinicApp({
 
   function updatePatient(patientId, updates) {
     const before = patientById[patientId];
-    setPatients(prev => prev.map(p => p.id === patientId ? { ...p, ...updates } : p));
+    updateDocument("patients", patientId, updates);
     const changed = Object.keys(updates).filter(k => JSON.stringify(before[k]) !== JSON.stringify(updates[k]));
     if (changed.length) addAudit(patientId, "Patient updated", "patient", patientId, changed.map(k => `${k}: ${before[k]}`).join("; "), changed.map(k => `${k}: ${updates[k]}`).join("; "));
   }
@@ -985,11 +1146,11 @@ function ClinicApp({
     const conflict = policies.find(pol => pol.patientId === patientId && pol.priority === form.priority && pol.status === "Active");
     if (conflict) {
       const endDate = form.effectiveDate ? new Date(new Date(form.effectiveDate + "T00:00") - 86400000).toISOString().slice(0, 10) : TODAY;
-      setPolicies(prev => prev.map(pol => pol.id === conflict.id ? { ...pol, status: "Terminated", terminationDate: endDate, updatedAt: nowIso() } : pol));
+      updateDocument("insurancePolicies", conflict.id, { status: "Terminated", terminationDate: endDate, updatedAt: nowIso() });
       addAudit(patientId, "Insurance terminated", "insurance", conflict.id, "Active", `Terminated ${endDate} (superseded by ${form.insuranceCompany})`);
     }
     const id = uid("POL");
-    setPolicies(prev => [...prev, { id, patientId, status: "Active", fieldHistory: [], createdBy: "Front Desk User", createdAt: nowIso(), updatedAt: nowIso(), ...form }]);
+    setDocument("insurancePolicies", id, { id, patientId, status: "Active", fieldHistory: [], createdBy: session.name, createdAt: nowIso(), updatedAt: nowIso(), ...form });
     addAudit(patientId, "Insurance added", "insurance", id, null, `${form.insuranceCompany} ${form.planName}, Member ${form.memberId}, ${form.priority}, effective ${form.effectiveDate}`);
   }
 
@@ -998,8 +1159,8 @@ function ClinicApp({
     if (!policy) return;
     if (createNew) { addInsurance(policy.patientId, { ...policy, ...updates, id: undefined }); return; }
     const changedFields = Object.keys(updates).filter(k => policy[k] !== updates[k]);
-    const historyEntries = changedFields.map(k => ({ field: k, oldValue: policy[k], newValue: updates[k], changedAt: nowIso(), changedBy: "Front Desk User" }));
-    setPolicies(prev => prev.map(p => p.id === policyId ? { ...p, ...updates, fieldHistory: [...p.fieldHistory, ...historyEntries], updatedAt: nowIso() } : p));
+    const historyEntries = changedFields.map(k => ({ field: k, oldValue: policy[k], newValue: updates[k], changedAt: nowIso(), changedBy: session.name }));
+    updateDocument("insurancePolicies", policyId, { ...updates, fieldHistory: [...(policy.fieldHistory || []), ...historyEntries], updatedAt: nowIso() });
     if (changedFields.length) addAudit(policy.patientId, "Insurance updated", "insurance", policyId, changedFields.map(k => `${k}: ${policy[k]}`).join("; "), changedFields.map(k => `${k}: ${updates[k]}`).join("; "));
   }
 
@@ -1007,49 +1168,62 @@ function ClinicApp({
     const policy = policies.find(p => p.id === policyId);
     if (!policy) return;
     const holder = policies.find(p => p.patientId === policy.patientId && p.priority === newPriority && p.status === "Active" && p.id !== policyId);
-    setPolicies(prev => prev.map(p => {
-      if (p.id === policyId) return { ...p, priority: newPriority, updatedAt: nowIso() };
-      if (holder && p.id === holder.id) return { ...p, priority: policy.priority, updatedAt: nowIso() };
-      return p;
-    }));
+    const batch = newBatch();
+    batch.update(docRef("insurancePolicies", policyId), { priority: newPriority, updatedAt: nowIso() });
+    if (holder) batch.update(docRef("insurancePolicies", holder.id), { priority: policy.priority, updatedAt: nowIso() });
+    batch.commit();
     addAudit(policy.patientId, "Insurance priority changed", "insurance", policyId, policy.priority, newPriority);
   }
 
   function endCoverage(policyId, endDate) {
     const policy = policies.find(p => p.id === policyId);
     if (!policy) return;
-    setPolicies(prev => prev.map(p => p.id === policyId ? { ...p, status: "Terminated", terminationDate: endDate, updatedAt: nowIso() } : p));
+    updateDocument("insurancePolicies", policyId, { status: "Terminated", terminationDate: endDate, updatedAt: nowIso() });
     addAudit(policy.patientId, "Insurance ended", "insurance", policyId, "Active", `Terminated ${endDate}`);
   }
 
   function uploadInsuranceCard(policyId, side, dataUrl) {
     const policy = policies.find(p => p.id === policyId);
-    setPolicies(prev => prev.map(p => p.id === policyId ? { ...p, [side]: dataUrl, updatedAt: nowIso() } : p));
+    updateDocument("insurancePolicies", policyId, { [side]: dataUrl, updatedAt: nowIso() });
     addAudit(policy.patientId, "Insurance card uploaded", "insurance", policyId, null, side === "cardFront" ? "Front card image" : "Back card image");
   }
 
-  function uploadIdDocument(patientId, doc) {
-    // Previous ID docs of the same type are archived, never deleted — history stays queryable.
-    setIdDocuments(prev => prev.map(d => d.patientId === patientId && d.idType === doc.idType && d.status === "Active" ? { ...d, status: "Archived" } : d));
+  // Stores the file inline on the Firestore document as a base64 data URL — no Cloud Storage
+  // bucket involved. (Firebase Storage — and Realtime Database — both require the project to be
+  // on the Blaze billing plan to provision a new bucket/instance at all, even for free-tier
+  // usage; this keeps the app fully working on the free Spark plan instead.) Firestore documents
+  // cap out at 1 MiB, so IdDocForm rejects files over ~700KB before they ever get here — plenty
+  // for a photographed/scanned ID, not for a high-res multi-page PDF.
+  // Previous ID docs of the same type are archived, never deleted — history stays queryable.
+  async function uploadIdDocument(patientId, doc) {
     const id = uid("DOC");
-    setIdDocuments(prev => [...prev, { id, patientId, status: "Active", uploadedBy: session.name, uploadedAt: nowIso(), ...doc }]);
+    const toArchive = idDocuments.filter(d => d.patientId === patientId && d.idType === doc.idType && d.status === "Active");
+    const batch = newBatch();
+    toArchive.forEach(d => batch.update(docRef("idDocuments", d.id), { status: "Archived" }));
+    batch.set(docRef("idDocuments", id), {
+      id, patientId, status: "Active", uploadedBy: session.name, uploadedAt: nowIso(),
+      idType: doc.idType, idNumber: doc.idNumber, issuingState: doc.issuingState, issueDate: doc.issueDate, expirationDate: doc.expirationDate,
+      file: doc.file, fileName: doc.fileName, fileType: doc.fileType, fileSize: doc.fileSize,
+    });
+    await batch.commit();
     addAudit(patientId, "ID uploaded", "document", id, null, `${doc.idType} ${doc.idNumber || ""}`.trim());
   }
 
   // Soft-delete: this app never hard-deletes records (everything is append-only, see addAudit
   // callers throughout), so "Delete" archives the document instead — it drops off the active
-  // list but stays in history rather than vanishing without a trace.
+  // list but stays in history rather than vanishing without a trace. The Storage file is left in
+  // place too, for the same reason.
   function archiveIdDocument(patientId, docId) {
     const doc = idDocuments.find(d => d.id === docId && d.patientId === patientId);
     if (!doc || doc.status !== "Active") return;
-    setIdDocuments(prev => prev.map(d => d.id === docId ? { ...d, status: "Archived" } : d));
+    updateDocument("idDocuments", docId, { status: "Archived" });
     addAudit(patientId, "ID document deleted", "document", docId, "Active", `${doc.idType} ${doc.idNumber || ""}`.trim());
   }
 
   // ----- Patient-level memos (billing/admin notes, separate from per-charge follow-ups) -----
   function addPatientMemo(patientId, text) {
     const id = uid("PMEMO");
-    setPatientMemos(prev => [...prev, { id, patientId, text, user: session.name, date: TODAY }]);
+    setDocument("patientMemos", id, { id, patientId, text, user: session.name, date: TODAY });
     addAudit(patientId, "Memo added", "memo", id, null, text);
   }
 
@@ -1061,6 +1235,7 @@ function ClinicApp({
   // payment (field "paid") is posted in full even past that room — the charge is then legitimately
   // overpaid and balanceOf() goes negative rather than silently truncating the payment.
   function postToChargeMulti(chargeId, entries) {
+    if (!myOpenBatch) { alert("Open your batch before posting payments — see the batch status in the header."); return; }
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
     let room = Math.max(0, target.charge - target.paid - target.writeoff - (target.credits || 0));
@@ -1076,16 +1251,19 @@ function ClinicApp({
       applied.push({ ...entry, amount: amt, postingId: uid("PST") });
     });
     if (applied.length === 0) return;
-    setCharges(prev => prev.map(c => {
-      if (c.id !== chargeId) return c;
-      const fieldDeltas = {};
-      applied.forEach(e => { fieldDeltas[e.field] = (fieldDeltas[e.field] || 0) + e.amount; });
-      const updated = { ...c };
-      Object.entries(fieldDeltas).forEach(([field, delta]) => { updated[field] = (c[field] || 0) + delta; });
-      updated.postings = [...(c.postings || []), ...applied.map(e => ({ id: e.postingId, field: e.field, amount: e.amount, debited: 0, postedBy: session.name, postedAt: nowIso(), ...e.posting }))];
-      return updated;
-    }));
-    setTransactions(prev => [...prev, ...applied.map(e => ({ id: uid("TXN"), postingId: e.postingId, chargeId, patientId: target.patientId, type: e.txnType, amount: e.amount, date: e.posting.date || TODAY, source: e.posting.insuranceName || e.posting.payer || e.posting.method || "Manual", reference: e.posting.reference || e.posting.checkNumber || "" }))]);
+
+    const fieldDeltas = {};
+    applied.forEach(e => { fieldDeltas[e.field] = (fieldDeltas[e.field] || 0) + e.amount; });
+    const updatedFields = {};
+    Object.entries(fieldDeltas).forEach(([field, delta]) => { updatedFields[field] = (target[field] || 0) + delta; });
+    updatedFields.postings = [...(target.postings || []), ...applied.map(e => ({ id: e.postingId, field: e.field, amount: e.amount, debited: 0, postedBy: session.name, postedAt: nowIso(), ...e.posting }))];
+
+    const batch = newBatch();
+    batch.update(docRef("charges", chargeId), updatedFields);
+    applied.forEach(e => {
+      batch.set(docRef("transactions", uid("TXN")), { postingId: e.postingId, batchId: myOpenBatch.id, chargeId, patientId: target.patientId, type: e.txnType, amount: e.amount, date: e.posting.date || TODAY, source: e.posting.insuranceName || e.posting.payer || e.posting.method || "Manual", reference: e.posting.reference || e.posting.checkNumber || "" });
+    });
+    batch.commit();
     applied.forEach(e => addAudit(target.patientId, e.auditLabel, "charge", chargeId, null, `${money(e.amount)} — ${e.posting.notes || e.posting.type || ""}`.trim()));
   }
   function postToCharge(chargeId, entry) {
@@ -1158,7 +1336,7 @@ function ClinicApp({
   function selectInsuranceForCharge(chargeId, policyId) {
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, chargeInsuranceId: policyId, payerOverride: null } : c));
+    updateDocument("charges", chargeId, { chargeInsuranceId: policyId, payerOverride: null });
     const pol = policies.find(p => p.id === policyId);
     addAudit(target.patientId, "Claim payer changed", "charge", chargeId, payerLabel(target, policies), pol ? pol.insuranceCompany : "Unassigned");
   }
@@ -1166,20 +1344,20 @@ function ClinicApp({
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
     // Insurance association is preserved, not cleared — only the payer display/override changes.
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, payerOverride: "self" } : c));
+    updateDocument("charges", chargeId, { payerOverride: "self" });
     addAudit(target.patientId, "Claim payer changed", "charge", chargeId, payerLabel(target, policies), "Self / Patient");
   }
   function editClaimFields(chargeId, updates) {
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
     const changed = Object.keys(updates).filter(k => target[k] !== updates[k]);
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, ...updates } : c));
+    updateDocument("charges", chargeId, updates);
     if (changed.length) addAudit(target.patientId, "Claim updated", "charge", chargeId, changed.map(k => `${k}: ${target[k]}`).join("; "), changed.map(k => `${k}: ${updates[k]}`).join("; "));
   }
   function addFollowUp(chargeId, entry) {
     const target = charges.find(c => c.id === chargeId);
     if (!target) return;
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, memos: [...c.memos, { ...entry, user: session.name }] } : c));
+    updateDocument("charges", chargeId, { memos: [...(target.memos || []), { ...entry, user: session.name }] });
     addAudit(target.patientId, "Follow-up added", "charge", chargeId, null, `${entry.type}: ${entry.text}`);
   }
 
@@ -1198,51 +1376,53 @@ function ClinicApp({
     if (form.systemDebit) {
       if (debitable <= 0) return;
       const field = posting.field || "paid";
-      setCharges(prev => prev.map(c => c.id === chargeId ? {
-        ...c,
-        [field]: Math.max(0, (c[field] || 0) - debitable),
-        postings: c.postings.filter(p => p.id !== postingId),
+      const batch = newBatch();
+      batch.update(docRef("charges", chargeId), {
+        [field]: Math.max(0, (target[field] || 0) - debitable),
+        postings: target.postings.filter(p => p.id !== postingId),
         // Surfaced in Follow-up history too — that panel is what billing staff actually look at
         // per DOS, and a removal like this shouldn't be visible only in the separate Audit History tab.
-        memos: [...(c.memos || []), { type: "System Debit", text: `System debited — ${posting.type} ${money(debitable)} removed from the ledger (no reason recorded).`, date: TODAY, user: session.name }],
-      } : c));
-      setTransactions(prev => prev.filter(t => t.postingId !== postingId));
+        memos: [...(target.memos || []), { type: "System Debit", text: `System debited — ${posting.type} ${money(debitable)} removed from the ledger (no reason recorded).`, date: TODAY, user: session.name }],
+      });
+      transactions.filter(t => t.postingId === postingId).forEach(t => batch.delete(docRef("transactions", t.id)));
+      batch.commit();
       addAudit(target.patientId, "System debit — posting removed", "charge", chargeId, `${posting.type} ${money(posting.amount)}`, "Removed entirely by system debit (no reason recorded)");
       return;
     }
 
+    if (!myOpenBatch) { alert("Open your batch before posting a debit — see the batch status in the header."); return; }
     const applied = Math.min(debitable, Number(form.amount) || 0);
     if (applied <= 0) return;
 
     const debitId = uid("PST");
-    setCharges(prev => prev.map(c => {
-      if (c.id !== chargeId) return c;
-      return {
-        ...c,
-        paid: Math.max(0, c.paid - applied),
-        postings: [
-          ...c.postings.map(p => p.id === postingId ? { ...p, debited: (p.debited || 0) + applied } : p),
-          { id: debitId, type: "Debit", debitType: form.debitType, reason: form.reason, amount: applied, date: form.date, notes: form.notes, reversalOf: postingId, postedBy: session.name, postedAt: nowIso() },
-        ],
-      };
-    }));
-    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId, patientId: target.patientId, type: "debit", amount: applied, date: form.date || TODAY, source: form.debitType, reference: form.reason }]);
-    addAudit(target.patientId, "Payment debited", "charge", chargeId, `${posting.type} ${money(posting.amount)}`, `${money(applied)} debited — ${form.reason} (${form.debitType})`);
+    const batch = newBatch();
+    batch.update(docRef("charges", chargeId), {
+      paid: Math.max(0, target.paid - applied),
+      postings: [
+        ...target.postings.map(p => p.id === postingId ? { ...p, debited: (p.debited || 0) + applied } : p),
+        { id: debitId, type: "Debit", debitType: form.debitType, reason: form.reason, amount: applied, date: form.date, notes: form.notes, reversalOf: postingId, postedBy: session.name, postedAt: nowIso() },
+      ],
+    });
+    batch.set(docRef("transactions", uid("TXN")), { batchId: myOpenBatch.id, chargeId, patientId: target.patientId, type: "debit", amount: applied, date: form.date || TODAY, source: form.debitType, reference: form.reason });
 
     // "Credit Balance" debits keep the money in the practice as an applicable credit pool;
     // "Refund" debits pay it back out and create no pool entry.
     if (form.debitType === "Patient Credit Balance") {
-      setPatientCreditBalances(prev => [...prev, { id: uid("PCB"), patientId: target.patientId, amount: applied, remaining: applied, reason: form.reason, date: form.date, sourceChargeId: chargeId, sourcePostingId: debitId, createdBy: session.name, createdAt: nowIso() }]);
+      batch.set(docRef("patientCreditBalances", uid("PCB")), { patientId: target.patientId, amount: applied, remaining: applied, reason: form.reason, date: form.date, sourceChargeId: chargeId, sourcePostingId: debitId, createdBy: session.name, createdAt: nowIso() });
     }
     if (form.debitType === "Insurance Credit Balance") {
       const insuranceName = posting.insuranceName || "Unspecified insurer";
-      setInsuranceCreditBalances(prev => [...prev, { id: uid("ICB"), insuranceName, patientId: target.patientId, amount: applied, remaining: applied, reason: form.reason, date: form.date, sourceChargeId: chargeId, sourcePostingId: debitId, createdBy: session.name, createdAt: nowIso() }]);
+      batch.set(docRef("insuranceCreditBalances", uid("ICB")), { insuranceName, patientId: target.patientId, amount: applied, remaining: applied, reason: form.reason, date: form.date, sourceChargeId: chargeId, sourcePostingId: debitId, createdBy: session.name, createdAt: nowIso() });
     }
+    batch.commit();
+    addAudit(target.patientId, "Payment debited", "charge", chargeId, `${posting.type} ${money(posting.amount)}`, `${money(applied)} debited — ${form.reason} (${form.debitType})`);
   }
 
   // Applies an existing credit-balance pool entry (patient- or insurance-sourced) as a payment
   // toward any patient's open charge — including a different patient than the one who generated it.
   function applyCreditBalance(poolType, creditId, targetChargeId, amount) {
+    if (!myOpenBatch) { alert("Open your batch before applying a credit balance — see the batch status in the header."); return; }
+    const poolName = poolType === "patient" ? "patientCreditBalances" : "insuranceCreditBalances";
     const pool = poolType === "patient" ? patientCreditBalances : insuranceCreditBalances;
     const credit = pool.find(c => c.id === creditId);
     const targetCharge = charges.find(c => c.id === targetChargeId);
@@ -1251,20 +1431,20 @@ function ClinicApp({
     const applied = Math.min(credit.remaining, room, Number(amount) || 0);
     if (applied <= 0) return;
 
-    const setPool = poolType === "patient" ? setPatientCreditBalances : setInsuranceCreditBalances;
-    setPool(prev => prev.map(c => c.id === creditId ? { ...c, remaining: c.remaining - applied } : c));
-
     const postingId = uid("PST");
-    setCharges(prev => prev.map(c => c.id === targetChargeId ? {
-      ...c, paid: c.paid + applied,
-      postings: [...(c.postings || []), {
+    const batch = newBatch();
+    batch.update(docRef(poolName, creditId), { remaining: credit.remaining - applied });
+    batch.update(docRef("charges", targetChargeId), {
+      paid: targetCharge.paid + applied,
+      postings: [...(targetCharge.postings || []), {
         id: postingId, type: poolType === "patient" ? "Patient Credit" : "Insurance Credit", amount: applied, debited: 0,
         notes: `Applied from ${poolType === "patient" ? "patient" : credit.insuranceName} credit balance (${credit.reason}, originally on charge ${credit.sourceChargeId})`,
         insuranceName: poolType === "insurance" ? credit.insuranceName : undefined,
         date: TODAY, postedBy: session.name, postedAt: nowIso(),
       }],
-    } : c));
-    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId: targetChargeId, patientId: targetCharge.patientId, type: "payment", amount: applied, date: TODAY, source: poolType === "patient" ? "Patient credit balance" : `${credit.insuranceName} credit balance`, reference: credit.id }]);
+    });
+    batch.set(docRef("transactions", uid("TXN")), { batchId: myOpenBatch.id, chargeId: targetChargeId, patientId: targetCharge.patientId, type: "payment", amount: applied, date: TODAY, source: poolType === "patient" ? "Patient credit balance" : `${credit.insuranceName} credit balance`, reference: credit.id });
+    batch.commit();
     addAudit(targetCharge.patientId, "Credit balance applied", "charge", targetChargeId, null, `${money(applied)} applied from ${poolType} credit balance (source: ${patientById[credit.patientId]?.name || credit.patientId})`);
     if (credit.patientId !== targetCharge.patientId) {
       addAudit(credit.patientId, "Credit balance used elsewhere", "credit", creditId, null, `${money(applied)} of this patient's credit balance applied to ${patientById[targetCharge.patientId]?.name || targetCharge.patientId}'s account`);
@@ -1274,126 +1454,103 @@ function ClinicApp({
   // ----- Clinical charting -----
   function addVital(patientId, entry) {
     const id = uid("VIT");
-    setVitals(prev => [...prev, { id, patientId, recordedBy: "Dr. S. Reyes", ...entry }]);
+    setDocument("vitals", id, { id, patientId, recordedBy: "Dr. S. Reyes", ...entry });
     addAudit(patientId, "Vitals recorded", "vital", id, null, `BP ${entry.bp}, HR ${entry.pulse}, Wt ${entry.weight}`);
   }
 
   function addAllergy(patientId, entry) {
     const id = uid("ALG");
-    setAllergies(prev => [...prev, { id, patientId, status: "Active", recordedBy: "Dr. S. Reyes", ...entry }]);
+    setDocument("allergies", id, { id, patientId, status: "Active", recordedBy: "Dr. S. Reyes", ...entry });
     addAudit(patientId, "Allergy recorded", "allergy", id, null, `${entry.substance} (${entry.severity})`);
   }
 
   function updateAllergyStatus(id, patientId, status) {
-    setAllergies(prev => prev.map(a => a.id === id ? { ...a, status } : a));
+    updateDocument("allergies", id, { status });
     addAudit(patientId, "Allergy updated", "allergy", id, "Active", status);
   }
 
   function addMedication(patientId, entry) {
     const id = uid("MED");
-    setMedications(prev => [...prev, { id, patientId, status: "Active", ...entry }]);
+    setDocument("medications", id, { id, patientId, status: "Active", ...entry });
     addAudit(patientId, "Medication added", "medication", id, null, `${entry.name} ${entry.dose}, ${entry.frequency}`);
   }
 
   function updateMedicationStatus(id, patientId, status) {
     const med = medications.find(m => m.id === id);
-    setMedications(prev => prev.map(m => m.id === id ? { ...m, status, endDate: status === "Active" ? m.endDate : (m.endDate || TODAY) } : m));
+    updateDocument("medications", id, { status, endDate: status === "Active" ? med?.endDate : (med?.endDate || TODAY) });
     addAudit(patientId, "Medication updated", "medication", id, med?.status, status);
   }
 
   function addProblem(patientId, entry) {
     const id = uid("PRB");
-    setProblems(prev => [...prev, { id, patientId, status: "Active", ...entry }]);
+    setDocument("problems", id, { id, patientId, status: "Active", ...entry });
     addAudit(patientId, "Problem added", "problem", id, null, `${entry.diagnosis} (${entry.icd10})`);
   }
 
   function updateProblemStatus(id, patientId, status) {
-    setProblems(prev => prev.map(p => p.id === id ? { ...p, status } : p));
+    updateDocument("problems", id, { status });
     addAudit(patientId, "Problem updated", "problem", id, "Active", status);
   }
 
   function addClinicalNote(patientId, entry) {
     const id = uid("NOTE");
-    setClinicalNotes(prev => [...prev, { id, patientId, status: "Draft", amendments: [], ...entry }]);
+    setDocument("clinicalNotes", id, { id, patientId, status: "Draft", amendments: [], ...entry });
     addAudit(patientId, "Note created", "note", id, null, `${entry.type}, draft`);
   }
 
   function signNote(id, patientId, provider) {
-    setClinicalNotes(prev => prev.map(n => n.id === id ? { ...n, status: "Signed", signedBy: provider, signedAt: nowIso() } : n));
+    updateDocument("clinicalNotes", id, { status: "Signed", signedBy: provider, signedAt: nowIso() });
     addAudit(patientId, "Note signed", "note", id, "Draft", `Signed by ${provider}`);
   }
 
   // Signed notes are never edited in place — an amendment is appended and the original stays intact.
   function amendNote(id, patientId, text, provider) {
-    setClinicalNotes(prev => prev.map(n => n.id === id ? { ...n, status: "Amended", amendments: [...n.amendments, { text, by: provider, at: nowIso() }] } : n));
+    const note = clinicalNotes.find(n => n.id === id);
+    updateDocument("clinicalNotes", id, { status: "Amended", amendments: [...(note?.amendments || []), { text, by: provider, at: nowIso() }] });
     addAudit(patientId, "Note amended", "note", id, null, text);
   }
 
   function addAppointment(a) {
-    setAppointments(prev => [...prev, { ...a, id: uid("A"), status: "Scheduled" }]);
+    setDocument("appointments", uid("A"), { ...a, status: "Scheduled" });
     setShowAddAppt(false);
   }
 
   function addCharge(patientId, entry) {
     const id = uid("C");
-    setCharges(prev => [...prev, {
+    const batch = newBatch();
+    // postedBy/postedAt/batchId are what let the Daily Transaction report attribute a charge to a
+    // user and a batch. Unlike posting a payment, adding a charge does not require an open batch,
+    // so batchId is legitimately null when the user has none open. Charges written before this
+    // was added simply lack the fields and report as unattributed.
+    const stamp = { postedBy: session.name, postedAt: nowIso(), batchId: myOpenBatch?.id || null };
+    batch.set(docRef("charges", id), {
       id, patientId, paid: 0, writeoff: 0, credits: 0, memos: [], postings: [],
       chargeInsuranceId: primaryPolicyByPatient[patientId]?.id || null, payerOverride: null, referralPhysician: "",
       facilityName: PRACTICE_INFO.name, facilityAddress: PRACTICE_INFO.address, taxId: PRACTICE_INFO.taxId,
       npi: "", diagnosisCodes: emptyDxCodes(), ndc: "", units: 1, time: "",
+      ...stamp,
       ...entry,
-    }]);
-    setTransactions(prev => [...prev, { id: uid("TXN"), chargeId: id, patientId, type: "charge", amount: entry.charge, date: entry.dos, source: "", reference: "" }]);
-  }
-
-  function recordPayment(chargeId, amount, meta = {}) {
-    const target = charges.find(c => c.id === chargeId);
-    if (!target) return;
-    const room = Math.max(0, target.charge - target.paid - target.writeoff);
-    const applied = Math.min(room, amount);
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, paid: c.paid + applied } : c));
-    if (applied > 0) {
-      setTransactions(prev => [...prev, { id: uid("TXN"), chargeId, patientId: target.patientId, type: "payment", amount: applied, date: meta.date || TODAY, source: meta.source || "Manual", reference: meta.reference || "" }]);
-    }
-  }
-
-  function writeOff(chargeId, amount, meta = {}) {
-    const target = charges.find(c => c.id === chargeId);
-    if (!target) return;
-    const room = Math.max(0, target.charge - target.paid - target.writeoff);
-    const applied = Math.min(room, amount);
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, writeoff: c.writeoff + applied } : c));
-    if (applied > 0) {
-      setTransactions(prev => [...prev, { id: uid("TXN"), chargeId, patientId: target.patientId, type: "writeoff", amount: applied, date: meta.date || TODAY, source: meta.source || "Manual write-off", reference: meta.reference || "" }]);
-    }
-  }
-
-  function creditAndRecode(chargeId, newCode) {
-    const cpt = cptCatalog.find(c => c.code === newCode);
-    if (!cpt) return;
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, cpt: cpt.code, desc: cpt.desc, charge: cpt.charge } : c));
-  }
-
-  function addMemo(chargeId, text) {
-    setCharges(prev => prev.map(c => c.id === chargeId ? { ...c, memos: [...c.memos, { date: "2026-08-24", text }] } : c));
+    });
+    batch.set(docRef("transactions", uid("TXN")), { chargeId: id, patientId, type: "charge", amount: entry.charge, date: entry.dos, source: "", reference: "", ...stamp });
+    batch.commit();
   }
 
   function generateClaimFromCharge(charge) {
     if (claims.some(c => c.chargeId === charge.id)) return;
     const primary = primaryPolicyByPatient[charge.patientId];
     const primaryDx = (charge.diagnosisCodes || []).find(d => d) || "";
-    const newClaim = {
-      id: uid("CLM-7"), patientId: charge.patientId, chargeId: charge.id,
+    const id = uid("CLM-7");
+    setDocument("claims", id, {
+      id, patientId: charge.patientId, chargeId: charge.id,
       payer: primary ? primary.insuranceCompany : "Self-pay", cpt: charge.cpt, dx: primaryDx, amount: charge.charge, submitted: "", status: "Draft",
       npi: charge.npi || "", facilityName: charge.facilityName || PRACTICE_INFO.name, taxId: charge.taxId || PRACTICE_INFO.taxId,
       units: charge.units || 1, diagnosisCodes: charge.diagnosisCodes || emptyDxCodes(),
-    };
-    setClaims(prev => [...prev, newClaim]);
+    });
     setTab("claims");
   }
 
   function submitClaim(id) {
-    setClaims(prev => prev.map(c => c.id === id ? { ...c, status: "Submitted", submitted: "2026-08-24" } : c));
+    updateDocument("claims", id, { status: "Submitted", submitted: "2026-08-24" });
   }
 
   function openBillingFor(patientId) {
@@ -1403,33 +1560,128 @@ function ClinicApp({
 
   // Electronic remittance (835) posting: apply parsed, matched claim rows in one batch.
   function postERABatch(matchedRows, meta = {}) {
-    setCharges(prev => prev.map(c => {
-      const row = matchedRows.find(r => r.chargeId === c.id);
-      if (!row) return c;
-      const room = Math.max(0, c.charge - c.paid - c.writeoff);
-      const paidApplied = Math.min(room, row.paid || 0);
-      const writeoffApplied = Math.min(room - paidApplied, row.writeoff || 0);
-      return { ...c, paid: c.paid + paidApplied, writeoff: c.writeoff + writeoffApplied };
-    }));
-    setClaims(prev => prev.map(cl => {
-      const row = matchedRows.find(r => r.claimId === cl.id);
-      if (!row) return cl;
-      return { ...cl, status: row.statusLabel === "Denied" ? "Denied" : "Paid" };
-    }));
-    const newTxns = [];
+    if (!myOpenBatch) { alert("Open your batch before posting a remittance — see the batch status in the header."); return; }
+    const batch = newBatch();
     matchedRows.forEach(row => {
       const target = charges.find(c => c.id === row.chargeId);
       if (!target) return;
       const room = Math.max(0, target.charge - target.paid - target.writeoff);
       const paidApplied = Math.min(room, row.paid || 0);
       const writeoffApplied = Math.min(room - paidApplied, row.writeoff || 0);
-      if (paidApplied > 0) newTxns.push({ id: uid("TXN"), chargeId: row.chargeId, patientId: target.patientId, type: "payment", amount: paidApplied, date: TODAY, source: meta.source || "Payer ERA", reference: meta.reference || "" });
-      if (writeoffApplied > 0) newTxns.push({ id: uid("TXN"), chargeId: row.chargeId, patientId: target.patientId, type: "writeoff", amount: writeoffApplied, date: TODAY, source: "Contractual adjustment", reference: meta.reference || "" });
+      batch.update(docRef("charges", row.chargeId), { paid: target.paid + paidApplied, writeoff: target.writeoff + writeoffApplied });
+      if (paidApplied > 0) batch.set(docRef("transactions", uid("TXN")), { batchId: myOpenBatch.id, chargeId: row.chargeId, patientId: target.patientId, type: "payment", amount: paidApplied, date: TODAY, source: meta.source || "Payer ERA", reference: meta.reference || "" });
+      if (writeoffApplied > 0) batch.set(docRef("transactions", uid("TXN")), { batchId: myOpenBatch.id, chargeId: row.chargeId, patientId: target.patientId, type: "writeoff", amount: writeoffApplied, date: TODAY, source: "Contractual adjustment", reference: meta.reference || "" });
     });
-    if (newTxns.length) setTransactions(prev => [...prev, ...newTxns]);
+    claims.forEach(cl => {
+      const row = matchedRows.find(r => r.claimId === cl.id);
+      if (!row) return;
+      batch.update(docRef("claims", cl.id), { status: row.statusLabel === "Denied" ? "Denied" : "Paid" });
+    });
+    batch.commit();
+  }
+
+  // ----- User account administration (SUPER_ADMIN only — also enforced by firestore.rules,
+  // so this isn't the only thing standing between another role and these actions) -----
+  // Real Firebase Auth accounts can't be hard-deleted from client code (that needs the Admin
+  // SDK in a trusted backend), so "delete" here deactivates the account instead — same
+  // never-truly-delete pattern used everywhere else in this app (ID documents, insurance
+  // policies, ...). A deactivated account is blocked at login (see LoginPage's submit).
+  async function addUserAccount(form) {
+    const uid = await createUserAccount(form.email.trim(), form.password);
+    await setDocument("users", uid, {
+      email: form.email.trim(), name: form.name, role: form.role, disabled: false,
+      createdBy: session.name, createdAt: nowIso(),
+    });
+    addAudit(null, "User account created", "user", uid, null, `${form.name} <${form.email}> as ${ROLE_LABELS[form.role] || form.role}`);
+  }
+
+  function setUserDisabled(uid, disabled) {
+    const target = userAccounts.find(u => u.id === uid);
+    updateDocument("users", uid, { disabled });
+    addAudit(null, disabled ? "User account deactivated" : "User account reactivated", "user", uid, null, target ? `${target.name} <${target.email}>` : uid);
+  }
+
+  function changeUserRole(uid, role) {
+    const target = userAccounts.find(u => u.id === uid);
+    updateDocument("users", uid, { role });
+    addAudit(null, "User role changed", "user", uid, target?.role || null, role);
+  }
+
+  // ----- Batch management: one open/closed daily work-batch per user -----
+  // Doc id is the user+date composite key — this IS the "one batch per user per day"
+  // uniqueness rule: opening a batch for a date that already has one just reopens that same
+  // document (status flips back to OPEN), it never creates a duplicate.
+  function openBatch(date) {
+    const batchDate = date || TODAY;
+    if (myOpenBatch && myOpenBatch.batchDate !== batchDate) {
+      alert(`You already have batch #${myOpenBatch.batchNumber} open for ${myOpenBatch.batchDate}. Close it first before opening a different date.`);
+      return;
+    }
+    const id = `${session.uid}_${batchDate}`;
+    const existing = batches.find(b => b.id === id);
+    if (existing) {
+      updateDocument("batches", id, { status: "OPEN", openedAt: nowIso(), closedAt: null });
+    } else {
+      setDocument("batches", id, {
+        id, batchNumber: uid("BATCH"), userId: session.uid, userName: session.name,
+        batchDate, status: "OPEN", openedAt: nowIso(), closedAt: null,
+      });
+    }
+    addAudit(null, "Batch opened", "batch", id, null, `${session.name} — ${batchDate}`);
+  }
+
+  function closeBatch() {
+    if (!myOpenBatch) return;
+    updateDocument("batches", myOpenBatch.id, { status: "CLOSED", closedAt: nowIso() });
+    addAudit(null, "Batch closed", "batch", myOpenBatch.id, "OPEN", "CLOSED");
+  }
+
+  // ----- Ticklers (reminders) -----
+  function addTickler(form) {
+    const id = uid("TICK");
+    setDocument("ticklers", id, {
+      id, patientId: form.patientId || null, patientName: form.patientName || "",
+      claimId: form.claimId || null, dos: form.dos || "", cpt: form.cpt || "",
+      title: form.title, description: form.description || "",
+      createdByUid: session.uid, createdByName: session.name,
+      assignedToUid: form.assignedToUid || session.uid, assignedToName: form.assignedToName || session.name,
+      reminderDate: form.reminderDate, reminderTime: form.reminderTime || "",
+      priority: form.priority || "Normal", status: "Open",
+      createdAt: nowIso(), completedAt: null,
+    });
+    addAudit(form.patientId || null, "Tickler created", "tickler", id, null, `${form.title} (assigned to ${form.assignedToName || session.name})`);
+  }
+
+  function updateTicklerStatus(id, status) {
+    updateDocument("ticklers", id, { status, completedAt: status === "Completed" ? nowIso() : null });
+  }
+
+  function snoozeTickler(id, newDate) {
+    updateDocument("ticklers", id, { status: "Snoozed", reminderDate: newDate });
+  }
+
+  // ----- Technical support tickets -----
+  function addSupportTicket(form) {
+    const id = uid("TCKT");
+    setDocument("supportTickets", id, {
+      id, subject: form.subject, description: form.description, priority: form.priority || "Normal",
+      status: "Open", attachment: form.attachment || null, attachmentName: form.attachmentName || null,
+      createdByUid: session.uid, createdByName: session.name, createdAt: nowIso(), notes: [],
+    });
+    addAudit(null, "Support ticket filed", "supportTicket", id, null, `${form.subject} (${form.priority})`);
+  }
+
+  function updateSupportTicketStatus(id, status) {
+    updateDocument("supportTickets", id, { status });
+    addAudit(null, "Support ticket status changed", "supportTicket", id, null, status);
+  }
+
+  if (dataLoading) {
+    return <div className="min-h-[700px] flex items-center justify-center bg-slate-50 text-slate-400 text-sm font-sans">Loading…</div>;
   }
 
   return (
+    <CptCatalogContext.Provider value={cptCatalog}>
     <div className="flex flex-col h-full min-h-[700px] bg-slate-50 text-slate-800 font-sans text-sm">
       <header className="bg-slate-900 text-slate-300 shrink-0">
         <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800">
@@ -1443,9 +1695,8 @@ function ClinicApp({
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <span className="hidden md:flex items-center gap-2 text-xs text-slate-500">
-              <Settings size={14} /> 
-            </span>
+            <BatchStatusWidget myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
+            <SettingsMenu onOpenBatchManagement={() => setShowBatchManagement(true)} />
             <div className="flex items-center gap-2 border-l border-slate-800 pl-4">
               <div className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-white text-xs font-medium">
                 {session.name.split(" ").map(n => n[0]).join("")}
@@ -1492,7 +1743,7 @@ function ClinicApp({
         {tabAllowed && tab === "schedule" && (
           <Schedule
             appointments={appointments} patientById={patientById} onAdd={() => setShowAddAppt(true)}
-            onStatusChange={(id, status) => setAppointments(prev => prev.map(a => a.id === id ? { ...a, status } : a))}
+            onStatusChange={(id, status) => updateDocument("appointments", id, { status })}
           />
         )}
 
@@ -1559,6 +1810,7 @@ function ClinicApp({
                 policies={policies}
                 onPostManualLine={postManualLinePayment}
                 onPostERA={postERABatch}
+                hasOpenBatch={!!myOpenBatch}
               />
             )}
           </div>
@@ -1583,10 +1835,6 @@ function ClinicApp({
             onBack={() => setBillingPatientId(null)}
             onUpdatePatient={(updates) => updatePatient(billingPatientId, updates)}
             onAddCharge={(entry) => addCharge(billingPatientId, entry)}
-            onRecordPayment={recordPayment}
-            onWriteOff={writeOff}
-            onRecode={creditAndRecode}
-            onAddMemo={addMemo}
             onGenerateClaim={generateClaimFromCharge}
             onAddInsurance={(f) => addInsurance(billingPatientId, f)}
             onEditInsurance={editInsurance}
@@ -1609,6 +1857,8 @@ function ClinicApp({
             onAddFollowUp={addFollowUp}
             onDebitPosting={debitPosting}
             onApplyCreditBalance={applyCreditBalance}
+            hasOpenBatch={!!myOpenBatch}
+            onCreateTickler={(prefill) => { setTicklerPrefill(prefill); setShowTicklerPanel(true); }}
           />
         )}
 
@@ -1620,6 +1870,14 @@ function ClinicApp({
           <Reports
             revenueByMonth={revenueByMonth} claimStatusData={claimStatusData} charges={charges} patientById={patientById}
             transactions={transactions} patients={patients} policies={policies}
+            batches={batches} userAccounts={userAccounts} session={session} isOversight={isBillingOversightRole}
+          />
+        )}
+
+        {tabAllowed && tab === "users" && (
+          <UserManagement
+            users={userAccounts} auditLogs={auditLogs} session={session}
+            onAddUser={addUserAccount} onSetDisabled={setUserDisabled} onChangeRole={changeUserRole}
           />
         )}
       </main>
@@ -1643,6 +1901,443 @@ function ClinicApp({
           <AddApptForm patients={patients} onSubmit={addAppointment} />
         </Modal>
       )}
+
+      {showBatchManagement && (
+        <Modal title="Batch Management" onClose={() => setShowBatchManagement(false)} wide>
+          <BatchManagement batches={batches} session={session} isOversight={isBillingOversightRole} myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
+        </Modal>
+      )}
+
+      {/* Floating Support / Tickler launchers — persist across every tab */}
+      <div className="fixed bottom-5 right-5 flex flex-col items-end gap-3 z-40">
+        <button onClick={() => setShowTicklerPanel(true)} title="Ticklers / reminders" className="w-12 h-12 rounded-full bg-amber-500 text-white shadow-lg flex items-center justify-center hover:bg-amber-600 relative">
+          <Bell size={20} />
+          {ticklerBadgeCount > 0 && <span className="absolute -top-1 -right-1 bg-rose-600 text-white text-[10px] font-semibold rounded-full w-5 h-5 flex items-center justify-center">{ticklerBadgeCount}</span>}
+        </button>
+        <button onClick={() => setShowSupportPanel(true)} title="Technical support" className="w-12 h-12 rounded-full bg-slate-700 text-white shadow-lg flex items-center justify-center hover:bg-slate-800">
+          <Wrench size={19} />
+        </button>
+      </div>
+
+      {showSupportPanel && (
+        <Modal title="Technical Support" onClose={() => setShowSupportPanel(false)} wide>
+          <SupportPanel
+            tickets={supportTickets} session={session} isOversight={isBillingOversightRole}
+            onAddTicket={addSupportTicket} onSetStatus={updateSupportTicketStatus}
+          />
+        </Modal>
+      )}
+
+      {showTicklerPanel && (
+        <Modal title="Ticklers" onClose={() => { setShowTicklerPanel(false); setTicklerPrefill(null); }} wide>
+          <TicklerPanel
+            ticklers={ticklers} session={session} users={userAccounts} patients={patients} prefill={ticklerPrefill}
+            onAddTickler={(form) => { addTickler(form); setTicklerPrefill(null); }}
+            onSetStatus={updateTicklerStatus} onSnooze={snoozeTickler}
+          />
+        </Modal>
+      )}
+    </div>
+    </CptCatalogContext.Provider>
+  );
+}
+
+// ---------- Header: batch status widget + Settings menu ----------
+
+function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
+  const [show, setShow] = useState(false);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [pickedDate, setPickedDate] = useState(TODAY);
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setShow(s => !s)}
+        className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border ${myOpenBatch ? "border-emerald-700 bg-emerald-900/30 text-emerald-300" : "border-amber-700 bg-amber-900/30 text-amber-300"}`}
+      >
+        <Landmark size={13} />
+        {myOpenBatch ? `Batch #${myOpenBatch.batchNumber} · ${myOpenBatch.batchDate}` : "No batch open"}
+      </button>
+      {show && (
+        <div className="absolute right-0 top-full mt-2 w-72 bg-white border border-slate-200 rounded-xl shadow-xl p-3 z-50 text-slate-700">
+          {myOpenBatch ? (
+            <>
+              <div className="text-xs text-slate-400 mb-1">Current batch</div>
+              <div className="text-sm font-medium mb-1">#{myOpenBatch.batchNumber} — {myOpenBatch.batchDate}</div>
+              <div className="text-xs text-slate-500 mb-3">Opened {myOpenBatch.openedAt?.slice(0, 16).replace("T", " ")}</div>
+              <button onClick={() => { onCloseBatch(); setShow(false); }} className="w-full bg-rose-600 text-white text-xs font-medium py-1.5 rounded-lg hover:bg-rose-700">Close batch</button>
+            </>
+          ) : showDatePicker ? (
+            <>
+              <div className="text-xs text-slate-400 mb-2">Open a previous date's batch</div>
+              <input type="date" className={inputCls} value={pickedDate} onChange={(e) => setPickedDate(e.target.value)} max={TODAY} />
+              <div className="flex gap-2 mt-2">
+                <button onClick={() => setShowDatePicker(false)} className="flex-1 border border-slate-200 text-xs py-1.5 rounded-lg hover:bg-slate-50">Cancel</button>
+                <button onClick={() => { onOpenBatch(pickedDate); setShow(false); setShowDatePicker(false); }} className="flex-1 bg-teal-600 text-white text-xs font-medium py-1.5 rounded-lg hover:bg-teal-700">Open</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-xs text-slate-500 mb-3">No batch is open. Payments and adjustments can't be posted until you open one.</p>
+              <button onClick={() => { onOpenBatch(TODAY); setShow(false); }} className="w-full bg-teal-600 text-white text-xs font-medium py-1.5 rounded-lg hover:bg-teal-700 mb-2">Open today's batch</button>
+              <button onClick={() => setShowDatePicker(true)} className="w-full border border-slate-200 text-slate-600 text-xs py-1.5 rounded-lg hover:bg-slate-50">Open a different date…</button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsMenu({ onOpenBatchManagement }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(o => !o)} title="Settings" className="hidden md:flex items-center gap-2 text-xs text-slate-500 hover:text-white p-1">
+        <Settings size={14} />
+      </button>
+      {open && (
+        <div onMouseLeave={() => setOpen(false)} className="absolute right-0 top-full mt-2 w-52 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50 text-slate-700">
+          <button onClick={() => { onOpenBatchManagement(); setOpen(false); }} className="w-full text-left px-3 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2"><Landmark size={13} /> Batch Management</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Settings: Batch Management ----------
+
+function BatchManagement({ batches, session, isOversight, myOpenBatch, onOpenBatch, onCloseBatch }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [dateFilter, setDateFilter] = useState("");
+
+  const visible = isOversight ? batches : batches.filter(b => b.userId === session.uid);
+  const filtered = visible.filter(b => {
+    if (statusFilter && b.status !== statusFilter) return false;
+    if (dateFilter && b.batchDate !== dateFilter) return false;
+    if (search && !`${b.batchNumber} ${b.userName}`.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  }).sort((a, b) => b.batchDate.localeCompare(a.batchDate) || (b.openedAt || "").localeCompare(a.openedAt || ""));
+
+  return (
+    <div>
+      <SectionTitle>Your current batch</SectionTitle>
+      {myOpenBatch ? (
+        <div className="grid grid-cols-2 gap-y-2 text-sm bg-slate-50 border border-slate-200 rounded-lg p-3 mb-4">
+          <div><span className="text-slate-400 text-xs block">Batch number</span>#{myOpenBatch.batchNumber}</div>
+          <div><span className="text-slate-400 text-xs block">Date</span>{myOpenBatch.batchDate}</div>
+          <div><span className="text-slate-400 text-xs block">Status</span><StatusPill status="Active" /></div>
+          <div><span className="text-slate-400 text-xs block">Opened by</span>{myOpenBatch.userName}</div>
+          <div><span className="text-slate-400 text-xs block">Opened</span>{myOpenBatch.openedAt?.slice(0, 16).replace("T", " ")}</div>
+          <div className="flex items-end"><button onClick={onCloseBatch} className="text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1 hover:bg-rose-100">Close batch</button></div>
+        </div>
+      ) : (
+        <div className="flex items-center justify-between bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm">
+          <span className="text-amber-800">No batch currently open.</span>
+          <button onClick={() => onOpenBatch(TODAY)} className="text-xs bg-teal-600 text-white px-2.5 py-1.5 rounded-lg hover:bg-teal-700">Open today's batch</button>
+        </div>
+      )}
+
+      <SectionTitle>Batch history{!isOversight && " (yours)"}</SectionTitle>
+      <div className="grid grid-cols-4 gap-2 mb-3">
+        <input className={inputCls} placeholder="Search batch # or user" value={search} onChange={(e) => setSearch(e.target.value)} />
+        <input type="date" className={inputCls} value={dateFilter} onChange={(e) => setDateFilter(e.target.value)} />
+        <select className={inputCls} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="">Any status</option>
+          <option value="OPEN">Open</option>
+          <option value="CLOSED">Closed</option>
+        </select>
+        <button onClick={() => { setSearch(""); setDateFilter(""); setStatusFilter(""); }} className="text-xs text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50">Clear filters</button>
+      </div>
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+              <th className="px-4 py-2.5 font-medium">Batch #</th>
+              <th className="px-4 py-2.5 font-medium">Date</th>
+              <th className="px-4 py-2.5 font-medium">User</th>
+              <th className="px-4 py-2.5 font-medium">Status</th>
+              <th className="px-4 py-2.5 font-medium">Opened</th>
+              <th className="px-4 py-2.5 font-medium">Closed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(b => (
+              <tr key={b.id} className="border-b border-slate-100 last:border-0">
+                <td className="px-4 py-2.5 font-medium text-slate-800">#{b.batchNumber}</td>
+                <td className="px-4 py-2.5 text-slate-600">{b.batchDate}</td>
+                <td className="px-4 py-2.5 text-slate-600">{b.userName}</td>
+                <td className="px-4 py-2.5"><StatusPill status={b.status === "OPEN" ? "Active" : "Terminated"} /></td>
+                <td className="px-4 py-2.5 text-slate-500 text-xs">{b.openedAt?.slice(0, 16).replace("T", " ") || "—"}</td>
+                <td className="px-4 py-2.5 text-slate-500 text-xs">{b.closedAt?.slice(0, 16).replace("T", " ") || "—"}</td>
+              </tr>
+            ))}
+            {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No batches match.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+// ---------- Floating: Technical Support ----------
+
+const MAX_ATTACHMENT_BYTES = 700 * 1024; // Firestore's 1 MiB document cap, same reasoning as ID documents
+const ticketPriorities = ["Low", "Normal", "High", "Urgent"];
+const ticketStatuses = ["Open", "In Progress", "Resolved", "Closed"];
+
+function SupportPanel({ tickets, session, isOversight, onAddTicket, onSetStatus }) {
+  const [mode, setMode] = useState("new");
+  const mine = tickets.filter(t => t.createdByUid === session.uid).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  const all = [...tickets].sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+
+  return (
+    <div>
+      <div className="flex items-center gap-1 mb-4 border border-slate-200 bg-white rounded-lg p-1 w-fit">
+        <button onClick={() => setMode("new")} className={`px-3 py-1.5 text-sm rounded-md ${mode === "new" ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>New ticket</button>
+        <button onClick={() => setMode("mine")} className={`px-3 py-1.5 text-sm rounded-md ${mode === "mine" ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>My tickets{mine.length > 0 ? ` (${mine.length})` : ""}</button>
+        {isOversight && <button onClick={() => setMode("all")} className={`px-3 py-1.5 text-sm rounded-md ${mode === "all" ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>All tickets ({all.length})</button>}
+      </div>
+
+      {mode === "new" && <NewTicketForm onSubmit={(form) => { onAddTicket(form); setMode("mine"); }} />}
+      {mode === "mine" && <TicketList tickets={mine} canManage={false} onSetStatus={onSetStatus} />}
+      {mode === "all" && isOversight && <TicketList tickets={all} canManage onSetStatus={onSetStatus} />}
+    </div>
+  );
+}
+
+function NewTicketForm({ onSubmit }) {
+  const [subject, setSubject] = useState("");
+  const [description, setDescription] = useState("");
+  const [priority, setPriority] = useState("Normal");
+  const [attachment, setAttachment] = useState(null);
+  const [attachmentName, setAttachmentName] = useState("");
+  const [attachmentSize, setAttachmentSize] = useState(null);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    if (!subject.trim()) { setError("Subject is required."); return; }
+    if (!description.trim()) { setError("Describe the problem."); return; }
+    if (attachmentSize > MAX_ATTACHMENT_BYTES) { setError(`Attachment is too large — keep it under ${formatFileSize(MAX_ATTACHMENT_BYTES)}.`); return; }
+    setError("");
+    setSaving(true);
+    await onSubmit({ subject, description, priority, attachment, attachmentName });
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <Field label="Subject"><input className={inputCls} value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="Short summary of the problem" /></Field>
+      <Field label="Describe the problem"><textarea className={`${inputCls} h-28 resize-none`} value={description} onChange={(e) => setDescription(e.target.value)} /></Field>
+      <Field label="Priority">
+        <select className={inputCls} value={priority} onChange={(e) => setPriority(e.target.value)}>{ticketPriorities.map(p => <option key={p}>{p}</option>)}</select>
+      </Field>
+      <FileDrop
+        label="Attach a screenshot (optional)"
+        value={attachment}
+        onChange={(dataUrl, file) => { setAttachment(dataUrl); setAttachmentName(file?.name || ""); setAttachmentSize(file ? file.size : null); }}
+      />
+      <p className="text-xs text-slate-400 mb-3">Keep attachments under {formatFileSize(MAX_ATTACHMENT_BYTES)}.</p>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} disabled={saving} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">{saving ? "Submitting…" : "Submit ticket"}</button>
+    </div>
+  );
+}
+
+function TicketList({ tickets, canManage, onSetStatus }) {
+  return (
+    <div className="space-y-2 max-h-[26rem] overflow-y-auto">
+      {tickets.map(t => (
+        <Card key={t.id} className="p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className="font-medium text-slate-800 truncate">{t.subject}</span>
+                <StatusPill status={t.priority === "Urgent" || t.priority === "High" ? "Severe" : t.priority === "Low" ? "Mild" : "Moderate"} />
+              </div>
+              <p className="text-xs text-slate-500 mb-1">{t.description}</p>
+              <div className="text-xs text-slate-400">{t.createdByName} · {t.createdAt?.slice(0, 16).replace("T", " ")}</div>
+              {t.attachment && (
+                <button onClick={() => openIdDocumentViewerWindow({ id: t.id, file: t.attachment, fileType: t.attachmentName?.endsWith(".pdf") ? "application/pdf" : "image" })} className="mt-1.5 flex items-center gap-1 text-xs text-teal-700 hover:underline">
+                  <Paperclip size={11} /> {t.attachmentName || "Attachment"}
+                </button>
+              )}
+            </div>
+            <div className="text-right shrink-0">
+              {canManage ? (
+                <select className="text-xs border border-slate-300 rounded-lg px-2 py-1" value={t.status} onChange={(e) => onSetStatus(t.id, e.target.value)}>
+                  {ticketStatuses.map(s => <option key={s}>{s}</option>)}
+                </select>
+              ) : (
+                <StatusPill status={t.status === "Resolved" || t.status === "Closed" ? "Completed" : t.status === "In Progress" ? "Amended" : "Open"} />
+              )}
+            </div>
+          </div>
+        </Card>
+      ))}
+      {tickets.length === 0 && <p className="text-center text-slate-400 text-sm py-6">No tickets here.</p>}
+    </div>
+  );
+}
+
+// ---------- Floating: Ticklers ----------
+
+const ticklerPriorities = ["Low", "Normal", "High", "Urgent"];
+
+function TicklerPanel({ ticklers, session, users, patients, prefill, onAddTickler, onSetStatus, onSnooze }) {
+  // TicklerPanel is only ever mounted fresh (see the {showTicklerPanel && <Modal>...} guard at
+  // the call site) — no effect needed to react to a later prefill change, there isn't one.
+  const [tab, setTab] = useState(prefill ? "new" : "mine");
+
+  const mine = ticklers.filter(t => t.createdByUid === session.uid || t.assignedToUid === session.uid);
+  const assignedToMe = ticklers.filter(t => t.assignedToUid === session.uid);
+  const createdByMe = ticklers.filter(t => t.createdByUid === session.uid);
+  const relevant = mine;
+  const dueToday = relevant.filter(t => t.status === "Open" && t.reminderDate === TODAY);
+  const upcoming = relevant.filter(t => t.status === "Open" && t.reminderDate > TODAY);
+  const overdue = relevant.filter(t => t.status === "Open" && t.reminderDate < TODAY);
+  const completed = relevant.filter(t => t.status === "Completed");
+
+  const tabs = [
+    { id: "new", label: "New" },
+    { id: "mine", label: `My Ticklers (${mine.length})` },
+    { id: "assigned", label: `Assigned to Me (${assignedToMe.length})` },
+    { id: "created", label: `Created by Me (${createdByMe.length})` },
+    { id: "today", label: `Due Today (${dueToday.length})` },
+    { id: "upcoming", label: `Upcoming (${upcoming.length})` },
+    { id: "overdue", label: `Overdue (${overdue.length})` },
+    { id: "completed", label: `Completed (${completed.length})` },
+  ];
+  const listByTab = { mine, assigned: assignedToMe, created: createdByMe, today: dueToday, upcoming, overdue, completed };
+
+  return (
+    <div>
+      <div className="flex items-center gap-1 mb-4 border border-slate-200 bg-white rounded-lg p-1 w-fit flex-wrap">
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} className={`px-2.5 py-1.5 text-xs rounded-md whitespace-nowrap ${tab === t.id ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}>{t.label}</button>
+        ))}
+      </div>
+
+      {tab === "new" ? (
+        <NewTicklerForm users={users} patients={patients} session={session} prefill={prefill} onSubmit={(form) => { onAddTickler(form); setTab("mine"); }} />
+      ) : (
+        <TicklerList ticklers={listByTab[tab] || []} onSetStatus={onSetStatus} onSnooze={onSnooze} />
+      )}
+    </div>
+  );
+}
+
+function NewTicklerForm({ users, patients, session, prefill, onSubmit }) {
+  const [form, setForm] = useState({
+    patientId: prefill?.patientId || "", patientName: prefill?.patientName || "",
+    claimId: prefill?.claimId || "", dos: prefill?.dos || "", cpt: prefill?.cpt || "",
+    title: prefill?.title || "", description: "", assignedToUid: session.uid, assignedToName: session.name,
+    reminderDate: TODAY, reminderTime: "", priority: "Normal",
+  });
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const [error, setError] = useState("");
+
+  function setPatient(patientId) {
+    const p = patients.find(x => x.id === patientId);
+    setForm({ ...form, patientId, patientName: p?.name || "" });
+  }
+  function setAssignee(uid) {
+    const u = users.find(x => x.id === uid);
+    setForm({ ...form, assignedToUid: uid, assignedToName: u?.name || session.name });
+  }
+
+  function submit() {
+    if (!form.title.trim()) { setError("Title is required."); return; }
+    if (!form.reminderDate) { setError("Reminder date is required."); return; }
+    setError("");
+    onSubmit(form);
+  }
+
+  return (
+    <div>
+      {prefill && (
+        <p className="text-xs text-teal-700 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 mb-3">
+          Linked to {prefill.patientName} — {prefill.dos} · {prefill.cpt}
+        </p>
+      )}
+      <Field label="Title"><input className={inputCls} value={form.title} onChange={set("title")} placeholder="e.g. Follow up with insurance" /></Field>
+      <Field label="Description"><textarea className={`${inputCls} h-20 resize-none`} value={form.description} onChange={set("description")} /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Patient (optional)">
+          <select className={inputCls} value={form.patientId} onChange={(e) => setPatient(e.target.value)}>
+            <option value="">No patient</option>
+            {patients.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </Field>
+        <Field label="CPT code (optional)"><input className={inputCls} value={form.cpt} onChange={set("cpt")} placeholder="e.g. 99213" /></Field>
+        <Field label="Date of service (optional)"><input type="date" className={inputCls} value={form.dos} onChange={set("dos")} /></Field>
+        <Field label="Claim ID (optional)"><input className={inputCls} value={form.claimId} onChange={set("claimId")} /></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Assigned to">
+          <select className={inputCls} value={form.assignedToUid} onChange={(e) => setAssignee(e.target.value)}>
+            <option value={session.uid}>Myself ({session.name})</option>
+            {users.filter(u => u.id !== session.uid).map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Priority">
+          <select className={inputCls} value={form.priority} onChange={set("priority")}>{ticklerPriorities.map(p => <option key={p}>{p}</option>)}</select>
+        </Field>
+        <Field label="Reminder date"><input type="date" className={inputCls} value={form.reminderDate} onChange={set("reminderDate")} /></Field>
+        <Field label="Reminder time (optional)"><input type="time" className={inputCls} value={form.reminderTime} onChange={set("reminderTime")} /></Field>
+      </div>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Create tickler</button>
+    </div>
+  );
+}
+
+function TicklerList({ ticklers, onSetStatus, onSnooze }) {
+  const [snoozing, setSnoozing] = useState(null);
+  const [snoozeDate, setSnoozeDate] = useState(TODAY);
+  const sorted = [...ticklers].sort((a, b) => (a.reminderDate || "").localeCompare(b.reminderDate || ""));
+
+  return (
+    <div className="space-y-2 max-h-[26rem] overflow-y-auto">
+      {sorted.map(t => {
+        const overdue = t.status === "Open" && t.reminderDate < TODAY;
+        const urgent = t.priority === "Urgent" || t.priority === "High";
+        return (
+          <Card key={t.id} className={`p-3 ${overdue ? "border-rose-300 bg-rose-50/60" : urgent ? "border-amber-300 bg-amber-50/50" : ""}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                  <span className="font-medium text-slate-800">{t.title}</span>
+                  <StatusPill status={urgent ? "Severe" : t.priority === "Low" ? "Mild" : "Moderate"} />
+                  {overdue && <StatusPill status="Denied" />}
+                </div>
+                {t.patientName && <div className="text-xs text-slate-500">{t.patientName}{t.cpt ? ` · CPT ${t.cpt}` : ""}{t.dos ? ` · DOS ${t.dos}` : ""}</div>}
+                {t.description && <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>}
+                <div className="text-xs text-slate-400 mt-1">Due {t.reminderDate}{t.reminderTime ? ` ${t.reminderTime}` : ""} · assigned to {t.assignedToName} · by {t.createdByName}</div>
+              </div>
+              <div className="flex flex-col items-end gap-1 shrink-0">
+                <StatusPill status={t.status === "Completed" ? "Completed" : t.status === "Snoozed" ? "Amended" : t.status === "Cancelled" ? "Discontinued" : "Open"} />
+                {t.status === "Open" && (
+                  <div className="flex gap-1 mt-1">
+                    <button onClick={() => onSetStatus(t.id, "Completed")} className="text-[11px] text-emerald-700 border border-emerald-200 bg-emerald-50 rounded-md px-1.5 py-0.5 hover:bg-emerald-100">Complete</button>
+                    <button onClick={() => setSnoozing(snoozing === t.id ? null : t.id)} className="text-[11px] text-slate-500 border border-slate-200 rounded-md px-1.5 py-0.5 hover:bg-slate-50">Snooze</button>
+                    <button onClick={() => onSetStatus(t.id, "Cancelled")} className="text-[11px] text-rose-500 border border-rose-200 rounded-md px-1.5 py-0.5 hover:bg-rose-50">Cancel</button>
+                  </div>
+                )}
+              </div>
+            </div>
+            {snoozing === t.id && (
+              <div className="flex items-center gap-2 mt-2 pt-2 border-t border-slate-100">
+                <input type="date" className="text-xs border border-slate-300 rounded-lg px-2 py-1" value={snoozeDate} onChange={(e) => setSnoozeDate(e.target.value)} />
+                <button onClick={() => { onSnooze(t.id, snoozeDate); setSnoozing(null); }} className="text-xs bg-slate-700 text-white px-2 py-1 rounded-lg hover:bg-slate-800">Snooze to this date</button>
+              </div>
+            )}
+          </Card>
+        );
+      })}
+      {sorted.length === 0 && <p className="text-center text-slate-400 text-sm py-6">Nothing here.</p>}
     </div>
   );
 }
@@ -1661,7 +2356,7 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-semibold text-slate-800">Dashboard</h1>
-          <p className="text-slate-500 text-sm">Monday, August 24, 2026</p>
+          <p className="text-slate-500 text-sm">{new Date(TODAY + "T00:00").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p>
         </div>
         {deniedClaims > 0 && (
           <button onClick={() => setTab("claims")} className="flex items-center gap-2 text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5">
@@ -1877,12 +2572,17 @@ function BillingSearch({ patients, policies, patientBalance, onSelect }) {
 
 // ---------- Billing: post payments (manual + electronic 835) ----------
 
-function PaymentPosting({ charges, claims, patients, patientById, chargeById, policies, onPostManualLine, onPostERA }) {
+function PaymentPosting({ charges, claims, patients, patientById, chargeById, policies, onPostManualLine, onPostERA, hasOpenBatch }) {
   const [mode, setMode] = useState("manual");
   return (
     <div>
       <h1 className="text-xl font-semibold text-slate-800 mb-1">Post payments</h1>
       <p className="text-slate-500 text-sm mb-4">Post insurance and patient payments manually, or import an electronic remittance (835) file.</p>
+      {!hasOpenBatch && (
+        <p className="flex items-center gap-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+          <AlertTriangle size={13} /> No batch is open — open your batch (top-right of the header) before posting.
+        </p>
+      )}
 
       <div className="flex items-center gap-1 mb-5 border border-slate-200 bg-white rounded-lg p-1 w-fit">
         <button onClick={() => setMode("manual")} className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md ${mode === "manual" ? "bg-teal-600 text-white" : "text-slate-500 hover:bg-slate-50"}`}>
@@ -1893,13 +2593,13 @@ function PaymentPosting({ charges, claims, patients, patientById, chargeById, po
         </button>
       </div>
 
-      {mode === "manual" && <ManualPosting charges={charges} patientById={patientById} policies={policies} onPostManualLine={onPostManualLine} />}
-      {mode === "electronic" && <ElectronicRemittance charges={charges} claims={claims} patientById={patientById} chargeById={chargeById} onPostERA={onPostERA} />}
+      {mode === "manual" && <ManualPosting charges={charges} patientById={patientById} policies={policies} onPostManualLine={onPostManualLine} hasOpenBatch={hasOpenBatch} />}
+      {mode === "electronic" && <ElectronicRemittance charges={charges} claims={claims} patientById={patientById} chargeById={chargeById} onPostERA={onPostERA} hasOpenBatch={hasOpenBatch} />}
     </div>
   );
 }
 
-function ManualPosting({ charges, patientById, policies, onPostManualLine }) {
+function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOpenBatch }) {
   const openCharges = charges.filter(c => balanceOf(c) > 0);
   const [search, setSearch] = useState("");
   const [checkNumber, setCheckNumber] = useState("");
@@ -1963,7 +2663,7 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine }) {
                   <td className="px-4 py-2.5 text-right text-slate-600">{money(c.charge)}</td>
                   <td className="px-4 py-2.5 text-right font-medium text-rose-600">{money(bal)}</td>
                   <td className="px-4 py-2.5 text-right">
-                    <button onClick={() => setPostingCharge(c)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-teal-700 ml-auto">
+                    <button onClick={() => setPostingCharge(c)} disabled={!hasOpenBatch} title={hasOpenBatch ? "" : "Open your batch first"} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-teal-700 ml-auto disabled:opacity-40 disabled:cursor-not-allowed">
                       <CreditCard size={13} /> Post
                     </button>
                   </td>
@@ -2089,7 +2789,7 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
   );
 }
 
-function ElectronicRemittance({ claims, patientById, chargeById, onPostERA }) {
+function ElectronicRemittance({ claims, patientById, chargeById, onPostERA, hasOpenBatch }) {
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState(null);
   const [error, setError] = useState("");
@@ -2218,7 +2918,7 @@ function ElectronicRemittance({ claims, patientById, chargeById, onPostERA }) {
 
           <div className="flex items-center justify-between mt-4">
             <p className="text-xs text-slate-400 max-w-md">Unmatched rows didn't find a claim with a matching internal claim ID and won't be posted automatically — reconcile those from the Claims tab.</p>
-            <button onClick={postAllMatched} disabled={matchedCount === 0} className="flex items-center gap-1.5 bg-teal-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+            <button onClick={postAllMatched} disabled={matchedCount === 0 || !hasOpenBatch} title={hasOpenBatch ? "" : "Open your batch first"} className="flex items-center gap-1.5 bg-teal-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
               <CreditCard size={15} /> Post {matchedCount} matched claim{matchedCount === 1 ? "" : "s"}
             </button>
           </div>
@@ -2233,10 +2933,11 @@ function ElectronicRemittance({ claims, patientById, chargeById, onPostERA }) {
 
 function PatientBilling({
   patient, charges, claims, policies, idDocuments, auditLogs, patientMemos, appointments, allPatients, allCharges, patientById, patientCreditBalances, insuranceCreditBalances, session,
-  onBack, onUpdatePatient, onAddCharge, onRecordPayment, onWriteOff, onRecode, onAddMemo, onGenerateClaim,
+  onBack, onUpdatePatient, onAddCharge, onGenerateClaim,
   onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc, onArchiveIdDoc,
   onAddPatientMemo, onAddAppointment, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit,
   onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp, onDebitPosting, onApplyCreditBalance,
+  hasOpenBatch, onCreateTickler,
 }) {
   const [pageTab, setPageTab] = useState("demography");
   const totalBalance = charges.reduce((s, c) => s + Math.max(0, balanceOf(c)), 0);
@@ -2319,6 +3020,7 @@ function PatientBilling({
           onWriteOffDOS={onWriteOffDOS} onCreditDOS={onCreditDOS}
           onSelectChargeInsurance={onSelectChargeInsurance} onSetSelfPay={onSetSelfPay}
           onEditClaimFields={onEditClaimFields} onAddFollowUp={onAddFollowUp} onDebitPosting={onDebitPosting} onApplyCreditBalance={onApplyCreditBalance}
+          hasOpenBatch={hasOpenBatch} onCreateTickler={onCreateTickler}
         />
       )}
 
@@ -2469,7 +3171,7 @@ function ClaimLedgerTab({
   patientId, charges, allCharges, allPatients, patientById, claims, policies, session, onAddCharge, onGenerateClaim,
   onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit,
   onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp, onDebitPosting,
-  patientCreditBalances, insuranceCreditBalances, onApplyCreditBalance,
+  patientCreditBalances, insuranceCreditBalances, onApplyCreditBalance, hasOpenBatch, onCreateTickler,
 }) {
   const [selectedId, setSelectedId] = useState(charges[0]?.id || null);
   const [menu, setMenu] = useState(null); // { x, y, chargeId }
@@ -2595,8 +3297,19 @@ function ClaimLedgerTab({
       {menu && (
         <DOSContextMenu
           x={menu.x} y={menu.y}
+          hasOpenBatch={hasOpenBatch}
           onClose={() => setMenu(null)}
           onAction={(type) => closeMenuAnd(() => setDialog({ type, chargeId: menu.chargeId }))}
+          onCreateTickler={() => closeMenuAnd(() => {
+            const c = charges.find(ch => ch.id === menu.chargeId);
+            if (!c) return;
+            const linkedClaim = claims.find(cl => cl.chargeId === c.id);
+            onCreateTickler({
+              patientId: c.patientId, patientName: patientById[c.patientId]?.name || "",
+              dos: c.dos, cpt: c.cpt, claimId: linkedClaim?.id || "",
+              title: `${c.cpt} — ${c.dos}`,
+            });
+          })}
         />
       )}
 
@@ -2633,7 +3346,7 @@ function ClaimLedgerTab({
   );
 }
 
-function DOSContextMenu({ x, y, onClose, onAction }) {
+function DOSContextMenu({ x, y, onClose, onAction, hasOpenBatch, onCreateTickler }) {
   const [paymentOpen, setPaymentOpen] = useState(true);
 
   React.useEffect(() => {
@@ -2643,33 +3356,40 @@ function DOSContextMenu({ x, y, onClose, onAction }) {
   }, [onClose]);
 
   const itemCls = "w-full text-left px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50 rounded-md flex items-center gap-2";
+  const disabledItemCls = "w-full text-left px-3 py-1.5 text-sm text-slate-300 rounded-md flex items-center gap-2 cursor-not-allowed";
+  const moneyItemCls = hasOpenBatch ? itemCls : disabledItemCls;
+  const moneyAction = (type) => hasOpenBatch && onAction(type);
 
   return (
     <div
       onClick={(e) => e.stopPropagation()}
-      style={{ position: "fixed", left: x, top: y, width: 220, zIndex: 100 }}
+      style={{ position: "fixed", left: x, top: y, width: 230, zIndex: 100 }}
       className="bg-white border border-slate-200 rounded-xl shadow-xl p-1.5"
     >
+      {!hasOpenBatch && (
+        <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1.5 mb-1">Open your batch to post payments/adjustments</div>
+      )}
       <button onClick={() => setPaymentOpen(o => !o)} className={itemCls + " font-medium justify-between"}>
         <span className="flex items-center gap-2"><CreditCard size={13} /> Post Payment</span>
         <span className="text-slate-400">{paymentOpen ? "▾" : "▸"}</span>
       </button>
       {paymentOpen && (
         <div className="pl-4 border-l border-slate-100 ml-3 mb-1">
-          <button onClick={() => onAction("check")} className={itemCls}>Check</button>
-          <button onClick={() => onAction("card")} className={itemCls}>Credit Card</button>
-          <button onClick={() => onAction("insurance")} className={itemCls}>Insurance Credit</button>
-          <button onClick={() => onAction("patient")} className={itemCls}>Patient Credit</button>
+          <button onClick={() => moneyAction("check")} className={moneyItemCls}>Check</button>
+          <button onClick={() => moneyAction("card")} className={moneyItemCls}>Credit Card</button>
+          <button onClick={() => moneyAction("insurance")} className={moneyItemCls}>Insurance Credit</button>
+          <button onClick={() => moneyAction("patient")} className={moneyItemCls}>Patient Credit</button>
         </div>
       )}
       <div className="border-t border-slate-100 my-1" />
-      <button onClick={() => onAction("writeoff")} className={itemCls}><ScissorsLineDashed size={13} /> Write Off</button>
-      <button onClick={() => onAction("creditdos")} className={itemCls}><TrendingDown size={13} /> Credit Date of Service</button>
+      <button onClick={() => moneyAction("writeoff")} className={moneyItemCls}><ScissorsLineDashed size={13} /> Write Off</button>
+      <button onClick={() => moneyAction("creditdos")} className={moneyItemCls}><TrendingDown size={13} /> Credit Date of Service</button>
       <button onClick={() => onAction("selectinsurance")} className={itemCls}><Shield size={13} /> Select Insurance</button>
       <button onClick={() => onAction("self")} className={itemCls}><Users size={13} /> Self</button>
       <div className="border-t border-slate-100 my-1" />
       <button onClick={() => onAction("editclaim")} className={itemCls}><Pencil size={13} /> Edit Claim</button>
       <button onClick={() => onAction("followup")} className={itemCls}><MessageSquarePlus size={13} /> Add Follow-Up</button>
+      <button onClick={onCreateTickler} className={itemCls}><Bell size={13} /> Create Tickler</button>
     </div>
   );
 }
@@ -3205,6 +3925,7 @@ function SelfPayConfirm({ onConfirm, onCancel }) {
 }
 
 function EditClaimForm({ charge, onSubmit }) {
+  const cptCatalog = useContext(CptCatalogContext);
   const [f, setF] = useState({
     dos: charge.dos, cpt: charge.cpt, provider: charge.provider, referralPhysician: charge.referralPhysician || "",
     facilityName: charge.facilityName || PRACTICE_INFO.name, facilityAddress: charge.facilityAddress || PRACTICE_INFO.address,
@@ -3535,20 +4256,29 @@ function PatientIdDocuments({ documents, onUpload, onArchive, canManage }) {
       </div>
       {showAdd && (
         <Modal title="Upload ID document" onClose={() => setShowAdd(false)}>
-          <IdDocForm onSubmit={(doc) => { onUpload(doc); setShowAdd(false); }} />
+          <IdDocForm onSubmit={async (doc) => { await onUpload(doc); setShowAdd(false); }} />
         </Modal>
       )}
     </div>
   );
 }
 
+// Firestore documents cap out at 1 MiB; base64 adds ~33% overhead on top of the raw file, so
+// keep a comfortable margin under that for the file plus its other fields.
+const MAX_ID_DOC_BYTES = 700 * 1024;
+
 function IdDocForm({ onSubmit }) {
   const [form, setForm] = useState({ idType: idTypes[0], idNumber: "", issuingState: "NY", issueDate: "", expirationDate: "", file: null, fileName: "", fileType: "", fileSize: null });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const [error, setError] = useState("");
-  function submit() {
+  const [saving, setSaving] = useState(false);
+  async function submit() {
     if (!form.file) { setError("Upload or scan an image or PDF of the ID first."); return; }
-    setError(""); onSubmit(form);
+    if (form.fileSize > MAX_ID_DOC_BYTES) { setError(`That file is too large (${formatFileSize(form.fileSize)}) — this stores documents directly in the database, so keep it under ${formatFileSize(MAX_ID_DOC_BYTES)}.`); return; }
+    setError("");
+    setSaving(true);
+    await onSubmit(form);
+    setSaving(false);
   }
   return (
     <div>
@@ -3566,9 +4296,9 @@ function IdDocForm({ onSubmit }) {
         value={form.file}
         onChange={(dataUrl, file) => setForm({ ...form, file: dataUrl, fileName: file?.name || form.fileName, fileType: file?.type || form.fileType, fileSize: file ? file.size : form.fileSize })}
       />
-      <p className="text-xs text-slate-400 mb-3">OCR isn't wired up in this prototype — enter fields manually and confirm before saving.</p>
+      <p className="text-xs text-slate-400 mb-3">OCR isn't wired up in this prototype — enter fields manually and confirm before saving. Keep files under {formatFileSize(MAX_ID_DOC_BYTES)}.</p>
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
-      <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Save document</button>
+      <button onClick={submit} disabled={saving} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">{saving ? "Saving…" : "Save document"}</button>
     </div>
   );
 }
@@ -3606,6 +4336,7 @@ function AuditHistory({ auditLogs }) {
 }
 
 function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAddMemo, onClose }) {
+  const cptCatalog = useContext(CptCatalogContext);
   const bal = balanceOf(charge);
   const [paymentAmt, setPaymentAmt] = useState("");
   const [writeoffAmt, setWriteoffAmt] = useState("");
@@ -3691,8 +4422,9 @@ function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAdd
 }
 
 function AddChargeForm({ onSubmit }) {
+  const cptCatalog = useContext(CptCatalogContext);
   const [dos, setDos] = useState("2026-08-24");
-  const [cpt, setCpt] = useState(cptCatalog[0].code);
+  const [cpt, setCpt] = useState(cptCatalog[0]?.code || "");
   const [provider, setProvider] = useState(providers[0]);
   const [referralPhysician, setReferralPhysician] = useState("");
   const [facilityName, setFacilityName] = useState(PRACTICE_INFO.name);
@@ -3718,6 +4450,7 @@ function AddChargeForm({ onSubmit }) {
   function submit() {
     if (!dos) { setError("Date of service is required."); return; }
     const entry = cptCatalog.find(c => c.code === cpt);
+    if (!entry) { setError("Select a CPT code."); return; }
     setError("");
     onSubmit({
       dos, provider, referralPhysician, cpt: entry.code, desc: entry.desc, charge: entry.charge,
@@ -3818,7 +4551,7 @@ function Claims({ claims, patientById, onSubmit }) {
 
 // ---------- Reports ----------
 
-function Reports({ revenueByMonth, claimStatusData, charges, patientById, transactions, patients, policies }) {
+function Reports({ revenueByMonth, claimStatusData, charges, patientById, transactions, patients, policies, batches, userAccounts, session, isOversight }) {
   const [view, setView] = useState("overview");
 
   return (
@@ -3860,19 +4593,152 @@ function Reports({ revenueByMonth, claimStatusData, charges, patientById, transa
       )}
 
       {view === "center" && (
-        <ReportCenter charges={charges} patientById={patientById} transactions={transactions} patients={patients} policies={policies} />
+        <ReportCenter
+          charges={charges} patientById={patientById} transactions={transactions} patients={patients} policies={policies}
+          batches={batches} userAccounts={userAccounts} session={session} isOversight={isOversight}
+        />
       )}
+    </div>
+  );
+}
+
+// ---------- User account administration (SUPER_ADMIN only) ----------
+
+const userRoles = ["SUPER_ADMIN", "MANAGER", "NURSE", "RECEPTIONIST", "BILLER"];
+
+function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, onChangeRole }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const sorted = [...users].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const recentActions = auditLogs.filter(a => a.entityType === "user").slice(0, 8);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <h1 className="text-xl font-semibold text-slate-800">User accounts</h1>
+        <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-sm px-3 py-2 rounded-lg hover:bg-teal-700"><Plus size={15} /> Add user</button>
+      </div>
+      <p className="text-slate-500 text-sm mb-4">Only Super Admins can see this page. Deactivating an account blocks that person from signing in — it doesn't delete their history, the same way nothing else in this app is ever hard-deleted.</p>
+
+      <Card className="mb-6">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+              <th className="px-4 py-2.5 font-medium">Name</th>
+              <th className="px-4 py-2.5 font-medium">Email</th>
+              <th className="px-4 py-2.5 font-medium">Role</th>
+              <th className="px-4 py-2.5 font-medium">Status</th>
+              <th className="px-4 py-2.5 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(u => {
+              const isSelf = u.email === session.email;
+              return (
+                <tr key={u.id} className="border-b border-slate-100 last:border-0">
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{u.name}{isSelf && <span className="text-slate-400 font-normal"> (you)</span>}</td>
+                  <td className="px-4 py-2.5 text-slate-600">{u.email}</td>
+                  <td className="px-4 py-2.5">
+                    <select
+                      className="border border-slate-300 rounded-lg px-2 py-1 text-xs"
+                      value={u.role}
+                      disabled={isSelf}
+                      onChange={(e) => onChangeRole(u.id, e.target.value)}
+                    >
+                      {userRoles.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+                    </select>
+                  </td>
+                  <td className="px-4 py-2.5"><StatusPill status={u.disabled ? "Terminated" : "Active"} /></td>
+                  <td className="px-4 py-2.5 text-right">
+                    {!isSelf && (
+                      u.disabled ? (
+                        <button onClick={() => onSetDisabled(u.id, false)} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2.5 py-1 hover:bg-teal-100">Reactivate</button>
+                      ) : (
+                        <button onClick={() => onSetDisabled(u.id, true)} className="text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1 hover:bg-rose-100">Deactivate</button>
+                      )
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {sorted.length === 0 && <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-400">No user accounts yet.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+
+      <h3 className="font-medium text-slate-700 mb-2">Recent account changes</h3>
+      <Card>
+        <div className="divide-y divide-slate-100">
+          {recentActions.map(a => (
+            <div key={a.id} className="px-4 py-2.5 text-xs flex items-center justify-between">
+              <span className="text-slate-700">{a.action} — {a.newValues}</span>
+              <span className="text-slate-400 whitespace-nowrap ml-3">{a.user} · {a.timestamp?.slice(0, 16).replace("T", " ")}</span>
+            </div>
+          ))}
+          {recentActions.length === 0 && <p className="px-4 py-4 text-center text-slate-400 text-xs">No account changes yet.</p>}
+        </div>
+      </Card>
+
+      {showAdd && (
+        <Modal title="Add user" onClose={() => setShowAdd(false)}>
+          <AddUserForm onSubmit={async (form) => { await onAddUser(form); setShowAdd(false); }} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function AddUserForm({ onSubmit }) {
+  const [form, setForm] = useState({ name: "", email: "", password: "", role: "RECEPTIONIST" });
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submit() {
+    if (!form.name.trim()) { setError("Name is required."); return; }
+    if (!/^\S+@\S+\.\S+$/.test(form.email)) { setError("Enter a valid email address."); return; }
+    if (form.password.length < 6) { setError("Password must be at least 6 characters."); return; }
+    setError("");
+    setSaving(true);
+    try {
+      await onSubmit(form);
+    } catch (err) {
+      setError(err?.code === "auth/email-already-in-use" ? "An account with that email already exists." : "Couldn't create the account. Please try again.");
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div>
+      <Field label="Full name"><input className={inputCls} value={form.name} onChange={set("name")} /></Field>
+      <Field label="Email"><input type="email" className={inputCls} value={form.email} onChange={set("email")} /></Field>
+      <Field label="Temporary password" hint="At least 6 characters — share this with them directly."><input className={inputCls} value={form.password} onChange={set("password")} /></Field>
+      <Field label="Role">
+        <select className={inputCls} value={form.role} onChange={set("role")}>
+          {userRoles.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+        </select>
+      </Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} disabled={saving} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">{saving ? "Creating…" : "Create account"}</button>
     </div>
   );
 }
 
 // ---------- Report center: aging / debit / credit, with CSV / PDF export ----------
 
-function ReportCenter({ charges, patientById, transactions, patients, policies }) {
+function ReportCenter({ charges, patientById, transactions, patients, policies, batches, userAccounts, session, isOversight }) {
   const [reportType, setReportType] = useState("aging");
   const [groupBy, setGroupBy] = useState("physician");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
+  const [showDailyTxn, setShowDailyTxn] = useState(false);
+  // Held here rather than inside the modal so the printable block can live outside it — the modal
+  // panel is fixed and scroll-clipped, which would truncate the printout.
+  const [dailyTxnResult, setDailyTxnResult] = useState(null);
+
+  const batchLabelById = useMemo(
+    () => Object.fromEntries((batches || []).map(b => [b.id, b.batchNumber || b.id])),
+    [batches]
+  );
 
   // ----- Aging report -----
   const openCharges = charges.filter(c => balanceOf(c) > 0);
@@ -3960,6 +4826,16 @@ function ReportCenter({ charges, patientById, transactions, patients, policies }
           #printable-report { position: absolute; top: 0; left: 0; width: 100%; padding: 24px; }
         }
       `}</style>
+
+      <div className="mb-4 print:hidden">
+        <SectionTitle>Daily Report</SectionTitle>
+        <button
+          onClick={() => setShowDailyTxn(true)}
+          className="flex items-center gap-2 text-sm text-slate-700 border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50 hover:border-teal-300"
+        >
+          <CalendarDays size={14} className="text-teal-600" /> Daily Transaction
+        </button>
+      </div>
 
       <div className="flex items-center gap-2 mb-3 print:hidden">
         <span className="text-xs text-slate-400">Quick generate:</span>
@@ -4131,7 +5007,596 @@ function ReportCenter({ charges, patientById, transactions, patients, policies }
           )}
         </Card>
       </div>
+
+      {showDailyTxn && (
+        <DailyTransactionModal
+          charges={charges} patientById={patientById} transactions={transactions}
+          batches={batches || []} userAccounts={userAccounts || []} session={session} isOversight={isOversight}
+          onClose={() => { setShowDailyTxn(false); setDailyTxnResult(null); }}
+          onResult={setDailyTxnResult}
+        />
+      )}
+
+      {/* Sibling of the modal, not a child: printing the full filtered dataset from inside a
+          fixed, scroll-clipped panel would truncate it at the visible page. */}
+      {showDailyTxn && dailyTxnResult && (
+        <DailyTransactionPrintable
+          result={dailyTxnResult}
+          columns={dailyTxnColumns(dailyTxnResult.filters)}
+          batchLabelById={batchLabelById}
+          generatedBy={session?.name || ""}
+        />
+      )}
     </div>
+  );
+}
+
+// ---------- Daily Transaction report (Reports -> Report center -> Daily Report) ----------
+
+// Searchable multi-select used by the procedure / doctor / user / batch pickers. The search box
+// is debounced so typing does not re-filter a long option list on every keystroke.
+function MultiSelectSearch({ options, selected, onChange, placeholder, error }) {
+  const [query, setQuery] = useState("");
+  const [debounced, setDebounced] = useState("");
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(query), 200);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  const filtered = useMemo(() => {
+    const q = debounced.trim().toLowerCase();
+    if (!q) return options;
+    return options.filter(o => o.label.toLowerCase().includes(q));
+  }, [options, debounced]);
+
+  function toggle(value) {
+    onChange(selected.includes(value) ? selected.filter(v => v !== value) : [...selected, value]);
+  }
+
+  return (
+    <div>
+      <div className="relative">
+        <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
+        <input
+          className={`${inputCls} pl-8`} value={query} placeholder={placeholder}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      </div>
+      {selected.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-2">
+          {selected.map(v => {
+            const opt = options.find(o => o.value === v);
+            return (
+              <span key={v} className="inline-flex items-center gap-1 bg-teal-50 text-teal-700 border border-teal-200 rounded-full px-2 py-0.5 text-xs">
+                {opt ? opt.label : v}
+                <button type="button" onClick={() => toggle(v)} className="text-teal-500 hover:text-teal-800"><X size={11} /></button>
+              </span>
+            );
+          })}
+        </div>
+      )}
+      <div className="mt-2 max-h-36 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+        {filtered.map(o => (
+          <label key={o.value} className="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50 cursor-pointer">
+            <input type="checkbox" checked={selected.includes(o.value)} onChange={() => toggle(o.value)} className="accent-teal-600" />
+            <span>{o.label}</span>
+          </label>
+        ))}
+        {filtered.length === 0 && <p className="px-3 py-2 text-xs text-slate-400">No matches.</p>}
+      </div>
+      {error && <p className="text-xs text-rose-600 mt-1">{error}</p>}
+    </div>
+  );
+}
+
+function RadioRow({ options, value, onChange, name }) {
+  return (
+    <div className="flex flex-wrap gap-4">
+      {options.map(o => (
+        <label key={o.value} className="flex items-center gap-1.5 text-sm text-slate-700 cursor-pointer">
+          <input type="radio" name={name} checked={value === o.value} onChange={() => onChange(o.value)} className="accent-teal-600" />
+          {o.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+const dailyTxnBasedOnLabel = { service: "Service Date", deposit: "Deposit Date", transaction: "Transaction Date" };
+const dailyTxnPatientLabel = { name: "Patient Name", total: "Total Patient Names" };
+const dailyTxnPrintLabel = { both: "Charges and Receipt", charge: "Charge Only", receipt: "Receipt Only" };
+
+// Human-readable list of the filters used, shown above the preview and on the printout (spec §19).
+function dailyTxnFilterSummary(f, batchLabelById) {
+  const list = (arr, all) => (arr.length ? arr.join(", ") : all);
+  const batchNames = (ids) => ids.map(id => batchLabelById[id] || id);
+  return [
+    ["Patient Display", dailyTxnPatientLabel[f.patientDisplay]],
+    ...(f.patientDisplay === "name" ? [["Print Type", dailyTxnPrintLabel[f.printWithName]]] : []),
+    ["Procedure", f.procedureMode === "all" ? "All Procedure Codes" : list(f.procedureCodes, "All Procedure Codes")],
+    ["Doctor", f.doctorMode === "all" ? "All Doctors" : list(f.doctors, "All Doctors")],
+    ["User", f.userMode === "all" ? "All Users" : list(f.users, "All Users")],
+    ["Batch", f.batchMode === "all" ? "All Batches" : list(batchNames(f.batchIds), "All Batches")],
+    ["Report From", f.reportFrom === "closing" ? `Closing — ${list(batchNames(f.closingBatchIds), "none")}` : "Date Span"],
+    ["Report Based On", dailyTxnBasedOnLabel[f.basedOn]],
+    ...(f.reportFrom === "dateSpan" ? [["Date Span", `${f.startDate || "—"} – ${f.endDate || "—"}`]] : []),
+    ["Included", [f.includeCharges && "Charges", f.includeReceipts && "Receipts"].filter(Boolean).join(" + ") || "None"],
+  ];
+}
+
+function DailyTxnSummary({ totals }) {
+  const items = [
+    ["Total Patients", String(totals.totalPatients)],
+    ["Total Transactions", String(totals.totalTransactions)],
+    ["Total Charges", money(totals.totalCharges)],
+    ["Total Adjustments", money(totals.totalAdjustments)],
+    ["Total Receipts", money(totals.totalReceipts)],
+    ["Remaining Balance", money(totals.remainingBalance)],
+  ];
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+      {items.map(([label, value]) => (
+        <div key={label} className="border border-slate-200 rounded-lg px-3 py-2">
+          <span className="block text-[11px] uppercase tracking-wide text-slate-400">{label}</span>
+          <span className="text-sm font-semibold text-slate-800">{value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DailyTxnTable({ rows, columns }) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm whitespace-nowrap">
+        <thead>
+          <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+            {columns.map(c => (
+              <th key={c.key} className={`py-2 pr-3 font-medium ${c.align === "right" ? "text-right" : ""}`}>{c.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.key} className="border-b border-slate-100 last:border-0">
+              {columns.map(c => {
+                const v = c.get(r);
+                return (
+                  <td key={c.key} className={`py-2 pr-3 ${c.align === "right" ? "text-right font-medium" : "text-slate-600"}`}>
+                    {c.money ? money(v) : v}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// The print view. Rendered outside the modal (the modal panel is fixed + scroll-clipped, which
+// would truncate the printout) and always over the complete filtered dataset rather than the
+// currently visible preview page.
+function DailyTransactionPrintable({ result, columns, batchLabelById, generatedBy }) {
+  const f = result.filters;
+  return (
+    <div id="daily-txn-printable" className="hidden print:block">
+      <style>{`
+        @media print {
+          body * { visibility: hidden !important; }
+          #daily-txn-printable, #daily-txn-printable * { visibility: visible !important; }
+          #daily-txn-printable { position: absolute; top: 0; left: 0; width: 100%; padding: 24px; }
+        }
+      `}</style>
+
+      <div className="text-center border-b-2 border-slate-800 pb-2 mb-3">
+        <h1 className="text-base font-bold tracking-wide">{PRACTICE_INFO.name.toUpperCase()} — MEDICAL BILLING SYSTEM</h1>
+        <h2 className="text-sm font-semibold">DAILY TRANSACTION REPORT</h2>
+      </div>
+
+      <table className="text-[11px] mb-3">
+        <tbody>
+          {dailyTxnFilterSummary(f, batchLabelById).map(([k, v]) => (
+            <tr key={k}><td className="pr-3 font-semibold align-top">{k}:</td><td>{v}</td></tr>
+          ))}
+          <tr><td className="pr-3 font-semibold">Generated By:</td><td>{generatedBy}</td></tr>
+          <tr><td className="pr-3 font-semibold">Generated Date:</td><td>{TODAY}</td></tr>
+        </tbody>
+      </table>
+
+      {result.rows.length === 0 ? (
+        <p className="text-xs">No transactions match the selected report filters and date range.</p>
+      ) : (
+        <DailyTxnTable rows={result.rows} columns={columns} />
+      )}
+
+      <div className="mt-4 border-t-2 border-slate-800 pt-2">
+        <h3 className="text-xs font-bold mb-1">REPORT SUMMARY</h3>
+        <table className="text-[11px]">
+          <tbody>
+            <tr><td className="pr-4">Total Patients:</td><td className="font-semibold">{result.totals.totalPatients}</td></tr>
+            <tr><td className="pr-4">Total Transactions:</td><td className="font-semibold">{result.totals.totalTransactions}</td></tr>
+            <tr><td className="pr-4">Total Charges:</td><td className="font-semibold">{money(result.totals.totalCharges)}</td></tr>
+            <tr><td className="pr-4">Total Adjustments:</td><td className="font-semibold">{money(result.totals.totalAdjustments)}</td></tr>
+            <tr><td className="pr-4">Total Receipts:</td><td className="font-semibold">{money(result.totals.totalReceipts)}</td></tr>
+            <tr><td className="pr-4">Remaining Balance:</td><td className="font-semibold">{money(result.totals.remainingBalance)}</td></tr>
+          </tbody>
+        </table>
+        <p className="text-[10px] text-slate-500 mt-2">
+          Adjustment and remaining balance are lifetime figures for each charge, not amounts limited to the reporting period.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function DailyTransactionModal({ charges, patientById, transactions, batches, userAccounts, session, isOversight, onClose, onResult }) {
+  const cptCatalog = useContext(CptCatalogContext);
+  const [f, setF] = useState(DAILY_TXN_DEFAULTS);
+  const [result, setResult] = useState(null);
+  const [page, setPage] = useState(1);
+  const [generating, setGenerating] = useState(false);
+  const [touched, setTouched] = useState(false);
+  const [toast, setToast] = useState("");
+
+  // Non-oversight users only ever see their own batches, mirroring BatchManagement.
+  const visibleBatches = useMemo(
+    () => (isOversight ? batches : batches.filter(b => b.userId === session.uid)),
+    [batches, isOversight, session.uid]
+  );
+  const batchLabelById = useMemo(
+    () => Object.fromEntries(visibleBatches.map(b => [b.id, b.batchNumber || b.id])),
+    [visibleBatches]
+  );
+
+  // Flattening every charge + posting is the expensive step, so it is memoised on the raw data
+  // and re-run only when Firestore pushes new documents — never when a filter changes.
+  const allRows = useMemo(
+    () => buildDailyTransactionRows({ charges, patientById, transactions }),
+    [charges, patientById, transactions]
+  );
+
+  const closedBatches = useMemo(
+    () => visibleBatches.filter(b => b.status === "CLOSED").sort((a, b) => (b.batchDate || "").localeCompare(a.batchDate || "")),
+    [visibleBatches]
+  );
+  // Per-batch receipt total, shown in the Closing picker so staff can recognise a batch by amount.
+  const closingTotals = useMemo(() => {
+    const totals = {};
+    allRows.forEach(r => { if (r.batchId) totals[r.batchId] = (totals[r.batchId] || 0) + r.receipt; });
+    return totals;
+  }, [allRows]);
+
+  const errors = validateDailyTxnFilters(f);
+  const hasErrors = Object.keys(errors).length > 0;
+  const show = (key) => (touched ? errors[key] : undefined);
+
+  // Any filter change invalidates a generated report, so the preview, CSV and print can never
+  // reflect options the user has since changed.
+  function set(key, value) {
+    setF(prev => ({ ...prev, [key]: value }));
+    setResult(null);
+    setPage(1);
+  }
+
+  const columns = useMemo(() => dailyTxnColumns(result ? result.filters : f), [result, f]);
+
+  function runReport() {
+    setTouched(true);
+    if (hasErrors) return null;
+    setGenerating(true);
+    const r = generateDailyTransactionReport(f, allRows);
+    setResult(r);
+    setPage(1);
+    setGenerating(false);
+    return r;
+  }
+
+  // CSV and print reuse whatever Generate already produced, and only generate themselves if the
+  // user pressed them first — so all three always describe the same dataset.
+  function ensureResult() {
+    if (result) return result;
+    return runReport();
+  }
+
+  function handleExport() {
+    const r = ensureResult();
+    if (!r) return;
+    if (!r.rows.length) { setToast("Nothing to export — no transactions match these filters."); return; }
+    const cols = dailyTxnColumns(r.filters);
+    exportCSV(dailyTxnFilename(r.filters, batchLabelById), dailyTxnCsvRows(r.rows, cols));
+    setToast(`Exported ${r.rows.length} transaction${r.rows.length === 1 ? "" : "s"} to CSV.`);
+  }
+
+  function handlePrint() {
+    const r = ensureResult();
+    if (!r) return;
+    onResult(r);
+    // Let React paint the printable block before opening the print dialog.
+    setTimeout(printReport, 50);
+  }
+
+  useEffect(() => { onResult(result); }, [result, onResult]);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(""), 4000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const pageCount = result ? Math.max(1, Math.ceil(result.rows.length / DAILY_TXN_PAGE_SIZE)) : 1;
+  const pageRows = result ? result.rows.slice((page - 1) * DAILY_TXN_PAGE_SIZE, page * DAILY_TXN_PAGE_SIZE) : [];
+
+  const procedureOptions = useMemo(
+    () => cptCatalog.map(c => ({ value: c.code, label: `${c.code} — ${c.desc}` })),
+    [cptCatalog]
+  );
+  const userOptions = useMemo(
+    () => userAccounts.filter(u => u.name).map(u => ({ value: u.name, label: `${u.name} (${ROLE_LABELS[u.role] || u.role})` })),
+    [userAccounts]
+  );
+  const batchOptions = useMemo(
+    () => visibleBatches.map(b => ({ value: b.id, label: `${b.batchNumber} — ${b.batchDate} (${b.userName})` })),
+    [visibleBatches]
+  );
+
+  return (
+    <Modal title="Daily Transaction Report" onClose={onClose} size="max-w-5xl">
+      <div className="space-y-5">
+        <div className="grid md:grid-cols-2 gap-x-6">
+          <div>
+            <SectionTitle>Patient Information</SectionTitle>
+            <RadioRow
+              name="dt-patient" value={f.patientDisplay} onChange={(v) => set("patientDisplay", v)}
+              options={[{ value: "total", label: "Show Total Patient Names" }, { value: "name", label: "Show Patient Name" }]}
+            />
+
+            {/* Only meaningful once names are shown — it scopes what prints next to each name. */}
+            {f.patientDisplay === "name" && (
+              <>
+                <SectionTitle>Print With Name</SectionTitle>
+                <RadioRow
+                  name="dt-print" value={f.printWithName} onChange={(v) => set("printWithName", v)}
+                  options={[
+                    { value: "both", label: "Charges and Receipt" },
+                    { value: "charge", label: "Charge Only" },
+                    { value: "receipt", label: "Receipt Only" },
+                  ]}
+                />
+              </>
+            )}
+
+            <SectionTitle>Report From</SectionTitle>
+            <RadioRow
+              name="dt-from" value={f.reportFrom} onChange={(v) => set("reportFrom", v)}
+              options={[{ value: "dateSpan", label: "Date Span" }, { value: "closing", label: "Closing" }]}
+            />
+
+            {f.reportFrom === "dateSpan" ? (
+              <>
+                <SectionTitle>Report Based On</SectionTitle>
+                <RadioRow
+                  name="dt-based" value={f.basedOn} onChange={(v) => set("basedOn", v)}
+                  options={[
+                    { value: "service", label: "Service Date" },
+                    { value: "deposit", label: "Deposit Date" },
+                    { value: "transaction", label: "Transaction Date" },
+                  ]}
+                />
+                {f.basedOn === "deposit" && (
+                  <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mt-2">
+                    Only payments carry a deposit date, so this report covers receipts only — charge rows are excluded.
+                  </p>
+                )}
+                {show("basedOn") && <p className="text-xs text-rose-600 mt-1">{errors.basedOn}</p>}
+
+                <SectionTitle>Select Date Span</SectionTitle>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Start Date">
+                    <input type="date" className={inputCls} value={f.startDate} onChange={(e) => set("startDate", e.target.value)} />
+                    {show("startDate") && <span className="block text-xs text-rose-600 mt-1">{errors.startDate}</span>}
+                  </Field>
+                  <Field label="End Date">
+                    <input type="date" className={inputCls} value={f.endDate} onChange={(e) => set("endDate", e.target.value)} />
+                    {show("endDate") && <span className="block text-xs text-rose-600 mt-1">{errors.endDate}</span>}
+                  </Field>
+                </div>
+              </>
+            ) : (
+              <>
+                <SectionTitle>Closed Batches</SectionTitle>
+                {closedBatches.length === 0 ? (
+                  <p className="text-xs text-slate-400 border border-slate-200 rounded-lg px-3 py-2">No closed batches available.</p>
+                ) : (
+                  <div className="max-h-44 overflow-y-auto border border-slate-200 rounded-lg">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-left text-slate-500 border-b border-slate-200">
+                          <th className="py-1.5 px-2 font-medium"></th>
+                          <th className="py-1.5 px-2 font-medium">Batch</th>
+                          <th className="py-1.5 px-2 font-medium">Closing Date</th>
+                          <th className="py-1.5 px-2 font-medium">User</th>
+                          <th className="py-1.5 px-2 font-medium text-right">Total</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {closedBatches.map(b => (
+                          <tr key={b.id} className="border-b border-slate-100 last:border-0">
+                            <td className="py-1.5 px-2">
+                              <input
+                                type="checkbox" className="accent-teal-600"
+                                checked={f.closingBatchIds.includes(b.id)}
+                                onChange={() => set("closingBatchIds", f.closingBatchIds.includes(b.id)
+                                  ? f.closingBatchIds.filter(x => x !== b.id)
+                                  : [...f.closingBatchIds, b.id])}
+                              />
+                            </td>
+                            <td className="py-1.5 px-2 text-slate-700">{b.batchNumber}</td>
+                            <td className="py-1.5 px-2 text-slate-600">{(b.closedAt || b.batchDate || "").slice(0, 10)}</td>
+                            <td className="py-1.5 px-2 text-slate-600">{b.userName}</td>
+                            <td className="py-1.5 px-2 text-right font-medium">{money(closingTotals[b.id] || 0)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {show("closingBatchIds") && <p className="text-xs text-rose-600 mt-1">{errors.closingBatchIds}</p>}
+              </>
+            )}
+          </div>
+
+          <div>
+            <SectionTitle>Procedure Code</SectionTitle>
+            <RadioRow
+              name="dt-proc" value={f.procedureMode} onChange={(v) => set("procedureMode", v)}
+              options={[{ value: "all", label: "All Procedure Codes" }, { value: "specific", label: "Specific Procedure Code(s)" }]}
+            />
+            {f.procedureMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={procedureOptions} selected={f.procedureCodes} placeholder="Search CPT codes…"
+                  onChange={(v) => set("procedureCodes", v)} error={show("procedureCodes")}
+                />
+              </div>
+            )}
+
+            <SectionTitle>Doctor</SectionTitle>
+            <RadioRow
+              name="dt-doc" value={f.doctorMode} onChange={(v) => set("doctorMode", v)}
+              options={[{ value: "all", label: "All Doctors" }, { value: "specific", label: "Specific Doctor" }]}
+            />
+            {f.doctorMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={providers.map(p => ({ value: p, label: p }))} selected={f.doctors} placeholder="Search doctors…"
+                  onChange={(v) => set("doctors", v)} error={show("doctors")}
+                />
+              </div>
+            )}
+
+            <SectionTitle>User</SectionTitle>
+            <RadioRow
+              name="dt-user" value={f.userMode} onChange={(v) => set("userMode", v)}
+              options={[{ value: "all", label: "All Users" }, { value: "specific", label: "Specific User" }]}
+            />
+            {f.userMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={userOptions} selected={f.users} placeholder="Search users…"
+                  onChange={(v) => set("users", v)} error={show("users")}
+                />
+              </div>
+            )}
+
+            <SectionTitle>Batch</SectionTitle>
+            <RadioRow
+              name="dt-batch" value={f.batchMode} onChange={(v) => set("batchMode", v)}
+              options={[{ value: "all", label: "All Batches" }, { value: "specific", label: "Specific Batch" }]}
+            />
+            {f.batchMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={batchOptions} selected={f.batchIds} placeholder="Search batches…"
+                  onChange={(v) => set("batchIds", v)} error={show("batchIds")}
+                />
+              </div>
+            )}
+
+            <SectionTitle>Include</SectionTitle>
+            <div className="flex gap-5">
+              <label className="flex items-center gap-1.5 text-sm text-slate-700 cursor-pointer">
+                <input type="checkbox" className="accent-teal-600" checked={f.includeCharges} onChange={(e) => set("includeCharges", e.target.checked)} />
+                Charges
+              </label>
+              <label className="flex items-center gap-1.5 text-sm text-slate-700 cursor-pointer">
+                <input type="checkbox" className="accent-teal-600" checked={f.includeReceipts} onChange={(e) => set("includeReceipts", e.target.checked)} />
+                Receipts
+              </label>
+            </div>
+            {show("include") && <p className="text-xs text-rose-600 mt-1">{errors.include}</p>}
+          </div>
+        </div>
+
+        {touched && hasErrors && (
+          <div className="flex items-start gap-2 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+            <AlertCircle size={15} className="mt-0.5 shrink-0" />
+            <span>Fix the highlighted options before generating the report.</span>
+          </div>
+        )}
+        {toast && (
+          <div className="flex items-center gap-2 text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+            <CheckCircle2 size={15} /> {toast}
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 pt-4">
+          <button
+            onClick={() => { setF(DAILY_TXN_DEFAULTS); setResult(null); setTouched(false); setToast(""); setPage(1); }}
+            className="text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-slate-50"
+          >
+            Reset
+          </button>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={runReport} className="flex items-center gap-1.5 text-sm bg-teal-600 text-white rounded-lg px-4 py-2 hover:bg-teal-700">
+              <BarChart3 size={14} /> Generate Report
+            </button>
+            <button onClick={handleExport} className="flex items-center gap-1.5 text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-slate-50">
+              <Download size={14} /> Export CSV
+            </button>
+            <button onClick={handlePrint} className="flex items-center gap-1.5 text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-slate-50">
+              <Printer size={14} /> Print Report
+            </button>
+          </div>
+        </div>
+
+        {generating && <p className="text-sm text-slate-500">Generating report…</p>}
+
+        {result && (
+          <div className="border-t border-slate-200 pt-4">
+            <h4 className="font-semibold text-slate-800 mb-1">Report preview</h4>
+            <p className="text-xs text-slate-500 mb-3">
+              {result.rows.length} record{result.rows.length === 1 ? "" : "s"} · {result.totals.totalPatients} patient{result.totals.totalPatients === 1 ? "" : "s"}
+            </p>
+
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500 mb-3">
+              {dailyTxnFilterSummary(result.filters, batchLabelById).map(([k, v]) => (
+                <span key={k}><span className="text-slate-400">{k}:</span> {v}</span>
+              ))}
+            </div>
+
+            {result.rows.length === 0 ? (
+              <div className="text-center py-8 border border-dashed border-slate-200 rounded-lg">
+                <p className="font-medium text-slate-600">No transactions found</p>
+                <p className="text-xs text-slate-400 mt-1">No transactions match the selected report filters and date range.</p>
+              </div>
+            ) : (
+              <>
+                {/* Only the visible page is rendered; CSV and print always use result.rows in full. */}
+                <DailyTxnTable rows={pageRows} columns={columns} />
+                {pageCount > 1 && (
+                  <div className="flex items-center justify-between mt-3">
+                    <span className="text-xs text-slate-500">Page {page} of {pageCount}</span>
+                    <div className="flex gap-1">
+                      <button disabled={page === 1} onClick={() => setPage(p => p - 1)} className="flex items-center gap-1 text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40">
+                        <ChevronLeft size={13} /> Prev
+                      </button>
+                      <button disabled={page === pageCount} onClick={() => setPage(p => p + 1)} className="flex items-center gap-1 text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-600 hover:bg-slate-50 disabled:opacity-40">
+                        Next <ChevronRight size={13} />
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <h4 className="font-semibold text-slate-800 mt-5 mb-2">Report summary</h4>
+                <DailyTxnSummary totals={result.totals} />
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -4726,7 +6191,8 @@ function DuplicateWarning({ dupes, onUseExisting, onCreateAnyway, onCancel }) {
 }
 
 function AddApptForm({ patients, onSubmit }) {
-  const [form, setForm] = useState({ patientId: patients[0]?.id || "", date: "2026-08-24", time: "09:00", provider: providers[0], type: "Follow-up", cpt: cptCatalog[0].code });
+  const cptCatalog = useContext(CptCatalogContext);
+  const [form, setForm] = useState({ patientId: patients[0]?.id || "", date: "2026-08-24", time: "09:00", provider: providers[0], type: "Follow-up", cpt: cptCatalog[0]?.code || "" });
   const [error, setError] = useState("");
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
