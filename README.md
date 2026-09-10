@@ -5,6 +5,8 @@ payments, claims, and reports.
 
 **Repository:** [github.com/jobaid/ClinicalEHRApplication](https://github.com/jobaid/ClinicalEHRApplication)
 
+![Jobaid Clinic demo](public/demo.gif)
+
 ---
 
 ## Start the application
