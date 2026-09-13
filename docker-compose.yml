@@ -1,0 +1,75 @@
+# Full local stack: PostgreSQL + Go API + nginx-served frontend.
+#
+#   cp .env.docker.example .env.docker
+#   # fill in POSTGRES_PASSWORD and JWT_SECRET, then:
+#   docker compose --env-file .env.docker up --build
+#
+# Then open http://localhost:8080. The API is reached through the same origin at /api.
+#
+# Compose's `${VAR:?message}` syntax refuses to start when a variable is unset, which matches how
+# the API itself behaves under APP_ENV=production — the stack fails loudly on a missing secret
+# instead of quietly running on a default that is printed in a public repository.
+
+name: medbill
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-medbill}
+      POSTGRES_USER: ${POSTGRES_USER:-medbill}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — see .env.docker.example}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # Postgres runs every .sql here in filename order, but ONLY when the data directory is
+      # empty — i.e. the very first start. Adding a migration later does not re-run this; apply
+      # it yourself with `docker compose exec -T db psql ...`, or drop the volume to rebuild.
+      - ./server/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-medbill} -d ${POSTGRES_DB:-medbill}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Deliberately publishes no port. The API reaches it over the private compose network, and
+    # the database is not exposed to the host or the LAN. To inspect it, go through the container:
+    #   docker compose exec db psql -U medbill -d medbill
+
+  api:
+    build:
+      context: ./server
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-medbill}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-medbill}?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET — generate with: openssl rand -base64 48}
+      # Same-origin through nginx means CORS is never exercised, but the server requires the
+      # variable under APP_ENV=production, so it is set to the origin people actually visit.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Also unpublished: the browser talks to /api through nginx, so nothing needs port 8080 from
+    # outside. Publish it only if you are pointing a separately hosted frontend at this API.
+
+  web:
+    build:
+      context: .
+      args:
+        # Empty = same origin, so the bundle requests /api/... from whatever host serves it.
+        VITE_API_BASE: ""
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  db-data:

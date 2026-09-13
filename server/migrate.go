@@ -24,7 +24,7 @@ import (
 
 // migrationOrder puts users first so batches/ticklers referencing a uid have their owner present.
 var migrationOrder = []string{
-	"users", "patients", "cptCatalog", "insurancePolicies",
+	"users", "patients", "cptCatalog", "physicians", "insurancePolicies",
 	"appointments", "patientMemos", "idDocuments",
 	"charges", "claims", "transactions", "batches",
 	"patientCreditBalances", "insuranceCreditBalances",

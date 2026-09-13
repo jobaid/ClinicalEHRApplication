@@ -53,6 +53,14 @@ func init() {
 		b("disabled", "disabled"), t("createdBy", "created_by"), t("createdAt", "created_at"),
 	}})
 
+	// Role -> tab grants, edited from Settings > Manage roles (SUPER_ADMIN only, see
+	// writeAllowed). Seeded by migrations/002_role_permissions.sql with the grants that used to
+	// be hardcoded in src/app.jsx.
+	register(&Collection{Name: "rolePermissions", Table: "role_permissions", Fields: []Field{
+		t("id", "id"), j("tabs", "tabs"), j("permissions", "permissions"),
+		t("updatedBy", "updated_by"), t("updatedAt", "updated_at"),
+	}})
+
 	register(&Collection{Name: "loginAudit", Table: "login_audit", Fields: []Field{
 		t("id", "id"), t("user", `"user"`), t("role", "role"), t("action", "action"),
 		t("timestamp", "timestamp"),
@@ -96,6 +104,9 @@ func init() {
 		t("status", "status"), t("priority", "priority"), t("subscriberName", "subscriber_name"),
 		t("subscriberDob", "subscriber_dob"), t("subscriberRelationship", "subscriber_relationship"),
 		t("copay", "copay"), t("deductible", "deductible"), t("coinsurance", "coinsurance"),
+		// Link to the master row, plus the address snapshot taken when the policy was created.
+		// See the note in migrations/005 on why the payer details are copied, not joined.
+		t("insuranceId", "insurance_id"), t("insuranceAddress", "insurance_address"),
 		b("authRequired", "auth_required"), b("referralRequired", "referral_required"),
 		t("notes", "notes"), t("cardFront", "card_front"), t("cardBack", "card_back"),
 		j("fieldHistory", "field_history"), t("createdBy", "created_by"),
@@ -105,6 +116,26 @@ func init() {
 	register(&Collection{Name: "cptCatalog", Table: "cpt_catalog", Fields: []Field{
 		t("id", "id"), t("code", "code"), t("desc", `"desc"`), n("charge", "charge"),
 		t("category", "category"), b("active", "active"),
+	}})
+
+	// Physician directory - see migrations/003_physicians.sql. Every signed-in role reads this
+	// (it fills the provider dropdown on charges and appointments); only SUPER_ADMIN writes it.
+	register(&Collection{Name: "physicians", Table: "physicians", Fields: []Field{
+		t("id", "id"), t("name", "name"), t("npi", "npi"),
+		t("specialty", "specialty"), b("active", "active"),
+		// Optional base64 data URL - see migrations/004_physician_signature.sql. Read by the
+		// statement renderer; empty means the statement prints a line to sign by hand.
+		t("signature", "signature"),
+	}})
+
+	// Master insurance list - see migrations/005_insurance_master.sql. Readable by every signed-in
+	// user (the patient insurance form needs the dropdown); writes are gated on the granular
+	// insurance.* permissions in writeAllowed/deleteAllowed, not on a tab.
+	register(&Collection{Name: "insurance", Table: "insurance", Fields: []Field{
+		t("id", "id"), t("name", "name"), t("payerId", "payer_id"), t("address", "address"),
+		t("phone", "phone"), t("website", "website"), t("notes", "notes"), t("status", "status"),
+		t("createdBy", "created_by"), t("createdAt", "created_at"),
+		t("updatedBy", "updated_by"), t("updatedAt", "updated_at"),
 	}})
 
 	register(&Collection{Name: "charges", Table: "charges", Fields: []Field{

@@ -66,3 +66,21 @@ export async function createUserAccount(email, password) {
   });
   return res.uid;
 }
+
+// Changes the signed-in user's own password. The server re-verifies currentPassword before
+// accepting the change, so this cannot be used to take over an unattended session.
+export async function changeOwnPassword(currentPassword, newPassword) {
+  await api("/api/auth/password", {
+    method: "POST",
+    body: { currentPassword, newPassword },
+  });
+}
+
+// SUPER_ADMIN only: sets another account's password. There is no email in this app, so this is
+// the recovery path for someone who is locked out.
+export async function adminResetPassword(uid, newPassword) {
+  await api(`/api/auth/users/${uid}/password`, {
+    method: "POST",
+    body: { newPassword },
+  });
+}

@@ -1,0 +1,19 @@
+# What never enters the API build context. See the note in the root .dockerignore — anything
+# copied in stays recoverable from the published image's layers.
+
+# --- secrets ---
+.env
+.env.*
+firebase-hash-config.json
+*.pem
+*.key
+
+# --- build output ---
+medbill-server
+medbill-server.exe
+medbill-server.exe~
+
+# --- noise ---
+*.md
+Dockerfile
+.dockerignore

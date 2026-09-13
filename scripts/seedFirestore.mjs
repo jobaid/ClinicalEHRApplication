@@ -116,6 +116,15 @@ const patients = [
     guarantor: { name: "Omar Haddad", relationship: "Self", employer: "Freelance" } },
 ];
 
+// ---------- Physician directory ----------
+// Mirrors migrations/003_physicians.sql. Editable at runtime from Settings > Practice catalog,
+// so this is a starting roster, not a fixed list.
+const physicians = [
+  { id: "PHY-1001", name: "Dr. S. Reyes", npi: "1912345678", specialty: "Internal Medicine", active: true },
+  { id: "PHY-1002", name: "Dr. A. Okafor", npi: "1923456789", specialty: "Family Medicine", active: true },
+  { id: "PHY-1003", name: "Dr. M. Lin", npi: "1934567890", specialty: "Cardiology", active: true },
+];
+
 // ---------- CPT catalog ----------
 const cptCatalog = [
   { code: "99213", desc: "Office visit, established patient (low complexity)", charge: 110, category: "Office Visit" },
@@ -256,6 +265,7 @@ async function main() {
   console.log("Seeding Firestore collections...");
   await seedCollection("patients", patients);
   await seedCollection("cptCatalog", cptCatalog.map(c => ({ ...c, id: c.code, active: true })));
+  await seedCollection("physicians", physicians);
   await seedCollection("insurancePolicies", insurancePolicies);
   await seedCollection("auditLogs", auditLogs);
   await seedCollection("patientMemos", patientMemos);

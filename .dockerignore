@@ -1,0 +1,52 @@
+# What never enters the frontend build context.
+#
+# This is a security control, not just a speed one. Everything copied here can be read out of the
+# published image's layers with `docker history` / `docker save`, even if a later step deletes it.
+# Secrets must not be in the context in the first place.
+
+# --- secrets ---
+.env
+.env.*
+!.env.example
+!.env.docker.example
+*serviceAccountKey*.json
+*firebase-adminsdk*.json
+*.pem
+*.key
+*.p12
+*.pfx
+server/firebase-hash-config.json
+
+# --- the nested repository (carries its own .env and a service-account key) ---
+Billing/
+
+# --- vcs, tooling, local state ---
+.git
+.gitignore
+.github
+.claude
+.agents
+.vscode
+.idea
+.firebase
+.scratch
+
+# --- build output and dependencies (reinstalled inside the image) ---
+node_modules
+dist
+dist-ssr
+tools/
+migration-export/
+server/medbill-server.exe
+server/medbill-server.exe~
+test-results
+playwright-report
+
+# --- noise ---
+*.log
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+clinicGIF.gif

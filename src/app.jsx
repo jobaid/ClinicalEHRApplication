@@ -1,7 +1,8 @@
 import React, { useState, useMemo, useEffect, useRef, useContext, createContext } from "react";
 import Papa from "papaparse";
-import { signIn, signOutUser, fetchUserProfile, createUserAccount } from "./firebase/authService";
-import { useFirestoreCollection, setDocument, updateDocument, addDocument, newBatch, docRef } from "./firebase/firestoreService";
+import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPassword, adminResetPassword } from "./firebase/authService";
+import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
+import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import {
   LayoutDashboard, CalendarDays, Users, Receipt, FileStack, BarChart3,
   Plus, X, Search, ChevronRight, ChevronLeft, AlertCircle, CheckCircle2, Clock,
@@ -9,7 +10,8 @@ import {
   ScissorsLineDashed, CreditCard, Upload, FileCheck2, Landmark, Wand2,
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
-  Activity, Pill, ClipboardList, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip
+  Activity, Pill, ClipboardList, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
+  KeyRound, ShieldCheck
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -24,11 +26,8 @@ import {
 // (role/permission tables, dropdown option lists, providers) that aren't "data" so much as UI
 // vocabulary, plus pure helper functions.
 
-const providers = ["Dr. S. Reyes", "Dr. A. Okafor", "Dr. M. Lin"];
-
 // CMS-1500-style claim fields — practice defaults, prefilled but editable per charge.
 const PRACTICE_INFO = { name: "Jobaid Clinic", address: "400 Harbor Way, Bellerose, NY 11426", taxId: "13-5551234" };
-const providerNPI = { "Dr. S. Reyes": "1912345678", "Dr. A. Okafor": "1923456789", "Dr. M. Lin": "1934567890" };
 const emptyDxCodes = () => Array(10).fill("");
 
 // ---------- Auth / RBAC ----------
@@ -38,8 +37,17 @@ const emptyDxCodes = () => Array(10).fill("");
 // lives in firestore.rules / storage.rules, not just in this client-side tab filter.
 
 // Display-only convenience for the login screen's "quick fill" panel — these are the accounts
-// scripts/seedFirestore.mjs creates in Firebase Auth. Never used to authenticate; real sign-in
-// always goes through signIn() in src/firebase/authService.js.
+// scripts/seedFirestore.mjs creates. Never used to authenticate; real sign-in always goes
+// through signIn() in src/firebase/authService.js.
+//
+// This list is working credentials printed on the sign-in page, so it must never reach a
+// deployed build. SHOW_DEMO_LOGINS gates the panel: on during `npm run dev`, off in any
+// production build unless VITE_SHOW_DEMO_LOGINS=true is set deliberately for a public demo.
+// Vite inlines import.meta.env at build time, so with the flag off the block below is
+// unreachable and the bundler drops it — the passwords are absent from the shipped JavaScript,
+// not merely hidden by CSS.
+const SHOW_DEMO_LOGINS = import.meta.env.DEV || import.meta.env.VITE_SHOW_DEMO_LOGINS === "true";
+
 const DEMO_LOGIN_HINTS = [
   { email: "admin@medbill.local", password: "Admin@12345", role: "SUPER_ADMIN" },
   { email: "manager@medbill.local", password: "Manager@12345", role: "MANAGER" },
@@ -51,9 +59,13 @@ const ROLE_LABELS = {
   SUPER_ADMIN: "Super Admin", MANAGER: "Manager", NURSE: "Nurse", RECEPTIONIST: "Receptionist", BILLER: "Biller",
 };
 
-// Which top-nav tabs each role may open. Nurse/Receptionist never see Billing/Claims/Reports;
-// Biller never sees Clinical; Manager/Super Admin see everything.
-const ROLE_TABS = {
+// Fallback tab grants, used only until the rolePermissions collection loads (and if a role has
+// no row there). The live grants are stored in the database and edited from
+// Settings > Manage roles; these values mirror migrations/002_role_permissions.sql.
+//
+// SUPER_ADMIN is deliberately absent from the editable path everywhere: it always holds every
+// tab, so an admin cannot revoke their own access to the screen that grants access back.
+const DEFAULT_ROLE_TABS = {
   SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "users"],
   MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports"],
   NURSE: ["dashboard", "schedule", "patients", "clinical"],
@@ -65,6 +77,48 @@ const ROLE_TABS = {
 // handed down through this context rather than prop-drilled through every intermediate form —
 // it's read from several unrelated leaf components (AddChargeForm, EditClaimForm, AddApptForm...).
 const CptCatalogContext = createContext([]);
+
+// The physician roster travels the same way, and for the same reason — the provider dropdown is
+// rendered by four unrelated leaf forms (AddChargeForm, EditClaimForm, AddApptForm, the report
+// doctor filter). It used to be two hardcoded constants; it is now the `physicians` collection,
+// edited from Settings > Practice catalog. See migrations/003_physicians.sql.
+const PhysiciansContext = createContext([]);
+
+// Every provider dropdown shows active physicians only, so retiring someone keeps them off new
+// charges without rewriting the history that already names them. `current` is the value already
+// saved on the record being edited: an inactive provider stays selectable on their own old
+// charge, otherwise opening that charge would silently reassign it to whoever sorts first.
+function useProviderOptions(current) {
+  const physicians = useContext(PhysiciansContext);
+  return useMemo(() => {
+    const names = physicians.filter(p => p.active !== false).map(p => p.name);
+    return current && !names.includes(current) ? [current, ...names] : names;
+  }, [physicians, current]);
+}
+
+// Same rule for the CPT dropdowns: a retired code stays readable on the charges that already use
+// it, but stops being offered for new work. Note this filters the *pickers* only — code lookups
+// (cptCatalog.find, to resolve a description or amount) always search the full catalog, or an
+// old charge would lose its description the moment its code was retired.
+function useCptOptions(current) {
+  const cptCatalog = useContext(CptCatalogContext);
+  return useMemo(() => {
+    const active = cptCatalog.filter(c => c.active !== false);
+    if (!current || active.some(c => c.code === current)) return active;
+    const retired = cptCatalog.find(c => c.code === current);
+    return retired ? [retired, ...active] : active;
+  }, [cptCatalog, current]);
+}
+
+// Name -> NPI. Built from the same rows, so a physician can never be in the dropdown while
+// missing an NPI the way the two old constants allowed.
+function useNpiByProvider() {
+  const physicians = useContext(PhysiciansContext);
+  return useMemo(
+    () => Object.fromEntries(physicians.map(p => [p.name, p.npi || ""])),
+    [physicians],
+  );
+}
 
 // ---------- Insurance (versioned — never overwritten, see addInsurance/editInsurance) ----------
 
@@ -107,6 +161,33 @@ function localDateString(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 const TODAY = localDateString(new Date());
+
+// ---------- Display date formatting ----------
+// Dates and timestamps are STORED as ISO ("2026-08-24", "2026-08-24T09:15:00") because sorting,
+// date-range filters and <input type="date"> all depend on that shape. These two helpers exist so
+// every place that shows a date to a human renders it as MM/DD/YYYY instead (spec: US date format).
+// Parsing is done with a regex rather than `new Date()` on purpose: `new Date("2026-08-24")` is
+// parsed as UTC midnight and can display as the previous day west of Greenwich.
+
+// "2026-08-24" or "2026-08-24T09:15:00" -> "08/24/2026". Anything else ("", null, "—", an already
+// formatted value) is passed straight through so callers can keep their own `|| "—"` fallbacks.
+function fmtDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value ?? ""));
+  return m ? `${m[2]}/${m[3]}/${m[1]}` : (value || "");
+}
+
+// The dashboard header and the schedule's day groupings used to spell the date out in full
+// ("Monday, August 24, 2026"). The date itself is now MM/DD/YYYY, but the weekday is kept as a
+// prefix because the schedule relies on it to tell one day's group of appointments from the next.
+function weekdayOf(isoDate) {
+  return new Date(isoDate + "T00:00").toLocaleDateString("en-US", { weekday: "long" });
+}
+
+// "2026-08-24T09:15:00" -> "08/24/2026 09:15". Falls back to fmtDate for date-only input.
+function fmtDateTime(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(String(value ?? ""));
+  return m ? `${m[2]}/${m[3]}/${m[1]} ${m[4]}:${m[5]}` : fmtDate(value);
+}
 
 function daysBetween(dateStr, todayStr) {
   const d1 = new Date(dateStr + "T00:00");
@@ -435,9 +516,9 @@ function dailyTxnColumns(filters) {
     cols.push({ key: "patientAccount", label: "Patient ID", get: r => r.patientAccount });
   }
   cols.push({ key: "kind", label: "Transaction", get: r => (r.kind === "charge" ? "Charge" : "Receipt") });
-  cols.push({ key: "serviceDate", label: "Service Date", get: r => r.serviceDate || UNATTRIBUTED });
-  cols.push({ key: "transactionDate", label: "Transaction Date", get: r => r.transactionDate || UNATTRIBUTED });
-  if (wantReceipt) cols.push({ key: "depositDate", label: "Deposit Date", get: r => r.depositDate || UNATTRIBUTED });
+  cols.push({ key: "serviceDate", label: "Service Date", get: r => fmtDate(r.serviceDate) || UNATTRIBUTED });
+  cols.push({ key: "transactionDate", label: "Transaction Date", get: r => fmtDate(r.transactionDate) || UNATTRIBUTED });
+  if (wantReceipt) cols.push({ key: "depositDate", label: "Deposit Date", get: r => fmtDate(r.depositDate) || UNATTRIBUTED });
   cols.push({ key: "cpt", label: "Procedure Code", get: r => r.cpt || UNATTRIBUTED });
   cols.push({ key: "doctor", label: "Doctor", get: r => r.doctor || UNATTRIBUTED });
   if (wantReceipt) {
@@ -836,6 +917,7 @@ function LoginPage({ onLogin }) {
           </form>
         </Card>
 
+        {SHOW_DEMO_LOGINS && (
         <Card className="p-4 mt-4 bg-amber-50 border-amber-200">
           <p className="text-xs font-medium text-amber-800 mb-2 flex items-center gap-1.5"><AlertTriangle size={13} /> Development-only credentials</p>
           <div className="space-y-1 text-xs text-amber-700">
@@ -846,9 +928,31 @@ function LoginPage({ onLogin }) {
               </div>
             ))}
           </div>
-          <p className="text-[11px] text-amber-600 mt-2">These accounts are created by scripts/seedFirestore.mjs — shown here only because this is a demo build. Sign-in itself goes through Firebase Auth, not this list.</p>
+          <p className="text-[11px] text-amber-600 mt-2">Seeded by scripts/seedFirestore.mjs and shown only in development builds. Sign-in still goes through the API, not this list.</p>
         </Card>
+        )}
       </div>
+    </div>
+  );
+}
+
+// A patient id that no longer resolves. This is reachable whenever the saved navigation position
+// outlives the record it points at - the patient was deleted, or the collections came back empty -
+// and it exists because the alternative was a crash: the chart and billing screens read
+// patient.name immediately, so an undefined patient unmounted the entire application and left a
+// blank page with no way back.
+function MissingPatient({ patientId, onBack }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-24 text-center">
+      <div className="w-14 h-14 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400 mb-4">
+        <Users size={24} />
+      </div>
+      <h2 className="text-lg font-semibold text-slate-800 mb-1">Patient record unavailable</h2>
+      <p className="text-sm text-slate-500 mb-5 max-w-sm">
+        No record could be loaded for <span className="font-medium text-slate-700">{patientId}</span>.
+        It may have been removed, or your session may have expired while this page was open.
+      </p>
+      <button onClick={onBack} className="bg-teal-600 text-white text-sm font-medium px-4 py-2 rounded-lg hover:bg-teal-700">Back to search</button>
     </div>
   );
 }
@@ -945,6 +1049,18 @@ export default function ClinicBilling() {
     })();
   }, []);
 
+  // The API drops the stored token the moment a request comes back 401 (see expireSession in
+  // apiClient). That can happen while the app is open - the token expires, the account is
+  // disabled, or the API restarts with a new signing secret - so the session state here follows
+  // it down. The saved navigation position is deliberately left alone: signing back in should
+  // return the user to the screen they were on.
+  useEffect(() => onTokenChange((next) => {
+    if (!next) {
+      setSession(null);
+      storageAdapter.remove(SESSION_KEY);
+    }
+  }), []);
+
   // Persist navigation position whenever it changes (skip the very first render so we
   // don't immediately overwrite a just-restored position with the pre-restore defaults).
   useEffect(() => {
@@ -1033,6 +1149,9 @@ function ClinicApp({
   const [idDocuments, lIdDocuments] = useFirestoreCollection("idDocuments");
   const [patientMemos, lPatientMemos] = useFirestoreCollection("patientMemos");
   const [cptCatalog, lCptCatalog] = useFirestoreCollection("cptCatalog");
+  const [physicians, lPhysicians] = useFirestoreCollection("physicians");
+  const [insurances, lInsurances] = useFirestoreCollection("insurance");
+  const [rolePermissions, lRolePermissions] = useFirestoreCollection("rolePermissions");
   // Credit balance pools created by "Credit Balance"-type debits — usable against any patient's charges.
   const [patientCreditBalances, lPatientCreditBalances] = useFirestoreCollection("patientCreditBalances");
   const [insuranceCreditBalances, lInsuranceCreditBalances] = useFirestoreCollection("insuranceCreditBalances");
@@ -1052,7 +1171,7 @@ function ClinicApp({
   // real UI so nothing briefly flashes "no data" (or a cptCatalog[0] lookup crashes) before the
   // seeded data actually arrives.
   const dataLoading = lPatients || lAppointments || lCharges || lClaims || lTransactions || lPolicies ||
-    lAuditLogs || lIdDocuments || lPatientMemos || lCptCatalog || lPatientCreditBalances ||
+    lAuditLogs || lIdDocuments || lPatientMemos || lCptCatalog || lPhysicians || lInsurances || lRolePermissions || lPatientCreditBalances ||
     lInsuranceCreditBalances || lVitals || lAllergies || lMedications || lProblems || lClinicalNotes ||
     lUserAccounts || lBatches || lTicklers || lSupportTickets;
 
@@ -1060,6 +1179,11 @@ function ClinicApp({
   const [showAddAppt, setShowAddAppt] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState(null);
   const [showBatchManagement, setShowBatchManagement] = useState(false);
+  const [showUserAdmin, setShowUserAdmin] = useState(false);
+  const [showManageRoles, setShowManageRoles] = useState(false);
+  const [showPracticeCatalog, setShowPracticeCatalog] = useState(false);
+  const [showInsuranceAdmin, setShowInsuranceAdmin] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
   const [showSupportPanel, setShowSupportPanel] = useState(false);
   const [showTicklerPanel, setShowTicklerPanel] = useState(false);
   const [ticklerPrefill, setTicklerPrefill] = useState(null); // set to open the Tickler panel pre-filled from a charge
@@ -1100,16 +1224,32 @@ function ClinicApp({
     { id: "billing", label: "Billing", icon: Receipt },
     { id: "claims", label: "Claims", icon: FileStack },
     { id: "reports", label: "Reports", icon: BarChart3 },
-    { id: "users", label: "Users", icon: UserCog },
   ];
-  const allowedTabs = ROLE_TABS[session.role] || ["dashboard"];
+  // Live grants win; DEFAULT_ROLE_TABS covers the first render and any role without a row.
+  // Super Admin is never read from the table - see DEFAULT_ROLE_TABS.
+  const allowedTabs = useMemo(() => {
+    if (session.role === "SUPER_ADMIN") return DEFAULT_ROLE_TABS.SUPER_ADMIN;
+    const row = rolePermissions.find(r => r.id === session.role);
+    if (row && Array.isArray(row.tabs)) return row.tabs;
+    return DEFAULT_ROLE_TABS[session.role] || ["dashboard"];
+  }, [rolePermissions, session.role]);
+  const isAccountAdmin = session.role === "SUPER_ADMIN";
   const nav = allNav.filter(item => allowedTabs.includes(item.id));
   const tabAllowed = allowedTabs.includes(tab);
+
+  // "users" was a nav tab until User accounts moved into the Settings menu, and the last
+  // position is restored from storage on refresh - so an admin who was on that screen would come
+  // back to a tab that no longer renders anything. The same guard covers a role whose access to
+  // the saved tab was revoked in Manage roles while they were away.
+  useEffect(() => {
+    if (!nav.some(item => item.id === tab)) setTab("dashboard");
+  }, [nav, tab, setTab]);
 
   // The batch this user currently has open, if any — a user can only ever have one (batches are
   // keyed by userId+date, see openBatch), so there's at most one OPEN doc for this uid at a time.
   const myOpenBatch = batches.find(b => b.userId === session.uid && b.status === "OPEN") || null;
   const isBillingOversightRole = session.role === "SUPER_ADMIN" || session.role === "MANAGER";
+  const insurancePerms = useInsurancePermissions(session, rolePermissions);
   // Badge on the floating Tickler button: open items assigned to me that are due today or overdue.
   const ticklerBadgeCount = ticklers.filter(t => t.assignedToUid === session.uid && t.status === "Open" && t.reminderDate <= TODAY).length;
 
@@ -1151,7 +1291,7 @@ function ClinicApp({
     }
     const id = uid("POL");
     setDocument("insurancePolicies", id, { id, patientId, status: "Active", fieldHistory: [], createdBy: session.name, createdAt: nowIso(), updatedAt: nowIso(), ...form });
-    addAudit(patientId, "Insurance added", "insurance", id, null, `${form.insuranceCompany} ${form.planName}, Member ${form.memberId}, ${form.priority}, effective ${form.effectiveDate}`);
+    addAudit(patientId, "Insurance added", "insurance", id, null, `${form.insuranceCompany} ${form.planName}, Member ${form.memberId}, ${form.priority}, effective ${fmtDate(form.effectiveDate)}`);
   }
 
   function editInsurance(policyId, updates, createNew) {
@@ -1194,30 +1334,34 @@ function ClinicApp({
   // usage; this keeps the app fully working on the free Spark plan instead.) Firestore documents
   // cap out at 1 MiB, so IdDocForm rejects files over ~700KB before they ever get here — plenty
   // for a photographed/scanned ID, not for a high-res multi-page PDF.
-  // Previous ID docs of the same type are archived, never deleted — history stays queryable.
+  // A new upload of the same ID type replaces the old one outright — the previous row and its
+  // inline file are removed, not archived, so the tab only ever lists documents that are really
+  // on file. The audit log below still records every upload and removal, so the paper trail of
+  // what happened and when survives even though the file itself does not.
   async function uploadIdDocument(patientId, doc) {
     const id = uid("DOC");
-    const toArchive = idDocuments.filter(d => d.patientId === patientId && d.idType === doc.idType && d.status === "Active");
+    const superseded = idDocuments.filter(d => d.patientId === patientId && d.idType === doc.idType);
     const batch = newBatch();
-    toArchive.forEach(d => batch.update(docRef("idDocuments", d.id), { status: "Archived" }));
+    superseded.forEach(d => batch.delete(docRef("idDocuments", d.id)));
     batch.set(docRef("idDocuments", id), {
       id, patientId, status: "Active", uploadedBy: session.name, uploadedAt: nowIso(),
       idType: doc.idType, idNumber: doc.idNumber, issuingState: doc.issuingState, issueDate: doc.issueDate, expirationDate: doc.expirationDate,
       file: doc.file, fileName: doc.fileName, fileType: doc.fileType, fileSize: doc.fileSize,
     });
     await batch.commit();
-    addAudit(patientId, "ID uploaded", "document", id, null, `${doc.idType} ${doc.idNumber || ""}`.trim());
+    addAudit(patientId, "ID uploaded", "document", id, superseded.length ? `Replaced ${superseded.length} earlier ${doc.idType}` : null, `${doc.idType} ${doc.idNumber || ""}`.trim());
   }
 
-  // Soft-delete: this app never hard-deletes records (everything is append-only, see addAudit
-  // callers throughout), so "Delete" archives the document instead — it drops off the active
-  // list but stays in history rather than vanishing without a trace. The Storage file is left in
-  // place too, for the same reason.
-  function archiveIdDocument(patientId, docId) {
+  // Hard delete, unlike the soft-delete/append-only pattern the rest of this app uses. ID
+  // documents carry a scanned government ID as an inline base64 file, so "delete" has to mean
+  // the image is gone from the database — keeping an archived copy of exactly the record someone
+  // asked to remove is the opposite of what deleting an ID is for. The audit entry (which holds
+  // no image data) is what remains, so the removal itself is still traceable.
+  function deleteIdDocument(patientId, docId) {
     const doc = idDocuments.find(d => d.id === docId && d.patientId === patientId);
-    if (!doc || doc.status !== "Active") return;
-    updateDocument("idDocuments", docId, { status: "Archived" });
-    addAudit(patientId, "ID document deleted", "document", docId, "Active", `${doc.idType} ${doc.idNumber || ""}`.trim());
+    if (!doc) return;
+    deleteDocument("idDocuments", docId);
+    addAudit(patientId, "ID document deleted", "document", docId, `${doc.idType} ${doc.idNumber || ""}`.trim(), "Permanently removed");
   }
 
   // ----- Patient-level memos (billing/admin notes, separate from per-charge follow-ups) -----
@@ -1607,6 +1751,110 @@ function ClinicApp({
     addAudit(null, "User role changed", "user", uid, target?.role || null, role);
   }
 
+  // Setting a password never goes through the collections API - credentials live in columns the
+  // document store deliberately does not expose (see the field registry in server/schema.go), so
+  // both of these call dedicated endpoints. Neither the old nor the new password is ever written
+  // to the audit log; only the fact that a change happened.
+  async function changeMyPassword(currentPassword, newPassword) {
+    await changeOwnPassword(currentPassword, newPassword);
+    addAudit(null, "Password changed", "user", session.uid, null, `${session.name} changed their own password`);
+  }
+
+  async function resetUserPassword(uid, newPassword) {
+    const target = userAccounts.find(u => u.id === uid);
+    await adminResetPassword(uid, newPassword);
+    addAudit(null, "Password reset by admin", "user", uid, null, target ? `${target.name} <${target.email}>` : uid);
+  }
+
+  // Role grants are stored one document per role. SUPER_ADMIN is not writable (the server
+  // rejects it too, in writeAllowed) so the admin role cannot be edited into a corner.
+  function saveRolePermissions(role, tabs, permissions = []) {
+    if (role === "SUPER_ADMIN") return;
+    const before = rolePermissions.find(r => r.id === role);
+    setDocument("rolePermissions", role, {
+      id: role, tabs, permissions, updatedBy: session.name, updatedAt: nowIso(),
+    });
+    // Tabs and action grants are audited as one line because they are saved as one decision;
+    // splitting them would make a single click read as two unrelated changes.
+    const describe = (t, p) => `tabs: ${(t || []).join(", ") || "none"} | actions: ${(p || []).join(", ") || "none"}`;
+    addAudit(null, "Role permissions changed", "user", role,
+      describe(before?.tabs, before?.permissions), describe(tabs, permissions));
+  }
+
+  // ----- Practice catalog: physicians + CPT codes (SUPER_ADMIN only) -----
+  // Both collections are reference data every other screen reads, so a change here is felt
+  // app-wide the moment it lands. The server pins physicians to SUPER_ADMIN in writeAllowed();
+  // this is the matching client-side gate, not the enforcement.
+  //
+  // An id is minted on first save and never reused, so renaming a physician (a married name, a
+  // corrected spelling) updates the row the dropdown reads without stranding the charges that
+  // recorded the old name.
+  function savePhysician(entry) {
+    const id = entry.id || uid("PHY");
+    const before = physicians.find(p => p.id === id);
+    setDocument("physicians", id, { ...entry, id, active: before ? before.active !== false : true });
+    addAudit(null, before ? "Physician updated" : "Physician added", "physician", id,
+      before ? `${before.name} · NPI ${before.npi}` : null,
+      `${entry.name} · NPI ${entry.npi}`);
+  }
+
+  // The doc id is the CPT code itself for codes seeded that way, so an edit that changes the code
+  // would otherwise orphan the old row. Keep the existing id and let `code` be the editable field.
+  function saveCptCode(entry) {
+    const id = entry.id || entry.code;
+    const before = cptCatalog.find(c => c.id === id);
+    setDocument("cptCatalog", id, { ...entry, id, active: before ? before.active !== false : true });
+    addAudit(null, before ? "CPT code updated" : "CPT code added", "cptCode", id,
+      before ? `${before.code} · ${before.desc} · ${money(before.charge)}` : null,
+      `${entry.code} · ${entry.desc} · ${money(entry.charge)}`);
+  }
+
+  // ----- Master insurance list (Settings > Insurance Management) -----
+  // Writes are gated server-side on the insurance.* permissions (see server/permissions.go); the
+  // buttons that call these are hidden for roles without the grant, but that is only the courtesy
+  // half - the API rejects an unauthorized call regardless of what the interface showed.
+  function saveInsurance(entry) {
+    const id = entry.id || uid("INS");
+    const before = insurances.find(i => i.id === id);
+    setDocument("insurance", id, {
+      ...entry, id,
+      createdBy: before?.createdBy || session.name,
+      createdAt: before?.createdAt || nowIso(),
+      updatedBy: session.name,
+      updatedAt: nowIso(),
+    });
+    addAudit(null, before ? "Insurance updated" : "Insurance created", "insurance", id,
+      before ? `${before.name} · Payer ${before.payerId}` : null,
+      `${entry.name} · Payer ${entry.payerId}`);
+  }
+
+  function setInsuranceStatus(entry, status) {
+    updateDocument("insurance", entry.id, { status, updatedBy: session.name, updatedAt: nowIso() });
+    addAudit(null, status === "Active" ? "Insurance reactivated" : "Insurance deactivated",
+      "insurance", entry.id, entry.status || "Active", status);
+  }
+
+  // Only reachable for a row no policy references - the server re-checks that and answers 409 if
+  // it is wrong, so a stale screen cannot delete an insurer that has since been used.
+  async function deleteInsurance(entry) {
+    try {
+      await deleteDocument("insurance", entry.id);
+      addAudit(null, "Insurance deleted", "insurance", entry.id, `${entry.name} · Payer ${entry.payerId}`, null);
+    } catch (e) {
+      alert(e?.message || "That insurance could not be deleted.");
+    }
+  }
+
+  // Deactivation is the app's stand-in for deletion here — see the note in PracticeCatalog.
+  function setCatalogEntryActive(collection, entry, active) {
+    const isPhysician = collection === "physicians";
+    updateDocument(collection, entry.id, { active });
+    addAudit(null, active ? "Catalog entry reactivated" : "Catalog entry deactivated",
+      isPhysician ? "physician" : "cptCode", entry.id,
+      isPhysician ? entry.name : `${entry.code} ${entry.desc}`,
+      active ? "Active" : "Inactive");
+  }
+
   // ----- Batch management: one open/closed daily work-batch per user -----
   // Doc id is the user+date composite key — this IS the "one batch per user per day"
   // uniqueness rule: opening a batch for a date that already has one just reopens that same
@@ -1614,7 +1862,7 @@ function ClinicApp({
   function openBatch(date) {
     const batchDate = date || TODAY;
     if (myOpenBatch && myOpenBatch.batchDate !== batchDate) {
-      alert(`You already have batch #${myOpenBatch.batchNumber} open for ${myOpenBatch.batchDate}. Close it first before opening a different date.`);
+      alert(`You already have batch #${myOpenBatch.batchNumber} open for ${fmtDate(myOpenBatch.batchDate)}. Close it first before opening a different date.`);
       return;
     }
     const id = `${session.uid}_${batchDate}`;
@@ -1682,6 +1930,7 @@ function ClinicApp({
 
   return (
     <CptCatalogContext.Provider value={cptCatalog}>
+    <PhysiciansContext.Provider value={physicians}>
     <div className="flex flex-col h-full min-h-[700px] bg-slate-50 text-slate-800 font-sans text-sm">
       <header className="bg-slate-900 text-slate-300 shrink-0">
         <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800">
@@ -1696,7 +1945,16 @@ function ClinicApp({
           </div>
           <div className="flex items-center gap-4">
             <BatchStatusWidget myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
-            <SettingsMenu onOpenBatchManagement={() => setShowBatchManagement(true)} />
+            <SettingsMenu
+              isAccountAdmin={isAccountAdmin}
+              onOpenBatchManagement={() => setShowBatchManagement(true)}
+              onOpenChangePassword={() => setShowChangePassword(true)}
+              onOpenUserAdmin={() => setShowUserAdmin(true)}
+              onOpenManageRoles={() => setShowManageRoles(true)}
+              onOpenPracticeCatalog={() => setShowPracticeCatalog(true)}
+              onOpenInsuranceAdmin={() => setShowInsuranceAdmin(true)}
+              canManageInsurance={insurancePerms.any}
+            />
             <div className="flex items-center gap-2 border-l border-slate-800 pl-4">
               <div className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-white text-xs font-medium">
                 {session.name.split(" ").map(n => n[0]).join("")}
@@ -1758,7 +2016,14 @@ function ClinicApp({
           <ClinicalSearch patients={patients} allergiesByPatient={allergiesByPatient} onSelect={setClinicalPatientId} />
         )}
 
-        {tabAllowed && tab === "clinical" && clinicalPatientId && (
+        {tabAllowed && tab === "clinical" && clinicalPatientId && !patientById[clinicalPatientId] && (
+          <MissingPatient
+            patientId={clinicalPatientId}
+            onBack={() => setClinicalPatientId(null)}
+          />
+        )}
+
+        {tabAllowed && tab === "clinical" && clinicalPatientId && patientById[clinicalPatientId] && (
           <ClinicalChart
             patient={patientById[clinicalPatientId]}
             vitals={vitals.filter(v => v.patientId === clinicalPatientId)}
@@ -1816,12 +2081,20 @@ function ClinicApp({
           </div>
         )}
 
-        {tabAllowed && tab === "billing" && billingPatientId && (
+        {tabAllowed && tab === "billing" && billingPatientId && !patientById[billingPatientId] && (
+          <MissingPatient
+            patientId={billingPatientId}
+            onBack={() => setBillingPatientId(null)}
+          />
+        )}
+
+        {tabAllowed && tab === "billing" && billingPatientId && patientById[billingPatientId] && (
           <PatientBilling
             patient={patientById[billingPatientId]}
             charges={charges.filter(c => c.patientId === billingPatientId)}
             claims={claims.filter(c => c.patientId === billingPatientId)}
             policies={policies.filter(p => p.patientId === billingPatientId)}
+            insurances={insurances}
             idDocuments={idDocuments.filter(d => d.patientId === billingPatientId)}
             auditLogs={auditLogs.filter(a => a.patientId === billingPatientId)}
             patientMemos={patientMemos.filter(m => m.patientId === billingPatientId)}
@@ -1842,7 +2115,7 @@ function ClinicApp({
             onEndCoverage={endCoverage}
             onUploadCard={uploadInsuranceCard}
             onUploadIdDoc={(doc) => uploadIdDocument(billingPatientId, doc)}
-            onArchiveIdDoc={(docId) => archiveIdDocument(billingPatientId, docId)}
+            onDeleteIdDoc={(docId) => deleteIdDocument(billingPatientId, docId)}
             onAddPatientMemo={(text) => addPatientMemo(billingPatientId, text)}
             onAddAppointment={addAppointment}
             onPostCheck={postCheckPayment}
@@ -1874,12 +2147,6 @@ function ClinicApp({
           />
         )}
 
-        {tabAllowed && tab === "users" && (
-          <UserManagement
-            users={userAccounts} auditLogs={auditLogs} session={session}
-            onAddUser={addUserAccount} onSetDisabled={setUserDisabled} onChangeRole={changeUserRole}
-          />
-        )}
       </main>
 
       {showAddPatient && (
@@ -1905,6 +2172,50 @@ function ClinicApp({
       {showBatchManagement && (
         <Modal title="Batch Management" onClose={() => setShowBatchManagement(false)} wide>
           <BatchManagement batches={batches} session={session} isOversight={isBillingOversightRole} myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
+        </Modal>
+      )}
+
+      {showChangePassword && (
+        <Modal title="Change password" onClose={() => setShowChangePassword(false)}>
+          <ChangePasswordForm onSubmit={changeMyPassword} onDone={() => setShowChangePassword(false)} />
+        </Modal>
+      )}
+
+      {showUserAdmin && isAccountAdmin && (
+        <Modal title="User accounts" onClose={() => setShowUserAdmin(false)} wide>
+          <UserManagement
+            users={userAccounts} auditLogs={auditLogs} session={session}
+            onAddUser={addUserAccount} onSetDisabled={setUserDisabled} onChangeRole={changeUserRole}
+            onResetPassword={resetUserPassword}
+          />
+        </Modal>
+      )}
+
+      {showManageRoles && isAccountAdmin && (
+        <Modal title="Manage roles" onClose={() => setShowManageRoles(false)} wide>
+          <ManageRoles
+            rolePermissions={rolePermissions} users={userAccounts} navItems={allNav}
+            onSave={saveRolePermissions}
+          />
+        </Modal>
+      )}
+
+      {showInsuranceAdmin && insurancePerms.any && (
+        <Modal title="Insurance Management" onClose={() => setShowInsuranceAdmin(false)} size="max-w-5xl">
+          <InsuranceManagement
+            insurances={insurances} policies={policies} perms={insurancePerms}
+            onSave={saveInsurance} onSetStatus={setInsuranceStatus} onDelete={deleteInsurance}
+          />
+        </Modal>
+      )}
+
+      {showPracticeCatalog && isAccountAdmin && (
+        <Modal title="Practice catalog" onClose={() => setShowPracticeCatalog(false)} size="max-w-4xl">
+          <PracticeCatalog
+            physicians={physicians} cptCatalog={cptCatalog}
+            charges={charges} appointments={appointments}
+            onSavePhysician={savePhysician} onSaveCpt={saveCptCode} onSetActive={setCatalogEntryActive}
+          />
         </Modal>
       )}
 
@@ -1938,6 +2249,7 @@ function ClinicApp({
         </Modal>
       )}
     </div>
+    </PhysiciansContext.Provider>
     </CptCatalogContext.Provider>
   );
 }
@@ -1956,15 +2268,15 @@ function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
         className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border ${myOpenBatch ? "border-emerald-700 bg-emerald-900/30 text-emerald-300" : "border-amber-700 bg-amber-900/30 text-amber-300"}`}
       >
         <Landmark size={13} />
-        {myOpenBatch ? `Batch #${myOpenBatch.batchNumber} · ${myOpenBatch.batchDate}` : "No batch open"}
+        {myOpenBatch ? `Batch #${myOpenBatch.batchNumber} · ${fmtDate(myOpenBatch.batchDate)}` : "No batch open"}
       </button>
       {show && (
         <div className="absolute right-0 top-full mt-2 w-72 bg-white border border-slate-200 rounded-xl shadow-xl p-3 z-50 text-slate-700">
           {myOpenBatch ? (
             <>
               <div className="text-xs text-slate-400 mb-1">Current batch</div>
-              <div className="text-sm font-medium mb-1">#{myOpenBatch.batchNumber} — {myOpenBatch.batchDate}</div>
-              <div className="text-xs text-slate-500 mb-3">Opened {myOpenBatch.openedAt?.slice(0, 16).replace("T", " ")}</div>
+              <div className="text-sm font-medium mb-1">#{myOpenBatch.batchNumber} — {fmtDate(myOpenBatch.batchDate)}</div>
+              <div className="text-xs text-slate-500 mb-3">Opened {fmtDateTime(myOpenBatch.openedAt)}</div>
               <button onClick={() => { onCloseBatch(); setShow(false); }} className="w-full bg-rose-600 text-white text-xs font-medium py-1.5 rounded-lg hover:bg-rose-700">Close batch</button>
             </>
           ) : showDatePicker ? (
@@ -1989,16 +2301,34 @@ function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
   );
 }
 
-function SettingsMenu({ onOpenBatchManagement }) {
+// The gear menu is the app's admin surface: everyone gets batch management and their own
+// password; a Super Admin additionally gets the two account screens, which is why User accounts
+// no longer sits in the top nav.
+function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassword, onOpenUserAdmin, onOpenManageRoles, onOpenPracticeCatalog, onOpenInsuranceAdmin, canManageInsurance }) {
   const [open, setOpen] = useState(false);
+  const itemCls = "w-full text-left px-3 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2";
   return (
     <div className="relative">
       <button onClick={() => setOpen(o => !o)} title="Settings" className="hidden md:flex items-center gap-2 text-xs text-slate-500 hover:text-white p-1">
         <Settings size={14} />
       </button>
       {open && (
-        <div onMouseLeave={() => setOpen(false)} className="absolute right-0 top-full mt-2 w-52 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50 text-slate-700">
-          <button onClick={() => { onOpenBatchManagement(); setOpen(false); }} className="w-full text-left px-3 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2"><Landmark size={13} /> Batch Management</button>
+        <div onMouseLeave={() => setOpen(false)} className="absolute right-0 top-full mt-2 w-56 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50 text-slate-700">
+          <button onClick={() => { onOpenBatchManagement(); setOpen(false); }} className={itemCls}><Landmark size={13} /> Batch Management</button>
+          <button onClick={() => { onOpenChangePassword(); setOpen(false); }} className={itemCls}><KeyRound size={13} /> Change password…</button>
+          {(isAccountAdmin || canManageInsurance) && (
+            <div className="border-t border-slate-100 mt-1.5 pt-1.5 px-3 pb-1 text-[10px] font-medium uppercase tracking-wide text-slate-400">Administration</div>
+          )}
+          {canManageInsurance && (
+            <button onClick={() => { onOpenInsuranceAdmin(); setOpen(false); }} className={itemCls}><Shield size={13} /> Insurance Management</button>
+          )}
+          {isAccountAdmin && (
+            <>
+              <button onClick={() => { onOpenUserAdmin(); setOpen(false); }} className={itemCls}><UserCog size={13} /> User accounts</button>
+              <button onClick={() => { onOpenManageRoles(); setOpen(false); }} className={itemCls}><ShieldCheck size={13} /> Manage roles</button>
+              <button onClick={() => { onOpenPracticeCatalog(); setOpen(false); }} className={itemCls}><Stethoscope size={13} /> Practice catalog</button>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -2026,10 +2356,10 @@ function BatchManagement({ batches, session, isOversight, myOpenBatch, onOpenBat
       {myOpenBatch ? (
         <div className="grid grid-cols-2 gap-y-2 text-sm bg-slate-50 border border-slate-200 rounded-lg p-3 mb-4">
           <div><span className="text-slate-400 text-xs block">Batch number</span>#{myOpenBatch.batchNumber}</div>
-          <div><span className="text-slate-400 text-xs block">Date</span>{myOpenBatch.batchDate}</div>
+          <div><span className="text-slate-400 text-xs block">Date</span>{fmtDate(myOpenBatch.batchDate)}</div>
           <div><span className="text-slate-400 text-xs block">Status</span><StatusPill status="Active" /></div>
           <div><span className="text-slate-400 text-xs block">Opened by</span>{myOpenBatch.userName}</div>
-          <div><span className="text-slate-400 text-xs block">Opened</span>{myOpenBatch.openedAt?.slice(0, 16).replace("T", " ")}</div>
+          <div><span className="text-slate-400 text-xs block">Opened</span>{fmtDateTime(myOpenBatch.openedAt)}</div>
           <div className="flex items-end"><button onClick={onCloseBatch} className="text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1 hover:bg-rose-100">Close batch</button></div>
         </div>
       ) : (
@@ -2066,11 +2396,11 @@ function BatchManagement({ batches, session, isOversight, myOpenBatch, onOpenBat
             {filtered.map(b => (
               <tr key={b.id} className="border-b border-slate-100 last:border-0">
                 <td className="px-4 py-2.5 font-medium text-slate-800">#{b.batchNumber}</td>
-                <td className="px-4 py-2.5 text-slate-600">{b.batchDate}</td>
+                <td className="px-4 py-2.5 text-slate-600">{fmtDate(b.batchDate)}</td>
                 <td className="px-4 py-2.5 text-slate-600">{b.userName}</td>
                 <td className="px-4 py-2.5"><StatusPill status={b.status === "OPEN" ? "Active" : "Terminated"} /></td>
-                <td className="px-4 py-2.5 text-slate-500 text-xs">{b.openedAt?.slice(0, 16).replace("T", " ") || "—"}</td>
-                <td className="px-4 py-2.5 text-slate-500 text-xs">{b.closedAt?.slice(0, 16).replace("T", " ") || "—"}</td>
+                <td className="px-4 py-2.5 text-slate-500 text-xs">{fmtDateTime(b.openedAt) || "—"}</td>
+                <td className="px-4 py-2.5 text-slate-500 text-xs">{fmtDateTime(b.closedAt) || "—"}</td>
               </tr>
             ))}
             {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No batches match.</td></tr>}
@@ -2083,7 +2413,7 @@ function BatchManagement({ batches, session, isOversight, myOpenBatch, onOpenBat
 
 // ---------- Floating: Technical Support ----------
 
-const MAX_ATTACHMENT_BYTES = 700 * 1024; // Firestore's 1 MiB document cap, same reasoning as ID documents
+const MAX_ATTACHMENT_BYTES = 2048 * 1024; // Firestore's 1 MiB document cap, same reasoning as ID documents
 const ticketPriorities = ["Low", "Normal", "High", "Urgent"];
 const ticketStatuses = ["Open", "In Progress", "Resolved", "Closed"];
 
@@ -2158,7 +2488,7 @@ function TicketList({ tickets, canManage, onSetStatus }) {
                 <StatusPill status={t.priority === "Urgent" || t.priority === "High" ? "Severe" : t.priority === "Low" ? "Mild" : "Moderate"} />
               </div>
               <p className="text-xs text-slate-500 mb-1">{t.description}</p>
-              <div className="text-xs text-slate-400">{t.createdByName} · {t.createdAt?.slice(0, 16).replace("T", " ")}</div>
+              <div className="text-xs text-slate-400">{t.createdByName} · {fmtDateTime(t.createdAt)}</div>
               {t.attachment && (
                 <button onClick={() => openIdDocumentViewerWindow({ id: t.id, file: t.attachment, fileType: t.attachmentName?.endsWith(".pdf") ? "application/pdf" : "image" })} className="mt-1.5 flex items-center gap-1 text-xs text-teal-700 hover:underline">
                   <Paperclip size={11} /> {t.attachmentName || "Attachment"}
@@ -2259,7 +2589,7 @@ function NewTicklerForm({ users, patients, session, prefill, onSubmit }) {
     <div>
       {prefill && (
         <p className="text-xs text-teal-700 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 mb-3">
-          Linked to {prefill.patientName} — {prefill.dos} · {prefill.cpt}
+          Linked to {prefill.patientName} — {fmtDate(prefill.dos)} · {prefill.cpt}
         </p>
       )}
       <Field label="Title"><input className={inputCls} value={form.title} onChange={set("title")} placeholder="e.g. Follow up with insurance" /></Field>
@@ -2313,9 +2643,9 @@ function TicklerList({ ticklers, onSetStatus, onSnooze }) {
                   <StatusPill status={urgent ? "Severe" : t.priority === "Low" ? "Mild" : "Moderate"} />
                   {overdue && <StatusPill status="Denied" />}
                 </div>
-                {t.patientName && <div className="text-xs text-slate-500">{t.patientName}{t.cpt ? ` · CPT ${t.cpt}` : ""}{t.dos ? ` · DOS ${t.dos}` : ""}</div>}
+                {t.patientName && <div className="text-xs text-slate-500">{t.patientName}{t.cpt ? ` · CPT ${t.cpt}` : ""}{t.dos ? ` · DOS ${fmtDate(t.dos)}` : ""}</div>}
                 {t.description && <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>}
-                <div className="text-xs text-slate-400 mt-1">Due {t.reminderDate}{t.reminderTime ? ` ${t.reminderTime}` : ""} · assigned to {t.assignedToName} · by {t.createdByName}</div>
+                <div className="text-xs text-slate-400 mt-1">Due {fmtDate(t.reminderDate)}{t.reminderTime ? ` ${t.reminderTime}` : ""} · assigned to {t.assignedToName} · by {t.createdByName}</div>
               </div>
               <div className="flex flex-col items-end gap-1 shrink-0">
                 <StatusPill status={t.status === "Completed" ? "Completed" : t.status === "Snoozed" ? "Amended" : t.status === "Cancelled" ? "Discontinued" : "Open"} />
@@ -2356,7 +2686,7 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-semibold text-slate-800">Dashboard</h1>
-          <p className="text-slate-500 text-sm">{new Date(TODAY + "T00:00").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p>
+          <p className="text-slate-500 text-sm">{weekdayOf(TODAY) + ", " + fmtDate(TODAY)}</p>
         </div>
         {deniedClaims > 0 && (
           <button onClick={() => setTab("claims")} className="flex items-center gap-2 text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5">
@@ -2423,7 +2753,7 @@ function Schedule({ appointments, patientById, onAdd, onStatusChange }) {
       </div>
       {dates.map(date => (
         <div key={date} className="mb-6">
-          <h3 className="text-sm font-medium text-slate-500 mb-2">{new Date(date + "T00:00").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}</h3>
+          <h3 className="text-sm font-medium text-slate-500 mb-2">{weekdayOf(date) + ", " + fmtDate(date)}</h3>
           <Card>
             {appointments.filter(a => a.date === date).sort((a, b) => a.time.localeCompare(b.time)).map((a, idx, arr) => (
               <div key={a.id} className={`flex items-center justify-between px-4 py-3 ${idx !== arr.length - 1 ? "border-b border-slate-100" : ""}`}>
@@ -2448,9 +2778,26 @@ function Schedule({ appointments, patientById, onAdd, onStatusChange }) {
 
 // ---------- Patients ----------
 
+// Shown in place of a result table until someone actually searches. These lists open onto the
+// whole patient population, and putting every record on screen by default is both slow to read
+// and a quiet invitation to browse charts nobody asked you to look at - so the list starts empty
+// and the search box is the way in.
+function SearchFirstPrompt({ icon: Icon, total, noun, hint }) {
+  return (
+    <Card className="py-12 text-center">
+      <Icon size={28} className="mx-auto text-slate-300 mb-3" />
+      <p className="text-sm text-slate-500">{hint}</p>
+      <p className="text-xs text-slate-400 mt-1">{total.toLocaleString()} {total === 1 ? noun.one : noun.many} on file.</p>
+    </Card>
+  );
+}
+
 function Patients({ patients, patientBalance, primaryPolicyByPatient, onAdd, onSelect }) {
   const [search, setSearch] = useState("");
-  const filtered = patients.filter(p => p.name.toLowerCase().includes(search.toLowerCase()) || p.id.toLowerCase().includes(search.toLowerCase()));
+  const query = search.trim().toLowerCase();
+  const filtered = query
+    ? patients.filter(p => p.name.toLowerCase().includes(query) || p.id.toLowerCase().includes(query))
+    : [];
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
@@ -2463,6 +2810,14 @@ function Patients({ patients, patientBalance, primaryPolicyByPatient, onAdd, onS
         <Search size={15} className="absolute left-3 top-2.5 text-slate-400" />
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name or ID" className={`${inputCls} pl-9`} />
       </div>
+      {!query ? (
+        <SearchFirstPrompt
+          icon={Search}
+          total={patients.length}
+          noun={{ one: "patient", many: "patients" }}
+          hint="Search by name or patient ID to find someone."
+        />
+      ) : (
       <Card>
         <table className="w-full text-sm">
           <thead>
@@ -2490,9 +2845,11 @@ function Patients({ patients, patientBalance, primaryPolicyByPatient, onAdd, onS
                 </tr>
               );
             })}
+            {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No patients match "{search.trim()}".</td></tr>}
           </tbody>
         </table>
       </Card>
+      )}
     </div>
   );
 }
@@ -2552,7 +2909,7 @@ function BillingSearch({ patients, policies, patientBalance, onSelect }) {
                 <tr key={p.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 cursor-pointer" onClick={() => onSelect(p.id)}>
                   <td className="px-4 py-2.5 font-medium text-slate-800">{p.name}</td>
                   <td className="px-4 py-2.5 text-slate-600">{p.id}</td>
-                  <td className="px-4 py-2.5 text-slate-600">{p.dob}</td>
+                  <td className="px-4 py-2.5 text-slate-600">{fmtDate(p.dob)}</td>
                   <td className="px-4 py-2.5 text-slate-600">{p.phone}</td>
                   <td className="px-4 py-2.5 text-slate-600">{primary ? primary.insuranceCompany : "Self-pay"}</td>
                   <td className={`px-4 py-2.5 text-right font-medium ${bal > 0 ? "text-rose-600" : "text-slate-700"}`}>{money(bal)}</td>
@@ -2607,12 +2964,13 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOp
   const [postingCharge, setPostingCharge] = useState(null);
   const [postedLines, setPostedLines] = useState([]);
 
-  const filtered = openCharges.filter(c => {
-    const q = search.trim().toLowerCase();
-    if (!q) return true;
-    const name = patientById[c.patientId]?.name?.toLowerCase() || "";
-    return name.includes(q) || c.patientId.toLowerCase().includes(q) || c.id.toLowerCase().includes(q);
-  });
+  const query = search.trim().toLowerCase();
+  const filtered = query
+    ? openCharges.filter(c => {
+        const name = patientById[c.patientId]?.name?.toLowerCase() || "";
+        return name.includes(query) || c.patientId.toLowerCase().includes(query) || c.id.toLowerCase().includes(query);
+      })
+    : [];
 
   function handleSubmit(form) {
     onPostManualLine(postingCharge.id, form);
@@ -2620,7 +2978,7 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOp
     const parts = [];
     if (Number(form.amount) > 0) parts.push(`${money(Number(form.amount))} payment`);
     if (Number(form.writeoff) > 0) parts.push(`${money(Number(form.writeoff))} write-off`);
-    setPostedLines(prev => [{ id: uid("LOG"), text: `${patientName} (${postingCharge.patientId}) — ${postingCharge.dos} · ${postingCharge.cpt}: ${parts.join(" + ")}` }, ...prev].slice(0, 8));
+    setPostedLines(prev => [{ id: uid("LOG"), text: `${patientName} (${postingCharge.patientId}) — ${fmtDate(postingCharge.dos)} · ${postingCharge.cpt}: ${parts.join(" + ")}` }, ...prev].slice(0, 8));
     setPostingCharge(null);
   }
 
@@ -2640,6 +2998,14 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOp
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search open charges by patient name, patient ID, or charge ID" className={`${inputCls} pl-9`} />
       </div>
 
+      {!query ? (
+        <SearchFirstPrompt
+          icon={Search}
+          total={openCharges.length}
+          noun={{ one: "open charge", many: "open charges" }}
+          hint="Search by patient name, patient ID, or charge ID to find the charge you're posting against."
+        />
+      ) : (
       <Card>
         <table className="w-full text-sm">
           <thead>
@@ -2659,7 +3025,7 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOp
                 <tr key={c.id} className="border-b border-slate-100 last:border-0">
                   <td className="px-4 py-2.5 text-slate-700">{patientById[c.patientId]?.name}</td>
                   <td className="px-4 py-2.5 text-slate-500 text-xs">{c.patientId}</td>
-                  <td className="px-4 py-2.5 text-slate-500 text-xs">{c.dos} · {c.cpt}</td>
+                  <td className="px-4 py-2.5 text-slate-500 text-xs">{fmtDate(c.dos)} · {c.cpt}</td>
                   <td className="px-4 py-2.5 text-right text-slate-600">{money(c.charge)}</td>
                   <td className="px-4 py-2.5 text-right font-medium text-rose-600">{money(bal)}</td>
                   <td className="px-4 py-2.5 text-right">
@@ -2670,10 +3036,11 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOp
                 </tr>
               );
             })}
-            {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No open balances match this search.</td></tr>}
+            {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No open balances match "{search.trim()}".</td></tr>}
           </tbody>
         </table>
       </Card>
+      )}
 
       {postedLines.length > 0 && (
         <div className="mt-4 space-y-1">
@@ -2682,7 +3049,7 @@ function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOp
       )}
 
       {postingCharge && (
-        <Modal title={`Post payment · ${patientById[postingCharge.patientId]?.name || postingCharge.patientId} · ${postingCharge.dos}`} onClose={() => setPostingCharge(null)}>
+        <Modal title={`Post payment · ${patientById[postingCharge.patientId]?.name || postingCharge.patientId} · ${fmtDate(postingCharge.dos)}`} onClose={() => setPostingCharge(null)}>
           <ManualLinePostingForm
             charge={postingCharge}
             policies={policies.filter(p => p.patientId === postingCharge.patientId && p.status === "Active")}
@@ -2931,10 +3298,405 @@ function ElectronicRemittance({ claims, patientById, chargeById, onPostERA, hasO
 
 // ---------- Billing: individual patient account ----------
 
+// ---------- Patient statement (Billing -> Claim / Ledger -> Generate statement) ----------
+//
+// A four-step wizard over the two /api/statements endpoints. Every figure shown here arrives from
+// the server: this component sends a patient id, a basis, a date range and an optional message,
+// and renders what comes back. It never computes a total, and the PDF is rebuilt server-side from
+// the database rather than from the previewed numbers, so nothing shown on this screen can change
+// what the document says.
+
+const STATEMENT_STEPS = ["Statement type", "Date range", "Review", "Download"];
+
+// Cents from the API, formatted the same way money() formats dollars elsewhere in the app.
+const centsToMoney = (c) => money((Number(c) || 0) / 100);
+
+function StatementStepper({ step }) {
+  return (
+    <ol className="flex items-center gap-1.5 mb-5 text-xs">
+      {STATEMENT_STEPS.map((label, i) => {
+        const state = i === step ? "current" : i < step ? "done" : "todo";
+        return (
+          <li key={label} className="flex items-center gap-1.5">
+            <span
+              className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-semibold ${
+                state === "current" ? "bg-teal-600 text-white"
+                  : state === "done" ? "bg-teal-100 text-teal-700"
+                  : "bg-slate-100 text-slate-400"
+              }`}
+            >
+              {state === "done" ? "✓" : i + 1}
+            </span>
+            <span className={state === "todo" ? "text-slate-400" : "text-slate-700"}>{label}</span>
+            {i < STATEMENT_STEPS.length - 1 && <span className="text-slate-300 mx-1">→</span>}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+// The two bases answer genuinely different questions, and picking the wrong one produces a
+// plausible-looking statement covering the wrong services — so each option says what it means
+// rather than just naming itself.
+const STATEMENT_BASES = [
+  {
+    id: "dos",
+    label: "By Date of Service",
+    sub: "DOS",
+    detail: "Includes the care delivered in the selected window, whenever it was billed.",
+    icon: Stethoscope,
+  },
+  {
+    id: "transaction",
+    label: "By Transaction Date",
+    sub: "Posted to the ledger",
+    detail: "Includes what was keyed in during the window, whenever the care happened.",
+    icon: Receipt,
+  },
+];
+
+function StatementWizard({ patient, onClose }) {
+  const [step, setStep] = useState(0);
+  const [basis, setBasis] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState(TODAY);
+  const [message, setMessage] = useState("");
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [downloaded, setDownloaded] = useState(false);
+
+  const basisMeta = STATEMENT_BASES.find(b => b.id === basis);
+
+  async function loadPreview() {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await api("/api/statements/preview", {
+        method: "POST",
+        body: { patientId: patient.id, basis, from, to, message },
+      });
+      setPreview(data);
+      setStep(2);
+    } catch (e) {
+      setError(e?.message || "Could not build the statement.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function generatePDF() {
+    setBusy(true);
+    setError("");
+    try {
+      const { blob, filename } = await apiBlob("/api/statements/pdf", {
+        body: { patientId: patient.id, basis, from, to, message },
+      });
+      downloadBlob(filename, blob);
+      setDownloaded(true);
+      setStep(3);
+    } catch (e) {
+      setError(e?.message || "Could not generate the PDF.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const rangeValid = from && to && from <= to;
+
+  return (
+    <Modal title={`Patient statement · ${patient.name}`} onClose={onClose} size="max-w-5xl">
+      <StatementStepper step={step} />
+
+      {error && (
+        <div className="mb-4 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 flex items-start gap-2">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* ---------- Step 1: how should this statement be built ---------- */}
+      {step === 0 && (
+        <div>
+          <p className="text-sm text-slate-500 mb-4">
+            Choose which date the statement should be built from. These are not interchangeable — a
+            visit in August billed in September appears in one and not the other.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            {STATEMENT_BASES.map(b => {
+              const Icon = b.icon;
+              const on = basis === b.id;
+              return (
+                <button
+                  key={b.id}
+                  onClick={() => setBasis(b.id)}
+                  className={`text-left border rounded-xl p-4 transition-colors ${
+                    on ? "border-teal-500 bg-teal-50/60 ring-1 ring-teal-500" : "border-slate-200 hover:border-slate-300"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <Icon size={16} className={on ? "text-teal-600" : "text-slate-400"} />
+                    <span className="font-medium text-slate-800 text-sm">{b.label}</span>
+                  </div>
+                  <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1.5">{b.sub}</div>
+                  <p className="text-xs text-slate-500">{b.detail}</p>
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex justify-end gap-2 mt-5">
+            <button onClick={onClose} className="px-3 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Cancel</button>
+            <button
+              disabled={!basis}
+              onClick={() => setStep(1)}
+              className="px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 disabled:bg-slate-200 disabled:text-slate-400"
+            >
+              Continue
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- Step 2: the window ---------- */}
+      {step === 1 && (
+        <div>
+          <div className="mb-4 text-xs inline-flex items-center gap-1.5 bg-slate-100 text-slate-600 rounded-full px-3 py-1">
+            <basisMeta.icon size={12} /> Selecting a <strong>{basisMeta.id === "dos" ? "date of service" : "transaction date"}</strong> range
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label={basisMeta.id === "dos" ? "Service from" : "Posted from"}>
+              <input type="date" className={inputCls} value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} />
+            </Field>
+            <Field label={basisMeta.id === "dos" ? "Service to" : "Posted to"}>
+              <input type="date" className={inputCls} value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} />
+            </Field>
+          </div>
+          {from && to && from > to && (
+            <p className="text-xs text-rose-600 -mt-1 mb-2">The start date is after the end date.</p>
+          )}
+          <div className="flex justify-between gap-2 mt-5">
+            <button onClick={() => setStep(0)} className="px-3 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Back</button>
+            <button
+              disabled={!rangeValid || busy}
+              onClick={loadPreview}
+              className="px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 disabled:bg-slate-200 disabled:text-slate-400"
+            >
+              {busy ? "Building…" : "Review statement"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- Step 3: review what the patient will receive ---------- */}
+      {step === 2 && preview && (
+        <div>
+          <StatementPreview statement={preview} />
+
+          <div className="mt-5">
+            <Field
+              label="Statement message (optional)"
+              hint="Appears on the statement. Leave blank and no message section is printed."
+            >
+              <textarea
+                className={`${inputCls} h-20 resize-none`}
+                value={message}
+                maxLength={2000}
+                placeholder="Please contact our billing department if you have any questions regarding this statement."
+                onChange={(e) => setMessage(e.target.value)}
+              />
+            </Field>
+          </div>
+
+          <div className="flex justify-between gap-2 mt-3">
+            <button onClick={() => setStep(1)} className="px-3 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Back</button>
+            <button
+              disabled={busy}
+              onClick={generatePDF}
+              className="px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 disabled:bg-slate-200 disabled:text-slate-400 flex items-center gap-1.5"
+            >
+              <FileText size={14} />
+              {busy ? "Generating…" : "Generate statement"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- Step 4: the document ---------- */}
+      {step === 3 && (
+        <div className="text-center py-6">
+          <div className="w-12 h-12 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto mb-3">
+            <FileText size={22} />
+          </div>
+          <p className="font-medium text-slate-800">Statement generated</p>
+          <p className="text-sm text-slate-500 mt-1">
+            {downloaded ? "The PDF has been downloaded." : "The PDF is ready."} This generation is recorded in the patient's audit history.
+          </p>
+
+          <div className="flex items-center justify-center gap-2 mt-5">
+            <button
+              onClick={generatePDF}
+              disabled={busy}
+              className="px-4 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50 flex items-center gap-1.5 disabled:text-slate-400"
+            >
+              <Download size={14} /> {busy ? "Generating…" : "Download again"}
+            </button>
+            <button onClick={onClose} className="px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700">Done</button>
+          </div>
+
+          {/* Emailing is not wired up: this application has no mail transport, and inventing one
+              would put an unreviewed delivery path in front of patient financial data. The seam is
+              a single POST alongside the two statement endpoints when that decision gets made. */}
+          <p className="text-xs text-slate-400 mt-5">
+            Sending by email is not available — this deployment has no mail service configured.
+            {preview?.patient?.email
+              ? ` The address on file is ${preview.patient.email}.`
+              : " No email address is on file for this patient."}
+          </p>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// The review table. Deliberately shows the same columns in the same order as the PDF, so what the
+// reviewer approves is what prints.
+function StatementPreview({ statement: st }) {
+  const hasLines = st.lines && st.lines.length > 0;
+
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-4 mb-4 text-sm">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Statement for</div>
+          <div className="font-medium text-slate-800">{st.patient.name}</div>
+          <div className="text-slate-500 text-xs mt-0.5">
+            {st.patient.address || "No address on file"}
+            {(st.patient.city || st.patient.state || st.patient.zip) && (
+              <><br />{[st.patient.city, st.patient.state].filter(Boolean).join(", ")} {st.patient.zip}</>
+            )}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Account</div>
+          <div className="font-medium text-slate-800">{st.patient.id}</div>
+          <div className="text-slate-500 text-xs mt-0.5">
+            {basisLabelFor(st.basis)}: {fmtDate(st.from)} – {fmtDate(st.to)}
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Amount due</div>
+          <div className="text-2xl font-semibold text-slate-900">{centsToMoney(st.totals.amountDue)}</div>
+        </div>
+      </div>
+
+      <div className="border border-slate-200 rounded-lg overflow-x-auto">
+        <table className="w-full text-xs whitespace-nowrap">
+          <thead>
+            <tr className="text-left text-slate-500 bg-slate-50 border-b border-slate-200">
+              <th className="px-2.5 py-2 font-medium">DOS</th>
+              <th className="px-2.5 py-2 font-medium">Txn date</th>
+              <th className="px-2.5 py-2 font-medium">Proc</th>
+              <th className="px-2.5 py-2 font-medium">CPT</th>
+              <th className="px-2.5 py-2 font-medium">Physician</th>
+              <th className="px-2.5 py-2 font-medium">Insurance</th>
+              <th className="px-2.5 py-2 font-medium text-right">Charges</th>
+              <th className="px-2.5 py-2 font-medium text-right">Ins paid</th>
+              <th className="px-2.5 py-2 font-medium text-right">Adjust</th>
+              <th className="px-2.5 py-2 font-medium text-right">Copay</th>
+              <th className="px-2.5 py-2 font-medium text-right">Deduct</th>
+              <th className="px-2.5 py-2 font-medium text-right">Pt paid</th>
+              <th className="px-2.5 py-2 font-medium text-right">Self-pay</th>
+            </tr>
+          </thead>
+          <tbody>
+            {st.lines.map(l => (
+              <tr key={l.chargeId} className="border-b border-slate-100 last:border-0">
+                <td className="px-2.5 py-2 text-slate-600">{fmtDate(l.dos)}</td>
+                <td className="px-2.5 py-2 text-slate-600">{fmtDate(l.transactionDate)}</td>
+                <td className="px-2.5 py-2 text-slate-600">{l.procedureCode || "—"}</td>
+                <td className="px-2.5 py-2 text-slate-600">{l.cpt}</td>
+                <td className="px-2.5 py-2 text-slate-600">{l.physician || "—"}</td>
+                <td className="px-2.5 py-2 text-slate-600">{l.insuranceName || "Unassigned"}</td>
+                <td className="px-2.5 py-2 text-right">{centsToMoney(l.charge)}</td>
+                <td className="px-2.5 py-2 text-right">{centsToMoney(l.insurancePaid)}</td>
+                <td className="px-2.5 py-2 text-right">{centsToMoney(l.adjustment)}</td>
+                <td className="px-2.5 py-2 text-right">{centsToMoney(l.copay)}</td>
+                <td className="px-2.5 py-2 text-right">{centsToMoney(l.deductible)}</td>
+                <td className="px-2.5 py-2 text-right">{centsToMoney(l.patientPaid)}</td>
+                <td className="px-2.5 py-2 text-right font-medium">{centsToMoney(l.selfPay)}</td>
+              </tr>
+            ))}
+            {!hasLines && (
+              <tr><td colSpan={13} className="px-3 py-6 text-center text-slate-400">No activity in this period. The statement will print as a zero-balance notice.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 mt-4">
+        <div>
+          {st.insurers?.length > 0 && (
+            <>
+              <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-1.5">Insurance activity</div>
+              <div className="border border-slate-200 rounded-lg overflow-hidden">
+                <table className="w-full text-xs">
+                  <tbody>
+                    {st.insurers.map(i => (
+                      <tr key={i.name} className="border-b border-slate-100 last:border-0">
+                        <td className="px-2.5 py-1.5 text-slate-700">{i.name}</td>
+                        <td className="px-2.5 py-1.5 text-right text-slate-500">paid {centsToMoney(i.paid)}</td>
+                        <td className="px-2.5 py-1.5 text-right text-slate-500">pt resp {centsToMoney(i.patientBalance)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+          {st.physicians?.length > 0 && (
+            <p className="text-[11px] text-slate-400 mt-2">
+              {st.physicians.map(p => `${p.name}${p.hasSignature ? "" : " (no signature on file)"}`).join(" · ")}
+            </p>
+          )}
+        </div>
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-1.5">Financial summary</div>
+          <div className="border border-slate-200 rounded-lg px-3 py-2 text-sm">
+            {[
+              ["Total charges", st.totals.charges],
+              ["Insurance paid", -st.totals.insurancePaid],
+              ["Adjustments", -st.totals.adjustments],
+              ["Patient payments", -st.totals.patientPayments],
+            ].map(([label, v]) => (
+              <div key={label} className="flex justify-between py-0.5">
+                <span className="text-slate-500">{label}</span>
+                <span className="text-slate-700">{centsToMoney(v)}</span>
+              </div>
+            ))}
+            <div className="flex justify-between border-t border-slate-200 mt-1.5 pt-1.5 font-semibold">
+              <span>Amount due</span>
+              <span>{centsToMoney(st.totals.amountDue)}</span>
+            </div>
+            <div className="text-[11px] text-slate-400 mt-1">
+              Of which copay {centsToMoney(st.totals.copay)} and deductible {centsToMoney(st.totals.deductible)}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function basisLabelFor(basis) {
+  return basis === "transaction" ? "Transaction date" : "Date of service";
+}
+
 function PatientBilling({
-  patient, charges, claims, policies, idDocuments, auditLogs, patientMemos, appointments, allPatients, allCharges, patientById, patientCreditBalances, insuranceCreditBalances, session,
+  patient, charges, claims, policies, insurances, idDocuments, auditLogs, patientMemos, appointments, allPatients, allCharges, patientById, patientCreditBalances, insuranceCreditBalances, session,
   onBack, onUpdatePatient, onAddCharge, onGenerateClaim,
-  onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc, onArchiveIdDoc,
+  onAddInsurance, onEditInsurance, onSetPriority, onEndCoverage, onUploadCard, onUploadIdDoc, onDeleteIdDoc,
   onAddPatientMemo, onAddAppointment, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit,
   onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp, onDebitPosting, onApplyCreditBalance,
   hasOpenBatch, onCreateTickler,
@@ -2965,7 +3727,7 @@ function PatientBilling({
         <div>
           <div className="text-xs text-slate-400 mb-0.5">Patient</div>
           <h1 className="text-xl font-semibold text-slate-800">{patient.name}</h1>
-          <p className="text-xs text-slate-500">MRN {patient.id} · DOB {patient.dob}</p>
+          <p className="text-xs text-slate-500">MRN {patient.id} · DOB {fmtDate(patient.dob)}</p>
           <div className="flex gap-1.5 mt-1.5">
             {activePolicies.map(pol => (
               <span key={pol.id} className="flex items-center gap-1 text-xs bg-slate-50 border border-slate-200 rounded-full px-2 py-0.5">
@@ -3003,6 +3765,7 @@ function PatientBilling({
       {pageTab === "insurance" && (
         <PatientInsuranceTab
           policies={policies}
+          insurances={insurances}
           onAdd={onAddInsurance} onEdit={onEditInsurance} onSetPriority={onSetPriority}
           onEndCoverage={onEndCoverage} onUploadCard={onUploadCard}
         />
@@ -3032,7 +3795,7 @@ function PatientBilling({
         <PatientIdDocuments
           documents={idDocuments}
           onUpload={onUploadIdDoc}
-          onArchive={onArchiveIdDoc}
+          onDelete={onDeleteIdDoc}
           canManage={["SUPER_ADMIN", "MANAGER", "BILLER"].includes(session.role)}
         />
       )}
@@ -3065,7 +3828,7 @@ function DemographyTab({ patient, onUpdatePatient }) {
       {!editing ? (
         <div className="grid grid-cols-4 gap-y-3 text-sm">
           <div><span className="text-slate-400 text-xs block">Name</span>{patient.name}</div>
-          <div><span className="text-slate-400 text-xs block">DOB</span>{patient.dob}</div>
+          <div><span className="text-slate-400 text-xs block">DOB</span>{fmtDate(patient.dob)}</div>
           <div><span className="text-slate-400 text-xs block">Phone</span>{patient.phone}</div>
           <div><span className="text-slate-400 text-xs block">Email</span>{patient.email}</div>
           <div><span className="text-slate-400 text-xs block">SSN</span>{maskSSN(patient.ssn)}</div>
@@ -3110,7 +3873,7 @@ function MemoTab({ memos, onAdd }) {
         {sorted.map(m => (
           <Card key={m.id} className="p-3">
             <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-              <span>{m.user}</span><span>{m.date}</span>
+              <span>{m.user}</span><span>{fmtDate(m.date)}</span>
             </div>
             <p className="text-sm text-slate-700">{m.text}</p>
           </Card>
@@ -3143,7 +3906,7 @@ function AppointmentTab({ appointments, patient, allPatients, onAdd }) {
           <tbody>
             {sorted.map(a => (
               <tr key={a.id} className="border-b border-slate-100 last:border-0">
-                <td className="px-4 py-2.5 text-slate-600">{a.date}</td>
+                <td className="px-4 py-2.5 text-slate-600">{fmtDate(a.date)}</td>
                 <td className="px-4 py-2.5 text-slate-600">{a.time}</td>
                 <td className="px-4 py-2.5 text-slate-600">{a.provider}</td>
                 <td className="px-4 py-2.5 text-slate-600">{a.type}</td>
@@ -3176,6 +3939,7 @@ function ClaimLedgerTab({
   const [selectedId, setSelectedId] = useState(charges[0]?.id || null);
   const [menu, setMenu] = useState(null); // { x, y, chargeId }
   const [showAddCharge, setShowAddCharge] = useState(false);
+  const [showStatement, setShowStatement] = useState(false);
   const [dialog, setDialog] = useState(null); // { type, chargeId }
   const [applyPool, setApplyPool] = useState(null); // 'patient' | 'insurance' | null
 
@@ -3204,10 +3968,20 @@ function ClaimLedgerTab({
 
   return (
     <div onClick={() => menu && setMenu(null)}>
+      {showStatement && (
+        <StatementWizard
+          patient={patientById[patientId] || { id: patientId, name: patientId }}
+          onClose={() => setShowStatement(false)}
+        />
+      )}
+
       {/* ---------- DIV 1: DOS / claim summary ---------- */}
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-medium text-slate-700">DOS / claim summary</h3>
-        <button onClick={() => setShowAddCharge(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Plus size={13} /> Add charge</button>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setShowStatement(true)} className="flex items-center gap-1.5 border border-slate-300 text-slate-700 text-xs px-3 py-1.5 rounded-lg hover:bg-slate-50"><FileText size={13} /> Generate statement</button>
+          <button onClick={() => setShowAddCharge(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700"><Plus size={13} /> Add charge</button>
+        </div>
       </div>
       <Card className="mb-6 overflow-x-auto">
         <table className="w-full text-sm">
@@ -3237,7 +4011,7 @@ function ClaimLedgerTab({
                   onContextMenu={(e) => { e.stopPropagation(); openMenu(e, c.id); }}
                   className={`border-b border-slate-100 last:border-0 cursor-pointer select-none ${isSelected ? "bg-teal-50/70" : "hover:bg-slate-50"}`}
                 >
-                  <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{c.dos}</td>
+                  <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{fmtDate(c.dos)}</td>
                   <td className="px-4 py-2.5 font-medium text-slate-800">{c.cpt}</td>
                   <td className="px-4 py-2.5 text-right">{money(c.charge)}</td>
                   <td className="px-4 py-2.5 text-right text-emerald-700">{money(c.paid)}</td>
@@ -3307,7 +4081,7 @@ function ClaimLedgerTab({
             onCreateTickler({
               patientId: c.patientId, patientName: patientById[c.patientId]?.name || "",
               dos: c.dos, cpt: c.cpt, claimId: linkedClaim?.id || "",
-              title: `${c.cpt} — ${c.dos}`,
+              title: `${c.cpt} — ${fmtDate(c.dos)}`,
             });
           })}
         />
@@ -3406,7 +4180,7 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
-        <h3 className="font-medium text-slate-700">Per-DOS details — {charge.dos} · {charge.cpt}</h3>
+        <h3 className="font-medium text-slate-700">Per-DOS details — {fmtDate(charge.dos)} · {charge.cpt}</h3>
         {!hasClaim && <button onClick={() => onGenerateClaim(charge)} className="text-xs text-sky-700 border border-sky-200 bg-sky-50 rounded-lg px-2.5 py-1.5 hover:bg-sky-100">Generate claim</button>}
         {linkedClaim && <StatusPill status={linkedClaim.status} />}
       </div>
@@ -3419,11 +4193,11 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
               <div><span className="text-slate-400 text-xs block">Type</span>{latestPosting.type}</div>
               <div><span className="text-slate-400 text-xs block">Amount</span>{money(latestPosting.amount)}</div>
               {latestPosting.checkNumber && <div><span className="text-slate-400 text-xs block">Check number</span>{latestPosting.checkNumber}</div>}
-              {latestPosting.depositDate && <div><span className="text-slate-400 text-xs block">Deposit date</span>{latestPosting.depositDate}</div>}
+              {latestPosting.depositDate && <div><span className="text-slate-400 text-xs block">Deposit date</span>{fmtDate(latestPosting.depositDate)}</div>}
               {latestPosting.insuranceName && <div><span className="text-slate-400 text-xs block">Insurance</span>{latestPosting.insuranceName}</div>}
               {latestPosting.reference && <div><span className="text-slate-400 text-xs block">Reference</span>{latestPosting.reference}</div>}
               <div><span className="text-slate-400 text-xs block">Posted by</span>{latestPosting.postedBy}</div>
-              <div><span className="text-slate-400 text-xs block">Posted at</span>{latestPosting.postedAt?.slice(0, 16).replace("T", " ")}</div>
+              <div><span className="text-slate-400 text-xs block">Posted at</span>{fmtDateTime(latestPosting.postedAt)}</div>
             </div>
           ) : <p className="text-xs text-slate-400">No postings recorded for this DOS yet.</p>}
 
@@ -3482,10 +4256,10 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
             {followUps.map((f, i) => (
               <div key={i} className={`text-xs border rounded-lg px-2.5 py-2 ${f.type === "System Debit" ? "border-rose-200 bg-rose-50" : "border-slate-100"}`}>
                 <div className="flex items-center justify-between text-slate-400 mb-0.5">
-                  <span className={f.type === "System Debit" ? "text-rose-600 font-medium" : ""}>{f.type || "Note"} · {f.user}</span><span>{f.date}</span>
+                  <span className={f.type === "System Debit" ? "text-rose-600 font-medium" : ""}>{f.type || "Note"} · {f.user}</span><span>{fmtDate(f.date)}</span>
                 </div>
                 <div className="text-slate-700">{f.text}</div>
-                {f.nextFollowUpDate && <div className="text-slate-400 mt-1">Next follow-up: {f.nextFollowUpDate}</div>}
+                {f.nextFollowUpDate && <div className="text-slate-400 mt-1">Next follow-up: {fmtDate(f.nextFollowUpDate)}</div>}
               </div>
             ))}
             {followUps.length === 0 && <p className="text-xs text-slate-400">No follow-ups recorded.</p>}
@@ -3500,7 +4274,7 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
                   <div className="flex items-center justify-between text-xs">
                     <span className={p.type === "Debit" ? "text-rose-600 font-medium" : ""}>{p.type}{p.type === "Debit" ? ` — ${p.reason}` : ""}</span>
                     <span className={`font-medium ${p.type === "Debit" ? "text-rose-600" : "text-emerald-700"}`}>{p.type === "Debit" ? "-" : ""}{money(p.amount)}</span>
-                    <span className="text-slate-400">{p.date}</span>
+                    <span className="text-slate-400">{fmtDate(p.date)}</span>
                   </div>
                   {canDebit && (
                     <button onClick={() => setDebitTarget(p)} className="mt-1 text-[11px] text-rose-600 border border-rose-200 bg-rose-50 rounded-md px-2 py-0.5 hover:bg-rose-100">
@@ -3516,7 +4290,7 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
       </div>
 
       {debitTarget && (
-        <Modal title={`Debit posting · ${debitTarget.type} on ${charge.dos}`} onClose={() => setDebitTarget(null)}>
+        <Modal title={`Debit posting · ${debitTarget.type} on ${fmtDate(charge.dos)}`} onClose={() => setDebitTarget(null)}>
           <DebitPostingForm
             posting={debitTarget}
             max={remainingDebitable(debitTarget)}
@@ -3556,7 +4330,7 @@ function DebitPostingForm({ posting, max, onSubmit }) {
         <div className="flex items-center gap-2 text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5 mb-4 text-sm">
           <AlertTriangle size={16} className="shrink-0" />
           {mode === "system" ? (
-            <span>You're about to <strong>system debit</strong> this posting — <strong>{posting.type} {money(max)}</strong> posted {posting.date}. It will be removed entirely, along with its recorded payment — no reason is captured, and this cannot be undone.</span>
+            <span>You're about to <strong>system debit</strong> this posting — <strong>{posting.type} {money(max)}</strong> posted {fmtDate(posting.date)}. It will be removed entirely, along with its recorded payment — no reason is captured, and this cannot be undone.</span>
           ) : (
             <span>You're about to debit <strong>{money(Number(f.amount))}</strong> as <strong>{f.debitType}</strong> ({f.reason}). This reduces the recorded payment on this posting and cannot be undone. Continue?</span>
           )}
@@ -3577,7 +4351,7 @@ function DebitPostingForm({ posting, max, onSubmit }) {
       </div>
 
       <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
-        Debiting <strong>{posting.type}</strong> posted {posting.date} for {money(posting.amount)}. Up to <strong>{money(max)}</strong> is available to debit from this posting.
+        Debiting <strong>{posting.type}</strong> posted {fmtDate(posting.date)} for {money(posting.amount)}. Up to <strong>{money(max)}</strong> is available to debit from this posting.
       </div>
 
       {mode === "system" ? (
@@ -3621,7 +4395,7 @@ function ChargeActionDialog({ dialog, charge, policies, onClose, onPostCheck, on
   };
 
   return (
-    <Modal title={`${titles[dialog.type]} · ${charge.dos}`} onClose={onClose} wide={dialog.type === "editclaim"}>
+    <Modal title={`${titles[dialog.type]} · ${fmtDate(charge.dos)}`} onClose={onClose} wide={dialog.type === "editclaim"}>
       <div className="flex items-center justify-between text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-4">
         <span>Charge {money(charge.charge)}</span>
         <span>Adjusted {money(adjustedOf(charge))}</span>
@@ -3673,7 +4447,7 @@ function ApplyCreditBalanceForm({ poolType, credits, allCharges, allPatients, pa
             <span className="flex items-center gap-2">
               <input type="radio" name="credit" checked={creditId === c.id} onChange={() => setCreditId(c.id)} />
               <span>
-                {poolType === "insurance" ? c.insuranceName : `From ${patientById[c.patientId]?.name || c.patientId}`} — {c.reason} · {c.date}
+                {poolType === "insurance" ? c.insuranceName : `From ${patientById[c.patientId]?.name || c.patientId}`} — {c.reason} · {fmtDate(c.date)}
               </span>
             </span>
             <span className="font-medium text-emerald-700">{money(c.remaining)} available</span>
@@ -3692,7 +4466,7 @@ function ApplyCreditBalanceForm({ poolType, credits, allCharges, allPatients, pa
         <Field label="Open charge">
           <select className={inputCls} value={targetChargeId} onChange={(e) => setTargetChargeId(e.target.value)} disabled={!targetPatientId}>
             <option value="">Select a charge…</option>
-            {targetOpenCharges.map(c => <option key={c.id} value={c.id}>{c.dos} · {c.cpt} — balance {money(balanceOf(c))}</option>)}
+            {targetOpenCharges.map(c => <option key={c.id} value={c.id}>{fmtDate(c.dos)} · {c.cpt} — balance {money(balanceOf(c))}</option>)}
           </select>
         </Field>
       </div>
@@ -3926,6 +4700,9 @@ function SelfPayConfirm({ onConfirm, onCancel }) {
 
 function EditClaimForm({ charge, onSubmit }) {
   const cptCatalog = useContext(CptCatalogContext);
+  const providerOptions = useProviderOptions(charge.provider);
+  const npiByProvider = useNpiByProvider();
+  const cptOptions = useCptOptions(charge.cpt);
   const [f, setF] = useState({
     dos: charge.dos, cpt: charge.cpt, provider: charge.provider, referralPhysician: charge.referralPhysician || "",
     facilityName: charge.facilityName || PRACTICE_INFO.name, facilityAddress: charge.facilityAddress || PRACTICE_INFO.address,
@@ -3939,7 +4716,7 @@ function EditClaimForm({ charge, onSubmit }) {
     next[i] = val.toUpperCase();
     setF({ ...f, diagnosisCodes: next });
   }
-  function setProviderAndNPI(p) { setF({ ...f, provider: p, npi: providerNPI[p] || f.npi }); }
+  function setProviderAndNPI(p) { setF({ ...f, provider: p, npi: npiByProvider[p] || f.npi }); }
   function submit() {
     const entry = cptCatalog.find(c => c.code === f.cpt);
     onSubmit({
@@ -3954,7 +4731,7 @@ function EditClaimForm({ charge, onSubmit }) {
       <div className="grid grid-cols-3 gap-3">
         <Field label="Date of service"><input type="date" className={inputCls} value={f.dos} onChange={set("dos")} /></Field>
         <Field label="CPT code">
-          <select className={inputCls} value={f.cpt} onChange={set("cpt")}>{cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
+          <select className={inputCls} value={f.cpt} onChange={set("cpt")}>{cptOptions.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
         </Field>
         <Field label="Units"><input type="number" min="1" className={inputCls} value={f.units} onChange={set("units")} /></Field>
         <Field label="Time (minutes)"><input className={inputCls} value={f.time} onChange={set("time")} /></Field>
@@ -3963,7 +4740,7 @@ function EditClaimForm({ charge, onSubmit }) {
       <SectionTitle>Providers</SectionTitle>
       <div className="grid grid-cols-3 gap-3">
         <Field label="Physician">
-          <select className={inputCls} value={f.provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providers.map(p => <option key={p}>{p}</option>)}</select>
+          <select className={inputCls} value={f.provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providerOptions.map(p => <option key={p}>{p}</option>)}</select>
         </Field>
         <Field label="Physician NPI"><input className={inputCls} value={f.npi} onChange={set("npi")} /></Field>
         <Field label="Referral physician"><input className={inputCls} value={f.referralPhysician} onChange={set("referralPhysician")} placeholder="Optional" /></Field>
@@ -3974,7 +4751,7 @@ function EditClaimForm({ charge, onSubmit }) {
         <Field label="Facility address"><input className={inputCls} value={f.facilityAddress} onChange={set("facilityAddress")} /></Field>
         <Field label="Tax ID"><input className={inputCls} value={f.taxId} onChange={set("taxId")} /></Field>
       </div>
-      <SectionTitle>Diagnosis codes (ICD-10, up to 10)</SectionTitle>
+      <SectionTitle>Diagnosis codes (ICD-10, up to 4)</SectionTitle>
       <div className="grid grid-cols-5 gap-2 mb-3">
         {f.diagnosisCodes.map((code, i) => (
           <input key={i} className={`${inputCls} text-center`} value={code} onChange={(e) => setDx(i, e.target.value)} placeholder={`Dx ${i + 1}`} />
@@ -4017,7 +4794,7 @@ function FollowUpForm({ onSubmit }) {
 
 // ---------- Patient billing: Insurance tab (versioned history) ----------
 
-function PatientInsuranceTab({ policies, onAdd, onEdit, onSetPriority, onEndCoverage, onUploadCard }) {
+function PatientInsuranceTab({ policies, insurances, onAdd, onEdit, onSetPriority, onEndCoverage, onUploadCard }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editPolicy, setEditPolicy] = useState(null);
   const [historyPolicy, setHistoryPolicy] = useState(null);
@@ -4043,7 +4820,7 @@ function PatientInsuranceTab({ policies, onAdd, onEdit, onSetPriority, onEndCove
                   <div className="font-medium text-slate-800 text-sm">{pol.insuranceCompany}</div>
                   <div className="text-xs text-slate-500">{pol.planName}</div>
                   <div className="text-xs text-slate-500 mt-1">Member {pol.memberId} · Grp {pol.groupNumber}</div>
-                  <div className="text-xs text-slate-400 mt-1">Eff. {pol.effectiveDate}</div>
+                  <div className="text-xs text-slate-400 mt-1">Eff. {fmtDate(pol.effectiveDate)}</div>
                 </div>
               ) : <p className="text-xs text-slate-400">No {pr.toLowerCase()} coverage</p>}
             </Card>
@@ -4071,7 +4848,7 @@ function PatientInsuranceTab({ policies, onAdd, onEdit, onSetPriority, onEndCove
               <tr key={pol.id} className="border-b border-slate-100 last:border-0">
                 <td className="px-4 py-2.5 font-medium text-slate-800">{pol.insuranceCompany}<div className="text-xs text-slate-400 font-normal">{pol.planName}</div></td>
                 <td className="px-4 py-2.5 text-slate-600">{pol.memberId}</td>
-                <td className="px-4 py-2.5 text-slate-600">{pol.effectiveDate}</td>
+                <td className="px-4 py-2.5 text-slate-600">{fmtDate(pol.effectiveDate)}</td>
                 <td className="px-4 py-2.5 text-slate-600">{pol.terminationDate || "—"}</td>
                 <td className="px-4 py-2.5"><StatusPill status={pol.status} /></td>
                 <td className="px-4 py-2.5"><PriorityBadge priority={pol.priority} /></td>
@@ -4096,12 +4873,13 @@ function PatientInsuranceTab({ policies, onAdd, onEdit, onSetPriority, onEndCove
 
       {showAdd && (
         <Modal title="Add insurance" onClose={() => setShowAdd(false)} wide>
-          <InsuranceForm onSubmit={(f) => { onAdd(f); setShowAdd(false); }} onUploadCard={null} />
+          <InsuranceForm insurances={insurances} onSubmit={(f) => { onAdd(f); setShowAdd(false); }} onUploadCard={null} />
         </Modal>
       )}
       {editPolicy && (
         <Modal title={`Edit insurance · ${editPolicy.insuranceCompany}`} onClose={() => setEditPolicy(null)} wide>
           <InsuranceForm
+            insurances={insurances}
             initial={editPolicy}
             onSubmit={(f, createNew) => { onEdit(editPolicy.id, f, createNew); setEditPolicy(null); }}
             onUploadCard={(side, dataUrl) => onUploadCard(editPolicy.id, side, dataUrl)}
@@ -4117,7 +4895,7 @@ function PatientInsuranceTab({ policies, onAdd, onEdit, onSetPriority, onEndCove
               <div key={i} className="text-xs border border-slate-100 rounded-lg px-3 py-2">
                 <div className="font-medium text-slate-700">{h.field}</div>
                 <div className="text-slate-500">{String(h.oldValue)} → {String(h.newValue)}</div>
-                <div className="text-slate-400 mt-1">{h.changedBy} · {h.changedAt.slice(0, 16).replace("T", " ")}</div>
+                <div className="text-slate-400 mt-1">{h.changedBy} · {fmtDateTime(h.changedAt)}</div>
               </div>
             ))}
           </div>
@@ -4127,9 +4905,9 @@ function PatientInsuranceTab({ policies, onAdd, onEdit, onSetPriority, onEndCove
   );
 }
 
-function InsuranceForm({ initial, onSubmit, onUploadCard, isEdit }) {
+function InsuranceForm({ initial, onSubmit, onUploadCard, isEdit, insurances = [] }) {
   const [form, setForm] = useState(initial || {
-    insuranceCompany: "", planName: "", insuranceType: insuranceTypes[0], memberId: "", subscriberId: "",
+    insuranceId: "", insuranceAddress: "", insuranceCompany: "", planName: "", insuranceType: insuranceTypes[0], memberId: "", subscriberId: "",
     groupNumber: "", payerId: "", effectiveDate: TODAY, terminationDate: "", priority: "Primary",
     subscriberName: "", subscriberDob: "", subscriberRelationship: "Self",
     copay: "", deductible: "", coinsurance: "", authRequired: false, referralRequired: false, notes: "",
@@ -4138,6 +4916,23 @@ function InsuranceForm({ initial, onSubmit, onUploadCard, isEdit }) {
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const setBool = (k) => (e) => setForm({ ...form, [k]: e.target.checked });
   const [error, setError] = useState("");
+
+  // Picking a master row copies its payer details onto the policy. They are copied rather than
+  // joined on purpose: a claim is submitted to the payer ID and address that were correct on the
+  // day, so a later correction to the master must not rewrite what an old policy recorded.
+  function selectInsurance(ins) {
+    if (!ins) {
+      setForm({ ...form, insuranceId: "", insuranceCompany: "", payerId: "", insuranceAddress: "" });
+      return;
+    }
+    setForm({
+      ...form,
+      insuranceId: ins.id,
+      insuranceCompany: ins.name,
+      payerId: ins.payerId || "",
+      insuranceAddress: ins.address || "",
+    });
+  }
 
   function validate() {
     if (!form.insuranceCompany.trim() || !form.memberId.trim() || !form.effectiveDate) return "Insurance company, member ID, and effective date are required.";
@@ -4151,12 +4946,27 @@ function InsuranceForm({ initial, onSubmit, onUploadCard, isEdit }) {
     <div>
       <SectionTitle>Payer information</SectionTitle>
       <div className="grid grid-cols-3 gap-3">
-        <Field label="Insurance company"><input className={inputCls} value={form.insuranceCompany} onChange={set("insuranceCompany")} /></Field>
+        <div className="col-span-3">
+          <InsuranceSelect
+            insurances={insurances}
+            value={form.insuranceId}
+            onChange={selectInsurance}
+          />
+        </div>
+
+        {/* Master details, filled in from the selected row. Read-only here: correcting a payer ID
+            belongs in Settings > Insurance Management, where it is permissioned and audited, not
+            on one patient's policy where it would silently disagree with every other patient's. */}
+        <Field label="Payer ID" hint="From the master insurance record.">
+          <input className={`${inputCls} bg-slate-50 text-slate-600`} value={form.payerId || ""} readOnly />
+        </Field>
+        <Field label="Insurance address" hint="From the master insurance record.">
+          <input className={`${inputCls} bg-slate-50 text-slate-600`} value={form.insuranceAddress || ""} readOnly />
+        </Field>
         <Field label="Plan name"><input className={inputCls} value={form.planName} onChange={set("planName")} /></Field>
         <Field label="Insurance type">
           <select className={inputCls} value={form.insuranceType} onChange={set("insuranceType")}>{insuranceTypes.map(t => <option key={t}>{t}</option>)}</select>
         </Field>
-        <Field label="Payer ID"><input className={inputCls} value={form.payerId} onChange={set("payerId")} /></Field>
         <Field label="Member ID"><input className={inputCls} value={form.memberId} onChange={set("memberId")} /></Field>
         <Field label="Group number"><input className={inputCls} value={form.groupNumber} onChange={set("groupNumber")} /></Field>
         <Field label="Priority">
@@ -4212,7 +5022,15 @@ function InsuranceForm({ initial, onSubmit, onUploadCard, isEdit }) {
 
 // ---------- Patient billing: ID Documents tab ----------
 
-function PatientIdDocuments({ documents, onUpload, onArchive, canManage }) {
+// Deleting an ID document is permanent — the scanned file is removed from the database rather
+// than archived — so it goes through a confirmation first.
+function confirmDelete(d) {
+  return window.confirm(`Delete this ${d.idType}${d.idNumber ? ` (#${d.idNumber})` : ""} permanently?
+
+The scanned file is removed from the system and cannot be recovered.`);
+}
+
+function PatientIdDocuments({ documents, onUpload, onDelete, canManage }) {
   const [showAdd, setShowAdd] = useState(false);
   const isPdf = (d) => d.fileType === "application/pdf" || (d.file || "").startsWith("data:application/pdf");
   return (
@@ -4235,7 +5053,7 @@ function PatientIdDocuments({ documents, onUpload, onArchive, canManage }) {
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-slate-800 truncate">{d.fileName || d.idType}</div>
                 <div className="text-xs text-slate-500">{d.idType} · #{d.idNumber} · exp {d.expirationDate || "—"}</div>
-                <div className="text-xs text-slate-400">Uploaded {d.uploadedAt?.slice(0, 10)} by {d.uploadedBy}</div>
+                <div className="text-xs text-slate-400">Uploaded {fmtDate(d.uploadedAt)} by {d.uploadedBy}</div>
                 <div className="text-xs text-slate-400">{d.fileType || "Unknown type"} · {formatFileSize(d.fileSize)}</div>
               </div>
               <StatusPill status={d.status} />
@@ -4244,8 +5062,8 @@ function PatientIdDocuments({ documents, onUpload, onArchive, canManage }) {
               <button onClick={() => openIdDocumentViewerWindow(d)} disabled={!d.file} className="flex items-center gap-1 text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2.5 py-1 hover:bg-teal-100 disabled:opacity-40">
                 <Eye size={12} /> View
               </button>
-              {canManage && d.status === "Active" && (
-                <button onClick={() => onArchive(d.id)} className="flex items-center gap-1 text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1 hover:bg-rose-100">
+              {canManage && (
+                <button onClick={() => confirmDelete(d) && onDelete(d.id)} className="flex items-center gap-1 text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1 hover:bg-rose-100">
                   <Trash2 size={12} /> Delete
                 </button>
               )}
@@ -4265,7 +5083,7 @@ function PatientIdDocuments({ documents, onUpload, onArchive, canManage }) {
 
 // Firestore documents cap out at 1 MiB; base64 adds ~33% overhead on top of the raw file, so
 // keep a comfortable margin under that for the file plus its other fields.
-const MAX_ID_DOC_BYTES = 700 * 1024;
+const MAX_ID_DOC_BYTES = 2028 * 1024;
 
 function IdDocForm({ onSubmit }) {
   const [form, setForm] = useState({ idType: idTypes[0], idNumber: "", issuingState: "NY", issueDate: "", expirationDate: "", file: null, fileName: "", fileType: "", fileSize: null });
@@ -4321,7 +5139,7 @@ function AuditHistory({ auditLogs }) {
         <tbody>
           {auditLogs.map(a => (
             <tr key={a.id} className="border-b border-slate-100 last:border-0">
-              <td className="px-4 py-2.5 text-slate-500 text-xs whitespace-nowrap">{a.timestamp.slice(0, 16).replace("T", " ")}</td>
+              <td className="px-4 py-2.5 text-slate-500 text-xs whitespace-nowrap">{fmtDateTime(a.timestamp)}</td>
               <td className="px-4 py-2.5 text-slate-600">{a.user}</td>
               <td className="px-4 py-2.5 font-medium text-slate-800">{a.action}</td>
               <td className="px-4 py-2.5 text-slate-500 text-xs max-w-[220px]">{a.oldValues || "—"}</td>
@@ -4336,7 +5154,7 @@ function AuditHistory({ auditLogs }) {
 }
 
 function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAddMemo, onClose }) {
-  const cptCatalog = useContext(CptCatalogContext);
+  const cptOptions = useCptOptions(charge.cpt);
   const bal = balanceOf(charge);
   const [paymentAmt, setPaymentAmt] = useState("");
   const [writeoffAmt, setWriteoffAmt] = useState("");
@@ -4393,7 +5211,7 @@ function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAdd
         <span className="text-sm font-medium text-slate-700 mb-2 block">Credit / recode CPT</span>
         <div className="flex gap-2">
           <select className={inputCls} value={newCode} onChange={(e) => setNewCode(e.target.value)}>
-            {cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc} ({money(c.charge)})</option>)}
+            {cptOptions.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc} ({money(c.charge)})</option>)}
           </select>
           <button onClick={handleRecode} className="bg-sky-600 text-white text-xs font-medium px-3 rounded-lg hover:bg-sky-700 whitespace-nowrap">Recode</button>
         </div>
@@ -4408,7 +5226,7 @@ function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAdd
           <div className="mt-3 space-y-1.5">
             {charge.memos.slice().reverse().map((m, i) => (
               <div key={i} className="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded-lg px-2 py-1.5">
-                <span className="text-slate-400">{m.date}</span> — {m.text}
+                <span className="text-slate-400">{fmtDate(m.date)}</span> — {m.text}
               </div>
             ))}
           </div>
@@ -4423,14 +5241,17 @@ function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAdd
 
 function AddChargeForm({ onSubmit }) {
   const cptCatalog = useContext(CptCatalogContext);
+  const providerOptions = useProviderOptions();
+  const npiByProvider = useNpiByProvider();
+  const cptOptions = useCptOptions();
   const [dos, setDos] = useState("2026-08-24");
-  const [cpt, setCpt] = useState(cptCatalog[0]?.code || "");
-  const [provider, setProvider] = useState(providers[0]);
+  const [cpt, setCpt] = useState(cptOptions[0]?.code || "");
+  const [provider, setProvider] = useState(providerOptions[0] || "");
   const [referralPhysician, setReferralPhysician] = useState("");
   const [facilityName, setFacilityName] = useState(PRACTICE_INFO.name);
   const [facilityAddress, setFacilityAddress] = useState(PRACTICE_INFO.address);
   const [taxId, setTaxId] = useState(PRACTICE_INFO.taxId);
-  const [npi, setNpi] = useState(providerNPI[providers[0]] || "");
+  const [npi, setNpi] = useState(npiByProvider[providerOptions[0]] || "");
   const [ndc, setNdc] = useState("");
   const [units, setUnits] = useState("1");
   const [time, setTime] = useState("");
@@ -4439,7 +5260,7 @@ function AddChargeForm({ onSubmit }) {
 
   function setProviderAndNPI(p) {
     setProvider(p);
-    setNpi(providerNPI[p] || "");
+    setNpi(npiByProvider[p] || "");
   }
   function setDx(i, val) {
     const next = [...dxCodes];
@@ -4466,7 +5287,7 @@ function AddChargeForm({ onSubmit }) {
         <Field label="Date of service"><input type="date" className={inputCls} value={dos} onChange={(e) => setDos(e.target.value)} /></Field>
         <Field label="CPT code">
           <select className={inputCls} value={cpt} onChange={(e) => setCpt(e.target.value)}>
-            {cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc} ({money(c.charge)})</option>)}
+            {cptOptions.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc} ({money(c.charge)})</option>)}
           </select>
         </Field>
         <Field label="Units"><input type="number" min="1" className={inputCls} value={units} onChange={(e) => setUnits(e.target.value)} /></Field>
@@ -4477,7 +5298,7 @@ function AddChargeForm({ onSubmit }) {
       <SectionTitle>Providers</SectionTitle>
       <div className="grid grid-cols-3 gap-3">
         <Field label="Physician">
-          <select className={inputCls} value={provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providers.map(p => <option key={p}>{p}</option>)}</select>
+          <select className={inputCls} value={provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providerOptions.map(p => <option key={p}>{p}</option>)}</select>
         </Field>
         <Field label="Physician NPI"><input className={inputCls} value={npi} onChange={(e) => setNpi(e.target.value)} /></Field>
         <Field label="Referral physician"><input className={inputCls} value={referralPhysician} onChange={(e) => setReferralPhysician(e.target.value)} placeholder="Optional" /></Field>
@@ -4602,12 +5423,842 @@ function Reports({ revenueByMonth, claimStatusData, charges, patientById, transa
   );
 }
 
+// ---------- Settings: Change password (every role) ----------
+
+function ChangePasswordForm({ onSubmit, onDone }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [done, setDone] = useState(false);
+
+  async function submit() {
+    if (!current) { setError("Enter your current password."); return; }
+    if (next.length < 6) { setError("Your new password must be at least 6 characters."); return; }
+    if (next !== confirm) { setError("The two new passwords don't match."); return; }
+    if (next === current) { setError("Your new password must be different from your current one."); return; }
+    setError("");
+    setSaving(true);
+    try {
+      await onSubmit(current, next);
+      setDone(true);
+    } catch (err) {
+      // The server answers 403 when the current password is wrong — the one failure worth
+      // spelling out, since there is nothing the user can do about the others.
+      setError(err?.status === 403 ? "Your current password is not correct." : "Couldn't change your password. Please try again.");
+    }
+    setSaving(false);
+  }
+
+  if (done) {
+    return (
+      <div>
+        <p className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 mb-3">
+          Your password has been changed. Your current session stays signed in — the new password applies the next time you log in.
+        </p>
+        <button onClick={onDone} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Done</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <Field label="Current password"><input type="password" autoComplete="current-password" className={inputCls} value={current} onChange={(e) => setCurrent(e.target.value)} /></Field>
+      <Field label="New password" hint="At least 6 characters."><input type="password" autoComplete="new-password" className={inputCls} value={next} onChange={(e) => setNext(e.target.value)} /></Field>
+      <Field label="Confirm new password"><input type="password" autoComplete="new-password" className={inputCls} value={confirm} onChange={(e) => setConfirm(e.target.value)} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} disabled={saving} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">{saving ? "Changing…" : "Change password"}</button>
+    </div>
+  );
+}
+
+// ---------- Settings: Practice catalog — physicians + CPT codes (SUPER_ADMIN only) ----------
+
+// Both lists behave the same way from an admin's point of view — a table, an inline row editor,
+// and an active/inactive toggle — so they share one screen and one editor component instead of
+// two near-identical ones.
+//
+// Nothing here hard-deletes. A physician or CPT code is referenced by every charge, claim and
+// appointment ever written against it; removing the row would leave those records pointing at
+// something that no longer exists. Deactivating instead keeps the history readable and only
+// takes the entry out of the dropdowns new work is created from.
+
+// A row is being added when `draft.id` is absent, edited when it is present. `fields` drives both
+// the form and the table columns, so the two cannot disagree about what an entry holds.
+function CatalogEditor({ fields, draft, onChange, onSave, onCancel, error, signature }) {
+  return (
+    <div className="border border-teal-200 bg-teal-50/40 rounded-lg p-3 mb-3">
+      <div className="grid grid-cols-2 gap-x-3">
+        {fields.map(f => (
+          <Field key={f.key} label={f.label} hint={f.hint}>
+            <input
+              className={inputCls}
+              value={draft[f.key] ?? ""}
+              onChange={(e) => onChange(f.key, e.target.value)}
+              placeholder={f.placeholder || ""}
+              inputMode={f.numeric ? "decimal" : undefined}
+            />
+          </Field>
+        ))}
+      </div>
+      {signature && (
+        <FileDrop
+          label="Electronic signature (optional)"
+          value={draft.signature || ""}
+          onChange={(dataUrl) => onChange("signature", dataUrl)}
+        />
+      )}
+      {error && <p className="text-xs text-rose-600 mb-2">{error}</p>}
+      <div className="flex gap-2">
+        <button onClick={onSave} className="px-3 py-1.5 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700">
+          {draft.id ? "Save changes" : "Add"}
+        </button>
+        <button onClick={onCancel} className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+const PHYSICIAN_FIELDS = [
+  { key: "name", label: "Physician name", placeholder: "Dr. J. Smith" },
+  { key: "npi", label: "NPI", placeholder: "10 digits", hint: "Box 24J on the CMS-1500." },
+  { key: "specialty", label: "Specialty", placeholder: "Optional" },
+];
+
+const CPT_FIELDS = [
+  { key: "code", label: "CPT code", placeholder: "99213" },
+  { key: "charge", label: "Charge", placeholder: "110.00", numeric: true },
+  { key: "desc", label: "Description", placeholder: "Office visit, established patient" },
+  { key: "category", label: "Category", placeholder: "Office Visit" },
+];
+
+function PracticeCatalog({ physicians, cptCatalog, charges, appointments, onSavePhysician, onSaveCpt, onSetActive }) {
+  const [section, setSection] = useState("physicians");
+  const [draft, setDraft] = useState(null);
+  const [error, setError] = useState("");
+
+  const isPhysicians = section === "physicians";
+  const fields = isPhysicians ? PHYSICIAN_FIELDS : CPT_FIELDS;
+
+  const rows = useMemo(() => {
+    const list = isPhysicians ? physicians : cptCatalog;
+    const key = isPhysicians ? "name" : "code";
+    return [...list].sort((a, b) => (a[key] || "").localeCompare(b[key] || ""));
+  }, [isPhysicians, physicians, cptCatalog]);
+
+  // How many records already name each entry, shown beside the deactivate button so an admin can
+  // see what a change reaches before making it.
+  const usage = useMemo(() => {
+    const counts = {};
+    const bump = (v) => { if (v) counts[v] = (counts[v] || 0) + 1; };
+    (charges || []).forEach(c => bump(isPhysicians ? c.provider : c.cpt));
+    (appointments || []).forEach(a => bump(isPhysicians ? a.provider : a.cpt));
+    return counts;
+  }, [isPhysicians, charges, appointments]);
+
+  function switchSection(next) {
+    setSection(next);
+    setDraft(null);
+    setError("");
+  }
+
+  function validate() {
+    if (isPhysicians) {
+      if (!draft.name?.trim()) return "Physician name is required.";
+      // An NPI is 10 digits. A payer rejects the entire claim on a malformed one, and that
+      // rejection only surfaces weeks later on a remittance — worth catching at entry.
+      if (!/^\d{10}$/.test((draft.npi || "").trim())) return "NPI must be exactly 10 digits.";
+      const clash = physicians.find(p => p.id !== draft.id && (p.name || "").trim().toLowerCase() === draft.name.trim().toLowerCase());
+      if (clash) return "Another physician already uses that name.";
+    } else {
+      if (!/^\w{5}$/.test((draft.code || "").trim())) return "A CPT code is 5 characters.";
+      if (!draft.desc?.trim()) return "Description is required.";
+      if (!(Number(draft.charge) > 0)) return "Charge must be greater than zero.";
+      const clash = cptCatalog.find(c => c.id !== draft.id && (c.code || "").trim() === draft.code.trim());
+      if (clash) return "That CPT code is already in the catalog.";
+    }
+    return "";
+  }
+
+  function save() {
+    const problem = validate();
+    if (problem) { setError(problem); return; }
+    if (isPhysicians) {
+      onSavePhysician({
+        id: draft.id, name: draft.name.trim(), npi: draft.npi.trim(),
+        specialty: (draft.specialty || "").trim(),
+        signature: draft.signature || "",
+      });
+    } else {
+      onSaveCpt({
+        id: draft.id, code: draft.code.trim(), desc: draft.desc.trim(),
+        charge: Number(draft.charge), category: (draft.category || "").trim(),
+      });
+    }
+    setDraft(null);
+    setError("");
+  }
+
+  const tabCls = (on) => `px-3 py-1.5 text-sm rounded-lg ${on ? "bg-slate-800 text-white" : "text-slate-600 hover:bg-slate-100"}`;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex gap-1">
+          <button onClick={() => switchSection("physicians")} className={tabCls(isPhysicians)}>Physicians</button>
+          <button onClick={() => switchSection("cpt")} className={tabCls(!isPhysicians)}>CPT codes</button>
+        </div>
+        {!draft && (
+          <button
+            onClick={() => { setDraft(isPhysicians ? { name: "", npi: "", specialty: "", signature: "" } : { code: "", desc: "", charge: "", category: "" }); setError(""); }}
+            className="px-3 py-1.5 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700"
+          >
+            {isPhysicians ? "Add physician" : "Add CPT code"}
+          </button>
+        )}
+      </div>
+
+      <p className="text-slate-500 text-sm mb-3">
+        {isPhysicians
+          ? "The provider dropdown on charges, claims, appointments and clinical notes is built from this list, and the NPI here is what lands in Box 24J of the CMS-1500."
+          : "The CPT dropdown on charges and appointments is built from this list. Editing an amount here only affects charges posted from now on it never reprices one already sitting on an account."}
+      </p>
+
+      {draft && (
+        <CatalogEditor
+          fields={fields} draft={draft} error={error} signature={isPhysicians}
+          onChange={(k, v) => setDraft({ ...draft, [k]: v })}
+          onSave={save}
+          onCancel={() => { setDraft(null); setError(""); }}
+        />
+      )}
+
+      <div className="border border-slate-200 rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 bg-slate-50 border-b border-slate-200">
+              {fields.map(f => <th key={f.key} className="px-3 py-2 font-medium">{f.label}</th>)}
+              {isPhysicians && <th className="px-3 py-2 font-medium">Signature</th>}
+              <th className="px-3 py-2 font-medium">In use</th>
+              <th className="px-3 py-2 font-medium">Status</th>
+              <th className="px-3 py-2 font-medium text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => {
+              const active = r.active !== false;
+              const used = usage[isPhysicians ? r.name : r.code] || 0;
+              return (
+                <tr key={r.id} className={`border-b border-slate-100 last:border-0 ${active ? "" : "bg-slate-50 text-slate-400"}`}>
+                  {fields.map(f => (
+                    <td key={f.key} className="px-3 py-2">{f.numeric ? money(r[f.key]) : (r[f.key] || "—")}</td>
+                  ))}
+                  {isPhysicians && (
+                    <td className="px-3 py-2 text-xs">
+                      {r.signature
+                        ? <span className="text-emerald-700">On file</span>
+                        : <span className="text-slate-400">—</span>}
+                    </td>
+                  )}
+                  <td className="px-3 py-2 text-slate-500 text-xs">{used ? `${used} record${used === 1 ? "" : "s"}` : "—"}</td>
+                  <td className="px-3 py-2"><StatusPill status={active ? "Active" : "Terminated"} /></td>
+                  <td className="px-3 py-2 text-right whitespace-nowrap">
+                    <button onClick={() => { setDraft({ ...r }); setError(""); }} className="text-teal-700 hover:underline text-xs mr-3">Edit</button>
+                    <button
+                      onClick={() => onSetActive(isPhysicians ? "physicians" : "cptCatalog", r, !active)}
+                      className="text-slate-500 hover:underline text-xs"
+                    >
+                      {active ? "Deactivate" : "Reactivate"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {rows.length === 0 && (
+              <tr><td colSpan={fields.length + (isPhysicians ? 4 : 3)} className="px-3 py-6 text-center text-slate-400">Nothing in this list yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="text-xs text-slate-400 mt-3">
+        Entries are deactivated, never deleted — charges and appointments already naming one keep
+        reading correctly, and a deactivated entry simply stops appearing in the dropdowns. Every
+        change here is written to the audit log.
+      </p>
+    </div>
+  );
+}
+
+// ---------- Master insurance list ----------
+//
+// One authoritative row per payer, managed from Settings > Insurance Management and selected on
+// the patient insurance form. Before this, the insurer was free text on every policy: two billers
+// spelling "UnitedHealthcare" differently produced two payers as far as every report was
+// concerned, and a mistyped payer ID is a rejected claim nobody sees until the remittance.
+//
+// The permission identifiers below must match the constants in server/permissions.go - the server
+// is the authority, and these strings are only how the UI asks the same question locally so it can
+// hide what the caller cannot do anyway.
+const PERM_INSURANCE = {
+  view: "insurance.view",
+  create: "insurance.create",
+  update: "insurance.update",
+  delete: "insurance.delete",
+};
+
+// Resolves the signed-in user's action grants from the same rolePermissions rows the server reads.
+//
+// This governs what the interface OFFERS, never what it permits: every one of these actions is
+// re-checked server-side in writeAllowed/deleteAllowed. Hiding a button the API would reject is a
+// courtesy to the user, not a security boundary.
+function useInsurancePermissions(session, rolePermissions) {
+  return useMemo(() => {
+    if (session?.role === "SUPER_ADMIN") {
+      return { view: true, create: true, update: true, delete: true, any: true };
+    }
+    const row = rolePermissions.find(r => r.id === session?.role);
+    const held = new Set(Array.isArray(row?.permissions) ? row.permissions : []);
+    const out = {
+      view: held.has(PERM_INSURANCE.view),
+      create: held.has(PERM_INSURANCE.create),
+      update: held.has(PERM_INSURANCE.update),
+      delete: held.has(PERM_INSURANCE.delete),
+    };
+    // Being able to add or edit implies being able to see the list - otherwise the grant is
+    // unusable and an administrator has to know to tick two boxes to mean one thing.
+    out.view = out.view || out.create || out.update || out.delete;
+    out.any = out.view;
+    return out;
+  }, [session?.role, rolePermissions]);
+}
+
+const INSURANCE_STATUSES = ["Active", "Inactive"];
+
+// ---------- Settings: Insurance Management ----------
+
+function InsuranceManagement({ insurances, policies, perms, onSave, onSetStatus, onDelete }) {
+  const [draft, setDraft] = useState(null);
+  const [error, setError] = useState("");
+  const [confirm, setConfirm] = useState(null); // { row, inUse }
+  const [search, setSearch] = useState("");
+
+  // How many patient policies point at each master row. Shown beside the row so an administrator
+  // can see what a change reaches, and used to decide whether deletion is even offered.
+  const usage = useMemo(() => {
+    const counts = {};
+    (policies || []).forEach(p => {
+      if (p.insuranceId) counts[p.insuranceId] = (counts[p.insuranceId] || 0) + 1;
+    });
+    return counts;
+  }, [policies]);
+
+  const rows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const list = [...insurances].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    if (!q) return list;
+    return list.filter(i =>
+      (i.name || "").toLowerCase().includes(q) || (i.payerId || "").toLowerCase().includes(q));
+  }, [insurances, search]);
+
+  function validate() {
+    if (!draft.name?.trim()) return "Insurance name is required.";
+    if (!draft.payerId?.trim()) return "Payer ID is required.";
+    if (!draft.address?.trim()) return "Insurance address is required.";
+    // The database enforces both of these too (see migrations/005); checking here as well turns a
+    // 400 from the server into an inline message before the round trip.
+    const name = draft.name.trim().toLowerCase();
+    if (insurances.some(i => i.id !== draft.id && (i.name || "").trim().toLowerCase() === name)) {
+      return "An insurance company with that name already exists.";
+    }
+    const payer = draft.payerId.trim();
+    if (insurances.some(i => i.id !== draft.id && (i.payerId || "").trim() === payer)) {
+      const clash = insurances.find(i => i.id !== draft.id && (i.payerId || "").trim() === payer);
+      return `Payer ID ${payer} is already used by ${clash.name}.`;
+    }
+    return "";
+  }
+
+  function save() {
+    const problem = validate();
+    if (problem) { setError(problem); return; }
+    onSave({
+      id: draft.id,
+      name: draft.name.trim(),
+      payerId: draft.payerId.trim(),
+      address: draft.address.trim(),
+      phone: (draft.phone || "").trim(),
+      website: (draft.website || "").trim(),
+      notes: (draft.notes || "").trim(),
+      status: draft.status || "Active",
+    });
+    setDraft(null);
+    setError("");
+  }
+
+  function askRemove(row) {
+    setConfirm({ row, inUse: usage[row.id] || 0 });
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <input
+          className={`${inputCls} max-w-xs`}
+          placeholder="Search by name or payer ID…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        {perms.create && !draft && (
+          <button
+            onClick={() => { setDraft({ name: "", payerId: "", address: "", phone: "", website: "", notes: "", status: "Active" }); setError(""); }}
+            className="px-3 py-1.5 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 whitespace-nowrap"
+          >
+            Add insurance
+          </button>
+        )}
+      </div>
+
+      <p className="text-slate-500 text-sm mb-3">
+        The insurance picker on a patient's policy is built from this list, and the payer ID and
+        address it fills in come from here. Editing a row changes what new policies pick up — it
+        never rewrites the payer details already recorded on an existing policy.
+      </p>
+
+      {draft && (
+        <div className="border border-teal-200 bg-teal-50/40 rounded-lg p-3 mb-3">
+          <div className="grid grid-cols-2 gap-x-3">
+            <Field label="Insurance name"><input className={inputCls} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="Aetna" /></Field>
+            <Field label="Payer ID" hint="The identifier claims are routed on."><input className={inputCls} value={draft.payerId} onChange={(e) => setDraft({ ...draft, payerId: e.target.value })} placeholder="60054" /></Field>
+          </div>
+          <Field label="Insurance address">
+            <textarea className={`${inputCls} h-16 resize-none`} value={draft.address} onChange={(e) => setDraft({ ...draft, address: e.target.value })} placeholder="151 Farmington Avenue, Hartford, CT 06156" />
+          </Field>
+          <div className="grid grid-cols-3 gap-x-3">
+            <Field label="Phone (optional)"><input className={inputCls} value={draft.phone} onChange={(e) => setDraft({ ...draft, phone: e.target.value })} /></Field>
+            <Field label="Website (optional)"><input className={inputCls} value={draft.website} onChange={(e) => setDraft({ ...draft, website: e.target.value })} /></Field>
+            <Field label="Status">
+              <select className={inputCls} value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>
+                {INSURANCE_STATUSES.map(s => <option key={s}>{s}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Notes (optional)"><input className={inputCls} value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} /></Field>
+
+          {error && <p className="text-xs text-rose-600 mb-2">{error}</p>}
+          <div className="flex gap-2">
+            <button onClick={save} className="px-3 py-1.5 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700">{draft.id ? "Save changes" : "Add"}</button>
+            <button onClick={() => { setDraft(null); setError(""); }} className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="border border-slate-200 rounded-lg overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 bg-slate-50 border-b border-slate-200">
+              <th className="px-3 py-2 font-medium">Insurance name</th>
+              <th className="px-3 py-2 font-medium">Payer ID</th>
+              <th className="px-3 py-2 font-medium">Address</th>
+              <th className="px-3 py-2 font-medium">In use</th>
+              <th className="px-3 py-2 font-medium">Status</th>
+              <th className="px-3 py-2 font-medium">Created</th>
+              <th className="px-3 py-2 font-medium">Updated</th>
+              <th className="px-3 py-2 font-medium text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => {
+              const active = (r.status || "Active") === "Active";
+              const used = usage[r.id] || 0;
+              return (
+                <tr key={r.id} className={`border-b border-slate-100 last:border-0 ${active ? "" : "bg-slate-50 text-slate-400"}`}>
+                  <td className="px-3 py-2 font-medium text-slate-800">{r.name}</td>
+                  <td className="px-3 py-2 text-slate-600">{r.payerId || "—"}</td>
+                  <td className="px-3 py-2 text-slate-500 text-xs max-w-[220px] whitespace-normal">{r.address || "—"}</td>
+                  <td className="px-3 py-2 text-slate-500 text-xs">{used ? `${used} ${used === 1 ? "policy" : "policies"}` : "—"}</td>
+                  <td className="px-3 py-2"><StatusPill status={active ? "Active" : "Terminated"} /></td>
+                  <td className="px-3 py-2 text-slate-500 text-xs">{fmtDate(r.createdAt)}</td>
+                  <td className="px-3 py-2 text-slate-500 text-xs">{fmtDate(r.updatedAt)}</td>
+                  <td className="px-3 py-2 text-right whitespace-nowrap">
+                    {perms.update && (
+                      <button onClick={() => { setDraft({ ...r, status: r.status || "Active" }); setError(""); }} className="text-teal-700 hover:underline text-xs mr-3">Edit</button>
+                    )}
+                    {perms.update && (
+                      <button
+                        onClick={() => onSetStatus(r, active ? "Inactive" : "Active")}
+                        className="text-slate-500 hover:underline text-xs mr-3"
+                      >
+                        {active ? "Deactivate" : "Reactivate"}
+                      </button>
+                    )}
+                    {perms.delete && (
+                      <button onClick={() => askRemove(r)} className="text-rose-600 hover:underline text-xs">Delete</button>
+                    )}
+                    {!perms.update && !perms.delete && <span className="text-xs text-slate-300">View only</span>}
+                  </td>
+                </tr>
+              );
+            })}
+            {rows.length === 0 && (
+              <tr><td colSpan={8} className="px-3 py-6 text-center text-slate-400">
+                {insurances.length === 0 ? "No insurance companies yet." : `Nothing matches "${search.trim()}".`}
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {confirm && (
+        <Modal title={confirm.inUse > 0 ? "Deactivate insurance" : "Delete insurance"} onClose={() => setConfirm(null)}>
+          {confirm.inUse > 0 ? (
+            <>
+              <p className="text-sm text-slate-600 mb-3">
+                <strong>{confirm.row.name}</strong> is used by{" "}
+                <strong>{confirm.inUse} patient {confirm.inUse === 1 ? "policy" : "policies"}</strong>, so it cannot be deleted.
+              </p>
+              <p className="text-sm text-slate-600 mb-4">
+                Deactivating it instead takes it out of the picker for new policies. Existing patient
+                records are not affected and keep showing the payer details they were created with.
+              </p>
+              <div className="flex justify-end gap-2">
+                <button onClick={() => setConfirm(null)} className="px-3 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Cancel</button>
+                <button
+                  onClick={() => { onSetStatus(confirm.row, "Inactive"); setConfirm(null); }}
+                  className="px-4 py-2 bg-amber-500 text-white rounded-lg text-sm hover:bg-amber-600"
+                >
+                  Deactivate
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-slate-600 mb-4">
+                Delete <strong>{confirm.row.name}</strong>? No patient policy references it, so nothing
+                else changes. This cannot be undone — deactivate instead if you may need it later.
+              </p>
+              <div className="flex justify-end gap-2">
+                <button onClick={() => setConfirm(null)} className="px-3 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50">Cancel</button>
+                <button
+                  onClick={() => { onSetStatus(confirm.row, "Inactive"); setConfirm(null); }}
+                  className="px-3 py-2 border border-slate-300 rounded-lg text-sm hover:bg-slate-50"
+                >
+                  Deactivate instead
+                </button>
+                <button
+                  onClick={() => { onDelete(confirm.row); setConfirm(null); }}
+                  className="px-4 py-2 bg-rose-600 text-white rounded-lg text-sm hover:bg-rose-700"
+                >
+                  Delete
+                </button>
+              </div>
+            </>
+          )}
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------- Searchable single-select for picking a master insurer ----------
+//
+// A practice can carry hundreds of payers, so this filters as you type rather than rendering the
+// whole list. Inactive rows are excluded unless one is already selected on the policy being
+// edited - a retired payer must stay visible on the record that already uses it, or reopening an
+// old policy would silently blank its insurer.
+function InsuranceSelect({ insurances, value, onChange, error, disabled }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [highlight, setHighlight] = useState(0);
+  const boxRef = useRef(null);
+
+  const selected = insurances.find(i => i.id === value) || null;
+
+  const options = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const base = insurances.filter(i => (i.status || "Active") === "Active" || i.id === value);
+    const list = q
+      ? base.filter(i => (i.name || "").toLowerCase().includes(q) || (i.payerId || "").toLowerCase().includes(q))
+      : base;
+    return [...list].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  }, [insurances, query, value]);
+
+  // Close when the click lands outside, so the list does not stay open over the rest of the form.
+  useEffect(() => {
+    if (!open) return undefined;
+    function onDocClick(e) {
+      if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open]);
+
+  function choose(ins) {
+    onChange(ins);
+    setOpen(false);
+    setQuery("");
+  }
+
+  function onKeyDown(e) {
+    if (e.key === "ArrowDown") { e.preventDefault(); setOpen(true); setHighlight(h => Math.min(h + 1, options.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setHighlight(h => Math.max(h - 1, 0)); }
+    else if (e.key === "Enter" && open && options[highlight]) { e.preventDefault(); choose(options[highlight]); }
+    else if (e.key === "Escape") { setOpen(false); }
+  }
+
+  return (
+    <div className="mb-3" ref={boxRef}>
+      <span className="block text-xs font-medium text-slate-500 mb-1">Insurance company</span>
+
+      {selected && !open ? (
+        <div className={`flex items-center justify-between gap-2 border rounded-lg px-3 py-2 ${error ? "border-rose-300" : "border-slate-300"}`}>
+          <span className="text-sm text-slate-800">
+            {selected.name}
+            {(selected.status || "Active") !== "Active" && <span className="ml-2 text-xs text-amber-600">(inactive)</span>}
+          </span>
+          {!disabled && (
+            <div className="flex items-center gap-2 shrink-0">
+              <button type="button" onClick={() => { setOpen(true); setQuery(""); }} className="text-xs text-teal-700 hover:underline">Change</button>
+              <button type="button" onClick={() => onChange(null)} className="text-xs text-slate-400 hover:text-slate-600">Clear</button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="relative">
+          <input
+            className={`${inputCls} ${error ? "border-rose-300" : ""}`}
+            placeholder="Search insurance by name or payer ID…"
+            value={query}
+            disabled={disabled}
+            onChange={(e) => { setQuery(e.target.value); setOpen(true); setHighlight(0); }}
+            onFocus={() => { setOpen(true); setHighlight(0); }}
+            onKeyDown={onKeyDown}
+          />
+          {open && (
+            <div className="absolute z-30 left-0 right-0 mt-1 max-h-56 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg">
+              {options.length === 0 ? (
+                <div className="px-3 py-3 text-xs text-slate-400">
+                  {insurances.length === 0
+                    ? "No insurance companies have been set up yet. An administrator adds them in Settings → Insurance Management."
+                    : `No insurance matches "${query.trim()}".`}
+                </div>
+              ) : options.map((ins, i) => (
+                <button
+                  type="button"
+                  key={ins.id}
+                  onMouseEnter={() => setHighlight(i)}
+                  onClick={() => choose(ins)}
+                  className={`w-full text-left px-3 py-2 border-b border-slate-100 last:border-0 ${i === highlight ? "bg-teal-50" : "hover:bg-slate-50"}`}
+                >
+                  <div className="text-sm text-slate-800">{ins.name}</div>
+                  <div className="text-[11px] text-slate-400">
+                    Payer ID {ins.payerId || "—"}{ins.address ? ` · ${ins.address}` : ""}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {error && <span className="block text-[11px] text-rose-600 mt-1">{error}</span>}
+    </div>
+  );
+}
+
+// ---------- Settings: Manage roles (SUPER_ADMIN only) ----------
+
+// Grants are edited as a role x tab grid and saved one role at a time, so a half-finished edit to
+// one role never rides along with another. Super Admin is shown for orientation but locked: it
+// always holds every tab, which is what guarantees there is a way back into this screen.
+// The four insurance actions, in the order they are stored and displayed. Must match the
+// constants in server/permissions.go - the server rejects anything it does not recognise.
+const INSURANCE_PERMISSION_COLUMNS = [
+  { id: "insurance.view", label: "View" },
+  { id: "insurance.create", label: "Add" },
+  { id: "insurance.update", label: "Edit" },
+  { id: "insurance.delete", label: "Delete" },
+];
+
+function ManageRoles({ rolePermissions, users, navItems, onSave }) {
+  const [draft, setDraft] = useState(() => {
+    const out = {};
+    userRoles.forEach(r => {
+      const row = rolePermissions.find(p => p.id === r);
+      out[r] = Array.isArray(row?.tabs) ? [...row.tabs] : [...(DEFAULT_ROLE_TABS[r] || [])];
+    });
+    return out;
+  });
+  // Action grants are tracked separately from tab grants because they are a different kind of
+  // decision: a tab controls navigation, an action controls writing shared billing reference
+  // data. Nobody holds any of these until an administrator grants them.
+  const [permDraft, setPermDraft] = useState(() => {
+    const out = {};
+    userRoles.forEach(r => {
+      const row = rolePermissions.find(p => p.id === r);
+      out[r] = Array.isArray(row?.permissions) ? [...row.permissions] : [];
+    });
+    return out;
+  });
+  const [savedRole, setSavedRole] = useState("");
+
+  // "users" is no longer in navItems (it moved into the Settings menu), so it is appended here —
+  // it still governs who can reach User accounts and Manage roles.
+  const columns = [...navItems.map(n => ({ id: n.id, label: n.label })), { id: "users", label: "Administration" }];
+
+  function toggle(role, tabId) {
+    setDraft(d => {
+      const has = d[role].includes(tabId);
+      return { ...d, [role]: has ? d[role].filter(t => t !== tabId) : [...d[role], tabId] };
+    });
+    setSavedRole("");
+  }
+
+  function togglePerm(role, permId) {
+    setPermDraft(d => {
+      const has = d[role].includes(permId);
+      return { ...d, [role]: has ? d[role].filter(t => t !== permId) : [...d[role], permId] };
+    });
+    setSavedRole("");
+  }
+
+  function isChanged(role) {
+    const row = rolePermissions.find(p => p.id === role);
+    const savedTabs = Array.isArray(row?.tabs) ? row.tabs : (DEFAULT_ROLE_TABS[role] || []);
+    const tabsChanged = savedTabs.length !== draft[role].length || savedTabs.some(t => !draft[role].includes(t));
+
+    const savedPerms = Array.isArray(row?.permissions) ? row.permissions : [];
+    const permsChanged = savedPerms.length !== permDraft[role].length || savedPerms.some(t => !permDraft[role].includes(t));
+
+    return tabsChanged || permsChanged;
+  }
+
+  function save(role) {
+    // Store in nav order rather than click order, so the audit entry reads as a real diff
+    // instead of a reshuffle.
+    const ordered = columns.map(c => c.id).filter(id => draft[role].includes(id));
+    const orderedPerms = INSURANCE_PERMISSION_COLUMNS.map(c => c.id).filter(id => permDraft[role].includes(id));
+    onSave(role, ordered, orderedPerms);
+    setSavedRole(role);
+  }
+
+  return (
+    <div>
+      <p className="text-slate-500 text-sm mb-4">
+        Controls which screens each role can open. These grants are enforced by the server as well as the
+        interface — a role without <span className="font-medium">Billing</span> can't post charges through the
+        API either, not merely have the tab hidden. Changes apply the next time that person loads the app.
+      </p>
+
+      <Card className="overflow-x-auto mb-4">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+              <th className="px-4 py-2.5 font-medium">Role</th>
+              {columns.map(c => <th key={c.id} className="px-2 py-2.5 font-medium text-center whitespace-nowrap">{c.label}</th>)}
+              <th className="px-4 py-2.5 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {userRoles.map(role => {
+              const locked = role === "SUPER_ADMIN";
+              const count = users.filter(u => u.role === role && !u.disabled).length;
+              return (
+                <tr key={role} className="border-b border-slate-100 last:border-0">
+                  <td className="px-4 py-2.5">
+                    <div className="font-medium text-slate-800 whitespace-nowrap">{ROLE_LABELS[role]}</div>
+                    <div className="text-xs text-slate-400 whitespace-nowrap">{count} active {count === 1 ? "user" : "users"}</div>
+                  </td>
+                  {columns.map(c => (
+                    <td key={c.id} className="px-2 py-2.5 text-center">
+                      <input
+                        type="checkbox"
+                        className="w-4 h-4 accent-teal-600 disabled:opacity-40"
+                        checked={locked || draft[role].includes(c.id)}
+                        disabled={locked}
+                        onChange={() => toggle(role, c.id)}
+                      />
+                    </td>
+                  ))}
+                  <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                    {locked ? (
+                      <span className="text-xs text-slate-400">Always full access</span>
+                    ) : isChanged(role) ? (
+                      <button onClick={() => save(role)} className="text-xs bg-teal-600 text-white rounded-lg px-2.5 py-1 hover:bg-teal-700">Save</button>
+                    ) : (
+                      <span className="text-xs text-slate-400">{savedRole === role ? "Saved" : "—"}</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Card>
+
+      <h4 className="text-sm font-medium text-slate-700 mb-1">Insurance Management</h4>
+      <p className="text-slate-500 text-sm mb-3">
+        Who may work with the master insurance list — the payer names, payer IDs and addresses that
+        every patient policy is built from. Separate from the Billing tab on purpose: posting a payment
+        and rewriting the payer list are different kinds of trust. Ticking any box here puts Insurance
+        Management in that role's Settings menu. Save with the button on the role's row above.
+      </p>
+
+      <Card className="overflow-x-auto mb-4">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+              <th className="px-4 py-2.5 font-medium">Role</th>
+              {INSURANCE_PERMISSION_COLUMNS.map(c => (
+                <th key={c.id} className="px-2 py-2.5 font-medium text-center whitespace-nowrap">{c.label}</th>
+              ))}
+              <th className="px-4 py-2.5 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {userRoles.map(role => {
+              const locked = role === "SUPER_ADMIN";
+              return (
+                <tr key={role} className="border-b border-slate-100 last:border-0">
+                  <td className="px-4 py-2.5 font-medium text-slate-800 whitespace-nowrap">{ROLE_LABELS[role]}</td>
+                  {INSURANCE_PERMISSION_COLUMNS.map(c => (
+                    <td key={c.id} className="px-2 py-2.5 text-center">
+                      <input
+                        type="checkbox"
+                        className="w-4 h-4 accent-teal-600 disabled:opacity-40"
+                        checked={locked || permDraft[role].includes(c.id)}
+                        disabled={locked}
+                        onChange={() => togglePerm(role, c.id)}
+                      />
+                    </td>
+                  ))}
+                  <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                    {locked && <span className="text-xs text-slate-400">Always full access</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Card>
+
+      <p className="text-xs text-slate-400">
+        Every role keeps the Dashboard, Batch Management and their own password regardless of this grid.
+        The Super Admin role can't be edited and only a Super Admin can open this screen — together that is
+        what stops the last admin from locking everyone out.
+      </p>
+    </div>
+  );
+}
+
 // ---------- User account administration (SUPER_ADMIN only) ----------
 
 const userRoles = ["SUPER_ADMIN", "MANAGER", "NURSE", "RECEPTIONIST", "BILLER"];
 
-function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, onChangeRole }) {
+function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, onChangeRole, onResetPassword }) {
   const [showAdd, setShowAdd] = useState(false);
+  const [resetting, setResetting] = useState(null);
   const sorted = [...users].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const recentActions = auditLogs.filter(a => a.entityType === "user").slice(0, 8);
 
@@ -4617,7 +6268,7 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
         <h1 className="text-xl font-semibold text-slate-800">User accounts</h1>
         <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-sm px-3 py-2 rounded-lg hover:bg-teal-700"><Plus size={15} /> Add user</button>
       </div>
-      <p className="text-slate-500 text-sm mb-4">Only Super Admins can see this page. Deactivating an account blocks that person from signing in — it doesn't delete their history, the same way nothing else in this app is ever hard-deleted.</p>
+      <p className="text-slate-500 text-sm mb-4">Only Super Admins can see this page. Deactivating an account blocks that person from signing in, it doesn't delete their history, the same way nothing else in this app is ever hard-deleted.</p>
 
       <Card className="mb-6">
         <table className="w-full text-sm">
@@ -4648,7 +6299,8 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
                     </select>
                   </td>
                   <td className="px-4 py-2.5"><StatusPill status={u.disabled ? "Terminated" : "Active"} /></td>
-                  <td className="px-4 py-2.5 text-right">
+                  <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                    <button onClick={() => setResetting(u)} className="text-xs text-slate-600 border border-slate-200 rounded-lg px-2.5 py-1 hover:bg-slate-50 mr-1.5">Reset password</button>
                     {!isSelf && (
                       u.disabled ? (
                         <button onClick={() => onSetDisabled(u.id, false)} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2.5 py-1 hover:bg-teal-100">Reactivate</button>
@@ -4671,7 +6323,7 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
           {recentActions.map(a => (
             <div key={a.id} className="px-4 py-2.5 text-xs flex items-center justify-between">
               <span className="text-slate-700">{a.action} — {a.newValues}</span>
-              <span className="text-slate-400 whitespace-nowrap ml-3">{a.user} · {a.timestamp?.slice(0, 16).replace("T", " ")}</span>
+              <span className="text-slate-400 whitespace-nowrap ml-3">{a.user} · {fmtDateTime(a.timestamp)}</span>
             </div>
           ))}
           {recentActions.length === 0 && <p className="px-4 py-4 text-center text-slate-400 text-xs">No account changes yet.</p>}
@@ -4683,6 +6335,62 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
           <AddUserForm onSubmit={async (form) => { await onAddUser(form); setShowAdd(false); }} />
         </Modal>
       )}
+
+      {resetting && (
+        <Modal title={`Reset password — ${resetting.name}`} onClose={() => setResetting(null)}>
+          <ResetPasswordForm
+            user={resetting}
+            onSubmit={(pw) => onResetPassword(resetting.id, pw)}
+            onDone={() => setResetting(null)}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// Admin-side reset. Deliberately does not ask for the admin's own password: the session already
+// proves who they are, and the account being reset is by definition one nobody can get into.
+function ResetPasswordForm({ user, onSubmit, onDone }) {
+  const [pw, setPw] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [done, setDone] = useState(false);
+
+  async function submit() {
+    if (pw.length < 6) { setError("Password must be at least 6 characters."); return; }
+    if (pw !== confirm) { setError("The two passwords don't match."); return; }
+    setError("");
+    setSaving(true);
+    try {
+      await onSubmit(pw);
+      setDone(true);
+    } catch {
+      setError("Couldn't reset the password. Please try again.");
+    }
+    setSaving(false);
+  }
+
+  if (done) {
+    return (
+      <div>
+        <p className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 mb-3">
+          Password reset for {user.name}. Give it to them directly — it isn't emailed, and it isn't recorded
+          in the audit log.
+        </p>
+        <button onClick={onDone} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Done</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <p className="text-sm text-slate-500 mb-3">Sets a new password for <span className="font-medium text-slate-700">{user.email}</span>. Any session they already have open stays signed in.</p>
+      <Field label="New password" hint="At least 6 characters."><input type="password" autoComplete="new-password" className={inputCls} value={pw} onChange={(e) => setPw(e.target.value)} /></Field>
+      <Field label="Confirm new password"><input type="password" autoComplete="new-password" className={inputCls} value={confirm} onChange={(e) => setConfirm(e.target.value)} /></Field>
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      <button onClick={submit} disabled={saving} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">{saving ? "Resetting…" : "Reset password"}</button>
     </div>
   );
 }
@@ -4756,10 +6464,10 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
       const days = daysBetween(c.dos, TODAY);
       return {
         Group: groupBy === "physician" ? c.provider : groupBy === "insurance" ? (primary ? primary.insuranceCompany : "Self-pay") : "Self-pay",
-        Patient: p.name || "", Account: p.id || "", DOB: p.dob || "", Phone: p.phone || "",
+        Patient: p.name || "", Account: p.id || "", DOB: fmtDate(p.dob), Phone: p.phone || "",
         SSN: maskSSN(p.ssn), "Insurance name": primary ? primary.insuranceCompany : "Self-pay", "Insurance ID": primary ? primary.memberId : "",
-        CPT: c.cpt, DOS: c.dos, Bucket: agingBucket(days), Balance: balanceOf(c),
-        Memo: lastMemo ? `${lastMemo.date} — ${lastMemo.text}` : "",
+        CPT: c.cpt, DOS: fmtDate(c.dos), Bucket: agingBucket(days), Balance: balanceOf(c),
+        Memo: lastMemo ? `${fmtDate(lastMemo.date)} — ${lastMemo.text}` : "",
       };
     }).sort((a, b) => a.Group.localeCompare(b.Group) || b.Balance - a.Balance);
   }, [reportType, groupBy, openCharges, patientById, policies]);
@@ -4780,7 +6488,7 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
         const charge = charges.find(c => c.id === t.chargeId);
         const isDebit = t.type === "debit";
         return {
-          Date: t.date, Patient: patientById[t.patientId]?.name || "", Physician: charge?.provider || "",
+          Date: fmtDate(t.date), Patient: patientById[t.patientId]?.name || "", Physician: charge?.provider || "",
           CPT: charge?.cpt || "", Description: isDebit ? `Debit — ${t.reference} (${t.source})` : (charge?.desc || ""), Amount: t.amount,
         };
       })
@@ -4796,7 +6504,7 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
       .map(t => {
         const charge = charges.find(c => c.id === t.chargeId);
         return {
-          Date: t.date, Patient: patientById[t.patientId]?.name || "", Physician: charge?.provider || "",
+          Date: fmtDate(t.date), Patient: patientById[t.patientId]?.name || "", Physician: charge?.provider || "",
           Type: t.type === "payment" ? "Payment" : "Write-off", Source: t.source || "", Reference: t.reference || "", Amount: t.amount,
         };
       })
@@ -5233,7 +6941,8 @@ function DailyTransactionPrintable({ result, columns, batchLabelById, generatedB
 }
 
 function DailyTransactionModal({ charges, patientById, transactions, batches, userAccounts, session, isOversight, onClose, onResult }) {
-  const cptCatalog = useContext(CptCatalogContext);
+  const providerOptions = useProviderOptions();
+  const cptOptions = useCptOptions();
   const [f, setF] = useState(DAILY_TXN_DEFAULTS);
   const [result, setResult] = useState(null);
   const [page, setPage] = useState(1);
@@ -5329,15 +7038,15 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
   const pageRows = result ? result.rows.slice((page - 1) * DAILY_TXN_PAGE_SIZE, page * DAILY_TXN_PAGE_SIZE) : [];
 
   const procedureOptions = useMemo(
-    () => cptCatalog.map(c => ({ value: c.code, label: `${c.code} — ${c.desc}` })),
-    [cptCatalog]
+    () => cptOptions.map(c => ({ value: c.code, label: `${c.code} — ${c.desc}` })),
+    [cptOptions]
   );
   const userOptions = useMemo(
     () => userAccounts.filter(u => u.name).map(u => ({ value: u.name, label: `${u.name} (${ROLE_LABELS[u.role] || u.role})` })),
     [userAccounts]
   );
   const batchOptions = useMemo(
-    () => visibleBatches.map(b => ({ value: b.id, label: `${b.batchNumber} — ${b.batchDate} (${b.userName})` })),
+    () => visibleBatches.map(b => ({ value: b.id, label: `${b.batchNumber} — ${fmtDate(b.batchDate)} (${b.userName})` })),
     [visibleBatches]
   );
 
@@ -5433,7 +7142,7 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
                               />
                             </td>
                             <td className="py-1.5 px-2 text-slate-700">{b.batchNumber}</td>
-                            <td className="py-1.5 px-2 text-slate-600">{(b.closedAt || b.batchDate || "").slice(0, 10)}</td>
+                            <td className="py-1.5 px-2 text-slate-600">{fmtDate(b.closedAt || b.batchDate)}</td>
                             <td className="py-1.5 px-2 text-slate-600">{b.userName}</td>
                             <td className="py-1.5 px-2 text-right font-medium">{money(closingTotals[b.id] || 0)}</td>
                           </tr>
@@ -5470,7 +7179,7 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
             {f.doctorMode === "specific" && (
               <div className="mt-2">
                 <MultiSelectSearch
-                  options={providers.map(p => ({ value: p, label: p }))} selected={f.doctors} placeholder="Search doctors…"
+                  options={providerOptions.map(p => ({ value: p, label: p }))} selected={f.doctors} placeholder="Search doctors…"
                   onChange={(v) => set("doctors", v)} error={show("doctors")}
                 />
               </div>
@@ -5629,7 +7338,7 @@ function ClinicalSearch({ patients, allergiesByPatient, onSelect }) {
               return (
                 <tr key={p.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 cursor-pointer" onClick={() => onSelect(p.id)}>
                   <td className="px-4 py-2.5"><div className="font-medium text-slate-800">{p.name}</div><div className="text-xs text-slate-400">{p.id}</div></td>
-                  <td className="px-4 py-2.5 text-slate-600">{p.dob}</td>
+                  <td className="px-4 py-2.5 text-slate-600">{fmtDate(p.dob)}</td>
                   <td className="px-4 py-2.5">
                     {allergyList.length > 0 ? (
                       <span className="flex items-center gap-1 text-xs text-rose-600"><AlertTriangle size={12} /> {allergyList.map(a => a.substance).join(", ")}</span>
@@ -5670,7 +7379,7 @@ function ClinicalChart({ patient, vitals, allergies, medications, problems, note
         <div className="flex items-start justify-between">
           <div>
             <h1 className="text-lg font-semibold text-slate-800">{patient.name}</h1>
-            <p className="text-xs text-slate-500">DOB {patient.dob} · {patient.id} · {patient.phone}</p>
+            <p className="text-xs text-slate-500">DOB {fmtDate(patient.dob)} · {patient.id} · {patient.phone}</p>
           </div>
           {activeAllergies.length > 0 ? (
             <div className="flex items-center gap-1.5 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5">
@@ -5729,7 +7438,7 @@ function VitalsTab({ vitals, onAdd }) {
           <tbody>
             {sorted.map(v => (
               <tr key={v.id} className="border-b border-slate-100 last:border-0">
-                <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{v.date}</td>
+                <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{fmtDate(v.date)}</td>
                 <td className="px-4 py-2.5 text-slate-600">{v.height} / {v.weight} / {v.bmi}</td>
                 <td className="px-4 py-2.5 font-medium text-slate-800">{v.bp}</td>
                 <td className="px-4 py-2.5 text-slate-600">{v.pulse}</td>
@@ -6020,7 +7729,7 @@ function NotesTab({ notes, onAdd, onSign, onAmend }) {
             <div className="flex items-center justify-between mb-2">
               <div>
                 <span className="font-medium text-slate-800">{n.type}</span>
-                <span className="text-xs text-slate-400 ml-2">{n.date} · {n.provider}</span>
+                <span className="text-xs text-slate-400 ml-2">{fmtDate(n.date)} · {n.provider}</span>
               </div>
               <StatusPill status={n.status} />
             </div>
@@ -6034,7 +7743,7 @@ function NotesTab({ notes, onAdd, onSign, onAmend }) {
               <div className="mt-3 pt-3 border-t border-slate-100 space-y-1.5">
                 {n.amendments.map((a, i) => (
                   <div key={i} className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
-                    <span className="font-medium">Amendment</span> — {a.text} <span className="text-amber-500">({a.by}, {a.at.slice(0, 16).replace("T", " ")})</span>
+                    <span className="font-medium">Amendment</span> — {a.text} <span className="text-amber-500">({a.by}, {fmtDateTime(a.at)})</span>
                   </div>
                 ))}
               </div>
@@ -6069,7 +7778,8 @@ function NotesTab({ notes, onAdd, onSign, onAmend }) {
 }
 
 function NoteForm({ onSubmit }) {
-  const [form, setForm] = useState({ type: noteTypes[0], date: TODAY, provider: "Dr. S. Reyes", subjective: "", objective: "", assessment: "", plan: "" });
+  const providerOptions = useProviderOptions();
+  const [form, setForm] = useState({ type: noteTypes[0], date: TODAY, provider: providerOptions[0] || "", subjective: "", objective: "", assessment: "", plan: "" });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const [error, setError] = useState("");
   function submit() {
@@ -6084,7 +7794,7 @@ function NoteForm({ onSubmit }) {
         </Field>
         <Field label="Date"><input type="date" className={inputCls} value={form.date} onChange={set("date")} /></Field>
         <Field label="Provider">
-          <select className={inputCls} value={form.provider} onChange={set("provider")}>{providers.map(p => <option key={p}>{p}</option>)}</select>
+          <select className={inputCls} value={form.provider} onChange={set("provider")}>{providerOptions.map(p => <option key={p}>{p}</option>)}</select>
         </Field>
       </div>
       <Field label="Subjective"><textarea className={`${inputCls} h-16 resize-none`} value={form.subjective} onChange={set("subjective")} /></Field>
@@ -6176,7 +7886,7 @@ function DuplicateWarning({ dupes, onUseExisting, onCreateAnyway, onCancel }) {
           <div key={d.id} className="flex items-center justify-between border border-slate-200 rounded-lg px-3 py-2">
             <div>
               <div className="font-medium text-slate-800">{d.name}</div>
-              <div className="text-xs text-slate-500">{d.id} · DOB {d.dob} · {d.phone}</div>
+              <div className="text-xs text-slate-500">{d.id} · DOB {fmtDate(d.dob)} · {d.phone}</div>
             </div>
             <button onClick={() => onUseExisting(d.id)} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-3 py-1.5 hover:bg-teal-100">View this patient</button>
           </div>
@@ -6191,8 +7901,9 @@ function DuplicateWarning({ dupes, onUseExisting, onCreateAnyway, onCancel }) {
 }
 
 function AddApptForm({ patients, onSubmit }) {
-  const cptCatalog = useContext(CptCatalogContext);
-  const [form, setForm] = useState({ patientId: patients[0]?.id || "", date: "2026-08-24", time: "09:00", provider: providers[0], type: "Follow-up", cpt: cptCatalog[0]?.code || "" });
+  const providerOptions = useProviderOptions();
+  const cptOptions = useCptOptions();
+  const [form, setForm] = useState({ patientId: patients[0]?.id || "", date: "2026-08-24", time: "09:00", provider: providerOptions[0] || "", type: "Follow-up", cpt: cptOptions[0]?.code || "" });
   const [error, setError] = useState("");
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
@@ -6211,11 +7922,11 @@ function AddApptForm({ patients, onSubmit }) {
         <Field label="Time"><input type="time" className={inputCls} value={form.time} onChange={set("time")} /></Field>
       </div>
       <Field label="Provider">
-        <select className={inputCls} value={form.provider} onChange={set("provider")}>{providers.map(p => <option key={p}>{p}</option>)}</select>
+        <select className={inputCls} value={form.provider} onChange={set("provider")}>{providerOptions.map(p => <option key={p}>{p}</option>)}</select>
       </Field>
       <Field label="Visit type"><input className={inputCls} value={form.type} onChange={set("type")} /></Field>
       <Field label="Expected CPT code">
-        <select className={inputCls} value={form.cpt} onChange={set("cpt")}>{cptCatalog.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
+        <select className={inputCls} value={form.cpt} onChange={set("cpt")}>{cptOptions.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
       </Field>
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
       <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 mt-2">Schedule appointment</button>

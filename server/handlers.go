@@ -67,7 +67,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if ok, why := writeAllowed(name, u.Role, u.UID, doc, existing); !ok {
+	if ok, why := writeAllowed(name, u.Role, u.UID, s.tabsFor(r.Context(), u.Role), s.permsFor(r.Context(), u.Role), doc, existing); !ok {
 		writeErr(w, http.StatusForbidden, why)
 		return
 	}
@@ -85,14 +85,14 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		err = Set(r.Context(), tx, name, id, doc)
 	}
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusBadRequest, friendlyWriteError(name, err))
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.hub.broadcast(name)
+	s.changed(name)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
@@ -109,7 +109,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r.Context())
-	if ok, why := writeAllowed(name, u.Role, u.UID, doc, nil); !ok {
+	if ok, why := writeAllowed(name, u.Role, u.UID, s.tabsFor(r.Context(), u.Role), s.permsFor(r.Context(), u.Role), doc, nil); !ok {
 		writeErr(w, http.StatusForbidden, why)
 		return
 	}
@@ -129,8 +129,19 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.hub.broadcast(name)
+	s.changed(name)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+// changed announces a collection write to every connected client, and drops the cached role
+// grants when the write was to rolePermissions - otherwise a permission change would keep being
+// judged against the previous grants until the process restarted.
+func (s *Server) changed(name string) {
+	if name == "rolePermissions" {
+		s.invalidateTabs()
+		s.invalidatePerms()
+	}
+	s.hub.broadcast(name)
 }
 
 // DELETE /api/collections/{name}/{id}
@@ -141,10 +152,25 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r.Context())
-	if ok, why := deleteAllowed(name, u.Role); !ok {
+	if ok, why := deleteAllowed(name, u.Role, s.tabsFor(r.Context(), u.Role), s.permsFor(r.Context(), u.Role)); !ok {
 		writeErr(w, http.StatusForbidden, why)
 		return
 	}
+	if name == "insurance" {
+		var inUse int
+		if err := s.db.QueryRow(r.Context(),
+			`SELECT count(*) FROM insurance_policies WHERE insurance_id = $1`, id).Scan(&inUse); err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not check whether this insurance is in use")
+			return
+		}
+		if inUse > 0 {
+			// 409, not 403: the caller is allowed to do this, the data will not permit it.
+			writeErr(w, http.StatusConflict,
+				"this insurance is used by patient policies and cannot be deleted - deactivate it instead, which keeps those records intact")
+			return
+		}
+	}
+
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -159,8 +185,32 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.hub.broadcast(name)
+	s.changed(name)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+// friendlyWriteError turns a database constraint violation into something the person who typed
+// the form can act on.
+//
+// Two reasons this is not just cosmetic. A raw driver message ("duplicate key value violates
+// unique constraint idx_insurance_payer_unique") names internal schema objects to anyone who can
+// reach the endpoint, and it tells the biller who typed a payer ID twice nothing about what to do.
+// Anything unrecognised is passed through unchanged rather than swallowed, so a genuine fault
+// still surfaces in full.
+func friendlyWriteError(collection string, err error) string {
+	msg := err.Error()
+	if !strings.Contains(msg, "23505") && !strings.Contains(msg, "duplicate key") {
+		return msg
+	}
+	switch {
+	case strings.Contains(msg, "idx_insurance_name_unique"):
+		return "an insurance company with that name already exists"
+	case strings.Contains(msg, "idx_insurance_payer_unique"):
+		return "that payer ID is already used by another insurance company"
+	case collection == "insurance":
+		return "that insurance company duplicates one that already exists"
+	}
+	return msg
 }
 
 // BatchOp is one write inside an atomic batch, mirroring Firestore's writeBatch API.
@@ -187,6 +237,8 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r.Context())
+	tabs := s.tabsFor(r.Context(), u.Role)
+	perms := s.permsFor(r.Context(), u.Role)
 
 	// Authorize every operation before opening the transaction, so a rejected op cannot leave
 	// a partially applied batch behind.
@@ -196,7 +248,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if op.Op == "delete" {
-			if ok, why := deleteAllowed(op.Collection, u.Role); !ok {
+			if ok, why := deleteAllowed(op.Collection, u.Role, tabs, perms); !ok {
 				writeErr(w, http.StatusForbidden, why)
 				return
 			}
@@ -207,7 +259,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if ok, why := writeAllowed(op.Collection, u.Role, u.UID, op.Data, existing); !ok {
+		if ok, why := writeAllowed(op.Collection, u.Role, u.UID, tabs, perms, op.Data, existing); !ok {
 			writeErr(w, http.StatusForbidden, why)
 			return
 		}
@@ -244,7 +296,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for c := range touched {
-		s.hub.broadcast(c)
+		s.changed(c)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"applied": len(ops)})
 }
@@ -304,6 +356,13 @@ func withCORS(allowed string, next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			// Cross-origin JavaScript can only read a short allowlist of response headers unless
+			// the server says otherwise. Without this the statement download reaches the browser
+			// with its filename stripped and saves as "download.pdf" instead of the name the
+			// audit trail refers to. Only relevant when the frontend is served from a different
+			// origin than the API - the Docker image proxies /api onto the same origin, where
+			// every header is readable anyway.
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

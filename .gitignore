@@ -37,3 +37,41 @@ tools/
 migration-export/
 server/medbill-server.exe
 server/firebase-hash-config.json
+
+# ---------- Secrets (added when preparing this repo to be public) ----------
+# Broadened from a bare `.env` so a variant filename cannot slip through: .env.local,
+# .env.production, .env.docker and anything else are all ignored, while the committed
+# *.example templates stay tracked.
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Service-account and private-key material, wherever it lands in the tree.
+**/serviceAccountKey.json
+**/*serviceAccountKey*.json
+**/*firebase-adminsdk*.json
+**/*-adminsdk-*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+client_secret*.json
+
+# Firebase scrypt parameters captured during migration — describes how to verify real password
+# hashes, so it is not something to publish.
+server/firebase-hash-config.json
+**/firebase-hash-config.json
+
+# Build output
+server/medbill-server
+server/medbill-server.exe
+server/medbill-server.exe~
+
+# Test artifacts
+test-results/
+playwright-report/
+blob-report/
