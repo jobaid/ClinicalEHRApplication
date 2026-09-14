@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'">
+  <title>Clinical EHR Manager</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+
+    <!-- ---------------- sidebar ---------------- -->
+    <nav class="sidebar" aria-label="Sections">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M6 3v6a6 6 0 0 0 12 0V3"></path>
+            <circle cx="18.5" cy="17" r="3"></circle>
+            <path d="M12 15v-3"></path>
+          </svg>
+        </span>
+        <span class="brand-text">
+          <strong>Clinical EHR</strong>
+          <small>Control Center</small>
+        </span>
+      </div>
+
+      <button class="nav-item is-active" data-screen="dashboard" type="button">
+        <span class="nav-dot" aria-hidden="true"></span> Dashboard
+      </button>
+      <button class="nav-item" data-screen="logs" type="button">
+        <span class="nav-dot" aria-hidden="true"></span> Logs
+      </button>
+      <button class="nav-item" data-screen="settings" type="button">
+        <span class="nav-dot" aria-hidden="true"></span> Settings
+      </button>
+
+      <div class="sidebar-foot">
+        <div class="sidebar-status" id="sidebarStatus">
+          <span class="dot dot-grey" aria-hidden="true"></span>
+          <span id="sidebarStatusText">Checking…</span>
+        </div>
+        <p class="version">Version 1.0.0</p>
+      </div>
+    </nav>
+
+    <!-- ---------------- main ---------------- -->
+    <main class="content">
+
+      <!-- ============ DASHBOARD ============ -->
+      <section class="screen is-active" id="screen-dashboard" aria-labelledby="dashTitle">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Application status</p>
+            <h1 id="dashTitle">Dashboard</h1>
+          </div>
+          <div class="health-pill" id="healthPill">
+            <span class="dot dot-grey" aria-hidden="true"></span>
+            <span id="healthPillText">Checking…</span>
+          </div>
+        </header>
+
+        <!-- overall banner -->
+        <div class="banner" id="banner">
+          <div class="banner-icon" id="bannerIcon" aria-hidden="true">◌</div>
+          <div class="banner-body">
+            <h2 id="bannerTitle">Checking services…</h2>
+            <p id="bannerText">Looking for services that are already running.</p>
+          </div>
+        </div>
+
+        <!-- startup progress -->
+        <div class="progress-card" id="progressCard" hidden>
+          <div class="progress-head">
+            <h3 id="progressTitle">Starting Clinical EHR</h3>
+            <span class="progress-pct" id="progressPct">0%</span>
+          </div>
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          <ul class="progress-steps" id="progressSteps"></ul>
+        </div>
+
+        <!-- error -->
+        <div class="error-card" id="errorCard" hidden role="alert">
+          <div class="error-head">
+            <span aria-hidden="true">⚠</span>
+            <h3 id="errorTitle">Startup error</h3>
+          </div>
+          <p id="errorText"></p>
+          <p class="error-hint" id="errorHint"></p>
+          <div class="error-actions">
+            <button class="btn btn-quiet" data-screen="logs" type="button">View Logs</button>
+            <button class="btn btn-primary" id="errorRetry" type="button">Retry</button>
+          </div>
+        </div>
+
+        <h3 class="section-label">Services</h3>
+        <div class="cards" id="serviceCards"></div>
+
+        <h3 class="section-label">Quick actions</h3>
+        <div class="actions">
+          <button class="btn btn-primary" id="btnStart" type="button">
+            <span aria-hidden="true">▶</span> Start Application
+          </button>
+          <button class="btn" id="btnRestart" type="button">
+            <span aria-hidden="true">↻</span> Restart
+          </button>
+          <button class="btn btn-danger" id="btnStop" type="button">
+            <span aria-hidden="true">■</span> Stop
+          </button>
+          <button class="btn btn-open" id="btnOpen" type="button">
+            Open Clinical EHR
+          </button>
+        </div>
+
+        <footer class="page-foot">
+          <span id="lastStarted">Last started: never this session</span>
+          <span id="appDirLabel"></span>
+        </footer>
+      </section>
+
+      <!-- ============ LOGS ============ -->
+      <section class="screen" id="screen-logs" aria-labelledby="logsTitle">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Service output</p>
+            <h1 id="logsTitle">Logs</h1>
+          </div>
+          <div class="log-tools">
+            <button class="btn btn-small" id="btnCopyLogs" type="button">Copy</button>
+            <button class="btn btn-small" id="btnExportLogs" type="button">Export</button>
+            <button class="btn btn-small btn-quiet" id="btnClearLogs" type="button">Clear</button>
+          </div>
+        </header>
+
+        <p class="hint">
+          The services run without a console window, so everything they print is captured here.
+        </p>
+
+        <div class="filters" role="group" aria-label="Filter log source">
+          <button class="chip is-active" data-source="all" type="button">All</button>
+          <button class="chip" data-source="manager" type="button">Manager</button>
+          <button class="chip" data-source="postgres" type="button">PostgreSQL</button>
+          <button class="chip" data-source="api" type="button">Go Backend</button>
+          <button class="chip" data-source="web" type="button">React</button>
+        </div>
+
+        <div class="log-view" id="logView" tabindex="0" aria-label="Log output"></div>
+      </section>
+
+      <!-- ============ SETTINGS ============ -->
+      <section class="screen" id="screen-settings" aria-labelledby="setTitle">
+        <header class="page-head">
+          <div>
+            <p class="eyebrow">Configuration</p>
+            <h1 id="setTitle">Settings</h1>
+          </div>
+        </header>
+
+        <div class="panel">
+          <h3>Application</h3>
+          <label class="field" for="appDir">Application directory</label>
+          <div class="row">
+            <input type="text" id="appDir" class="input" readonly>
+            <button class="btn" id="btnBrowse" type="button">Browse…</button>
+          </div>
+          <p class="hint" id="appDirHint">The folder containing package.json, server/ and src/.</p>
+        </div>
+
+        <div class="panel">
+          <h3>Startup</h3>
+
+          <div class="toggle-row">
+            <div>
+              <p class="toggle-label">Start Manager with Windows</p>
+              <p class="hint">Only the manager starts. Services stay off until you start them.</p>
+            </div>
+            <button class="switch" id="swStartWithWindows" role="switch" aria-checked="false" type="button">
+              <span class="knob"></span>
+            </button>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <p class="toggle-label">Start Clinical EHR automatically</p>
+              <p class="hint">When the manager launches, it also starts the services.</p>
+            </div>
+            <button class="switch" id="swAutoStartApp" role="switch" aria-checked="false" type="button">
+              <span class="knob"></span>
+            </button>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <p class="toggle-label">Start minimised to system tray</p>
+              <p class="hint">Applies when Windows launches the manager at sign-in.</p>
+            </div>
+            <button class="switch" id="swStartMinimized" role="switch" aria-checked="false" type="button">
+              <span class="knob"></span>
+            </button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Service recovery</h3>
+
+          <div class="toggle-row">
+            <div>
+              <p class="toggle-label">Restart failed services automatically</p>
+              <p class="hint">Applies only to services the manager started itself.</p>
+            </div>
+            <button class="switch" id="swAutoRestart" role="switch" aria-checked="false" type="button">
+              <span class="knob"></span>
+            </button>
+          </div>
+
+          <label class="field" for="maxRestarts">Maximum restart attempts</label>
+          <input type="number" id="maxRestarts" class="input input-narrow" min="1" max="10" value="3">
+          <p class="hint">After this many failures the manager stops trying and reports an error.</p>
+        </div>
+
+        <div class="panel panel-note">
+          <h3>Database safety</h3>
+          <p class="hint">
+            Stopping or restarting shuts PostgreSQL down cleanly and never removes data.
+            The manager issues only <code>pg_ctl start</code> and <code>pg_ctl stop</code> —
+            it runs no migrations, no resets and no cleanup.
+          </p>
+        </div>
+
+        <div class="settings-actions">
+          <button class="btn btn-primary" id="btnSaveSettings" type="button">Save Settings</button>
+          <span class="saved-flag" id="savedFlag" hidden>Saved</span>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- confirm stop -->
+  <div class="modal-backdrop" id="stopModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="stopModalTitle">
+      <h2 id="stopModalTitle">Stop Clinical EHR?</h2>
+      <p>This will stop the application services.</p>
+      <ul class="modal-list" id="stopModalList"></ul>
+      <p class="reassure">Database data will <strong>not</strong> be deleted.</p>
+      <div class="modal-actions">
+        <button class="btn" id="stopCancel" type="button">Cancel</button>
+        <button class="btn btn-danger" id="stopConfirm" type="button">Stop Application</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

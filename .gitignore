@@ -75,3 +75,12 @@ server/medbill-server.exe~
 test-results/
 playwright-report/
 blob-report/
+
+# ---------- Clinical EHR Manager (desktop control centre) ----------
+# Electron runtime and packaged output: large, machine-specific, and rebuilt by
+# `npm install` / `npm run dist` inside manager/.
+manager/node_modules/
+manager/dist/
+# Generated from scripts/make-icons.mjs; keep icon.ico and the tray images, which
+# the packaged build needs and which are small.
+manager/build/icon-*.png

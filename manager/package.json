@@ -1,0 +1,50 @@
+{
+  "name": "clinical-ehr-manager",
+  "productName": "Clinical EHR Manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Desktop control centre for the Clinical EHR application. Starts, stops and monitors PostgreSQL, the Go API and the React frontend with no console windows.",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "icons": "node scripts/make-icons.mjs",
+    "dist": "electron-builder --win",
+    "pack": "electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.clinicalehr.manager",
+    "productName": "Clinical EHR Manager",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "build/tray.png"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "ClinicalEHRManager-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Clinical EHR Manager"
+    },
+    "portable": {
+      "artifactName": "ClinicalEHRManager-${version}-portable.exe"
+    }
+  }
+}
