@@ -1,5 +1,7 @@
 import React, { useState, useMemo, useEffect, useRef, useContext, createContext } from "react";
 import Papa from "papaparse";
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
 import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPassword, adminResetPassword } from "./firebase/authService";
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
@@ -220,6 +222,191 @@ function exportCSV(filename, rows) {
 
 function printReport() {
   window.print();
+}
+
+// ---------- Report PDF ----------
+//
+// Built from `exportRows` - the same array the CSV button hands to Papa.unparse.
+// That is the whole point of doing it this way: the PDF cannot disagree with the
+// CSV or with the table on screen, because no figure is recomputed on the way
+// out. Columns are read off the row objects too, so a column added to a report
+// appears in all three places at once.
+//
+// The output is a real application/pdf document opened in the browser's own
+// viewer. It deliberately does NOT call window.print(): printing is the reader's
+// decision, taken from the viewer's own toolbar.
+
+const REPORT_MONEY_COLUMNS = new Set(["Amount", "Balance"]);
+
+// Columns that need room to breathe. Everything else is sized by autoTable.
+const REPORT_COLUMN_WIDTHS = {
+  Memo: 46,
+  Description: 46,
+  Patient: 32,
+  Physician: 28,
+  "Insurance name": 30,
+};
+
+/**
+ * Renders a report to a PDF and opens it in a new tab.
+ *
+ * @param {object}   opts
+ * @param {string}   opts.title       e.g. "Debit report - charges posted"
+ * @param {string[]} opts.meta        filter lines to print under the title
+ * @param {object[]} opts.rows        the report rows, exactly as CSV receives them
+ * @param {string}   opts.totalLabel
+ * @param {number}   opts.totalValue
+ * @param {string}   opts.filename
+ * @param {object}   [opts.groupTotals] aging only: subtotal per Group value
+ * @returns {{ok: boolean, error?: string}}
+ */
+function openReportPDF({ title, meta, rows, totalLabel, totalValue, filename, groupTotals }) {
+  if (!rows || !rows.length) {
+    return { ok: false, error: "There are no rows in this report to put in a PDF." };
+  }
+
+  // The tab is opened synchronously, inside the click, BEFORE the document is
+  // built. Popup blockers allow a window opened during a user gesture but block
+  // one opened later from an async callback, and rendering a few hundred rows is
+  // easily long enough to lose that association.
+  const tab = window.open("", "_blank");
+
+  try {
+    const columns = Object.keys(rows[0]);
+    const isWide = columns.length > 7;
+
+    const doc = new jsPDF({ orientation: isWide ? "landscape" : "portrait", unit: "mm", format: "a4" });
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    // ---- letterhead ----
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(15);
+    doc.text(PRACTICE_INFO.name, 14, 16);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.5);
+    doc.setTextColor(110);
+    doc.text(PRACTICE_INFO.address, 14, 21);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.setTextColor(20);
+    doc.text(title, 14, 30);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.5);
+    doc.setTextColor(110);
+    let metaY = 35;
+    for (const line of meta.filter(Boolean)) {
+      doc.text(line, 14, metaY);
+      metaY += 4.2;
+    }
+    doc.setTextColor(20);
+
+    // ---- body ----
+    const body = [];
+    let lastGroup = null;
+
+    for (const row of rows) {
+      // Aging groups its rows on screen with a subtotal band; the PDF carries the
+      // same bands so the two read identically.
+      if (groupTotals && row.Group !== lastGroup) {
+        lastGroup = row.Group;
+        body.push([{
+          content: `${row.Group}          ${money(groupTotals[row.Group] || 0)}`,
+          colSpan: columns.length,
+          styles: { fillColor: [238, 243, 246], textColor: [30, 41, 59], fontStyle: "bold" },
+        }]);
+      }
+      body.push(columns.map((key) =>
+        REPORT_MONEY_COLUMNS.has(key) ? money(row[key]) : String(row[key] ?? "")
+      ));
+    }
+
+    const columnStyles = {};
+    columns.forEach((key, i) => {
+      if (REPORT_MONEY_COLUMNS.has(key)) columnStyles[i] = { halign: "right", cellWidth: 22 };
+      else if (REPORT_COLUMN_WIDTHS[key]) columnStyles[i] = { cellWidth: REPORT_COLUMN_WIDTHS[key] };
+    });
+
+    autoTable(doc, {
+      head: [columns],
+      body,
+      startY: metaY + 2,
+      margin: { left: 14, right: 14, top: 14, bottom: 16 },
+      styles: { fontSize: 7.5, cellPadding: 1.8, overflow: "linebreak", valign: "top" },
+      headStyles: { fillColor: [15, 23, 42], textColor: 255, fontSize: 7.5, fontStyle: "bold" },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      columnStyles,
+      // Repeats the column header on every page, and gives long memos and
+      // descriptions a wrapped cell rather than a clipped one.
+      showHead: "everyPage",
+      didDrawPage: () => {
+        const page = doc.internal.getCurrentPageInfo().pageNumber;
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(7.5);
+        doc.setTextColor(120);
+        doc.text(
+          `${PRACTICE_INFO.name} — generated ${fmtDate(TODAY)}`,
+          14,
+          doc.internal.pageSize.getHeight() - 8
+        );
+        doc.text(
+          `Page ${page} of ${doc.internal.getNumberOfPages()}`,
+          pageWidth - 14,
+          doc.internal.pageSize.getHeight() - 8,
+          { align: "right" }
+        );
+        doc.setTextColor(20);
+      },
+    });
+
+    // ---- total ----
+    const afterTable = doc.lastAutoTable.finalY + 8;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    doc.text(`${totalLabel}: ${money(totalValue)}`, pageWidth - 14, afterTable, { align: "right" });
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(110);
+    doc.text(`${rows.length} row${rows.length === 1 ? "" : "s"}`, 14, afterTable);
+
+    // The page-count footer is written per page as pages are created, so the
+    // "of N" on early pages is stale until every page exists. Rewriting the
+    // footer now that the total is known fixes page 1 of a ten-page report.
+    const total = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= total; i++) {
+      doc.setPage(i);
+      doc.setFillColor(255, 255, 255);
+      doc.rect(pageWidth - 45, doc.internal.pageSize.getHeight() - 12, 32, 6, "F");
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(7.5);
+      doc.setTextColor(120);
+      doc.text(`Page ${i} of ${total}`, pageWidth - 14, doc.internal.pageSize.getHeight() - 8, { align: "right" });
+    }
+
+    const blob = doc.output("blob");
+    const url = URL.createObjectURL(blob);
+
+    if (tab) {
+      tab.location.href = url;
+      tab.document.title = filename;
+    } else {
+      // The popup was blocked. Rather than fail, hand the reader the file - the
+      // browser opens it in the same native viewer from the downloads bar.
+      downloadBlob(filename, blob);
+    }
+
+    // Released once the tab has had time to take its own reference to the blob.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    return { ok: true, popupBlocked: !tab };
+  } catch (err) {
+    if (tab) tab.close();
+    console.error("[medbill] report PDF generation failed:", err);
+    return { ok: false, error: "Unable to generate PDF report. Please try again." };
+  }
 }
 
 const money = (n) => Number(n || 0).toLocaleString("en-US", { style: "currency", currency: "USD" });
@@ -1265,7 +1452,7 @@ function ClinicApp({
       setDuplicateWarning({ form, dupes });
       return;
     }
-    const id = uid("P");
+    const id = uid("");
     const patient = { ...form, id };
     delete patient._forceCreate;
     setDocument("patients", id, patient);
@@ -3548,7 +3735,7 @@ function StatementWizard({ patient, onClose }) {
               would put an unreviewed delivery path in front of patient financial data. The seam is
               a single POST alongside the two statement endpoints when that decision gets made. */}
           <p className="text-xs text-slate-400 mt-5">
-            Sending by email is not available — this deployment has no mail service configured.
+            Sending by email is not available this deployment has no mail service configured.
             {preview?.patient?.email
               ? ` The address on file is ${preview.patient.email}.`
               : " No email address is on file for this patient."}
@@ -6524,6 +6711,34 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
     ? agingDetailRows.reduce((s, r) => s + r.Balance, 0)
     : exportRows.reduce((s, r) => s + (r.Amount || 0), 0);
 
+  const [pdfError, setPdfError] = useState("");
+
+  // The PDF is built from exportRows - the very array the CSV button exports - so
+  // the two can never disagree, and no report calculation is repeated here.
+  function handleExportPDF() {
+    setPdfError("");
+    const meta = reportType === "aging"
+      ? [`Grouped by ${groupBy === "physician" ? "physician" : groupBy === "insurance" ? "insurance type" : "self-pay"}`,
+         "Open balances as at " + fmtDate(TODAY)]
+      : [`Date range: ${fromDate ? fmtDate(fromDate) : "all dates"} to ${toDate ? fmtDate(toDate) : "all dates"}`,
+         "Generated " + fmtDate(TODAY)];
+
+    const result = openReportPDF({
+      title: reportTitle,
+      meta,
+      rows: exportRows,
+      totalLabel: "Total",
+      totalValue: grandTotal,
+      filename: `${filenameBase}.pdf`,
+      groupTotals: reportType === "aging" ? agingGroupTotals : null,
+    });
+
+    if (!result.ok) setPdfError(result.error);
+    else if (result.popupBlocked) {
+      setPdfError("Your browser blocked the new tab, so the PDF was downloaded instead.");
+    }
+  }
+
   return (
     <div>
       {/* Print-only styling: hides everything except #printable-report when printReport() is called */}
@@ -6580,11 +6795,18 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
           <button onClick={() => exportCSV(`${filenameBase}.csv`, exportRows)} className="flex items-center gap-1.5 text-xs text-slate-600 border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50">
             <Download size={13} /> CSV
           </button>
-          <button onClick={printReport} className="flex items-center gap-1.5 text-xs text-slate-600 border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50">
+          <button onClick={handleExportPDF} className="flex items-center gap-1.5 text-xs text-slate-600 border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50">
             <Printer size={13} /> PDF
           </button>
         </div>
       </div>
+
+      {pdfError && (
+        <div className="mb-3 print:hidden text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 flex items-start gap-2">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <span>{pdfError}</span>
+        </div>
+      )}
 
       <div id="printable-report">
         <div className="hidden print:block mb-4">
