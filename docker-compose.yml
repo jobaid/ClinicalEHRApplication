@@ -42,7 +42,9 @@ services:
     environment:
       APP_ENV: production
       DATABASE_URL: postgres://${POSTGRES_USER:-medbill}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-medbill}?sslmode=disable
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET — generate with: openssl rand -base64 48}
+      # Quoted because the message contains a colon-and-space, which YAML would otherwise read as
+      # the start of a second mapping and refuse to parse the file at all.
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET - generate one with openssl rand -base64 48}"
       # Same-origin through nginx means CORS is never exercised, but the server requires the
       # variable under APP_ENV=production, so it is set to the origin people actually visit.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
