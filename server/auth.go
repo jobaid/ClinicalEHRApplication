@@ -26,6 +26,15 @@ type Claims struct {
 	UID   string `json:"uid"`
 	Email string `json:"email"`
 	Role  string `json:"role"`
+
+	// Empty for a real session token. Set to mfaChallengeKind for the short-lived token issued
+	// between "password accepted" and "second factor accepted".
+	//
+	// This is the boundary the whole MFA feature rests on: a challenge token proves only that
+	// somebody knew the password, so requireAuth refuses it. Without this field the challenge
+	// would be a fully valid session and the second factor would be optional in practice.
+	Purpose string `json:"purpose,omitempty"`
+
 	jwt.RegisteredClaims
 }
 
@@ -67,15 +76,42 @@ func (s *Server) parseToken(tokenStr string) (*Claims, error) {
 	return claims, nil
 }
 
+// issueChallengeToken mints the short-lived token that carries a half-finished login from the
+// password step to the second-factor step. It is not a session and requireAuth will not accept it.
+func (s *Server) issueChallengeToken(u authedUser) (string, error) {
+	claims := Claims{
+		UID: u.UID, Email: u.Email, Role: u.Role, Purpose: mfaChallengeKind,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   u.UID,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(mfaChallengeTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.jwtSecret)
+}
+
+// parseChallengeToken accepts ONLY a challenge token, so a full session cannot be replayed into
+// the enrolment endpoints and a challenge cannot be replayed into the application.
+func (s *Server) parseChallengeToken(raw string) (*Claims, error) {
+	claims, err := s.parseToken(strings.TrimSpace(strings.TrimPrefix(raw, "Bearer ")))
+	if err != nil {
+		return nil, err
+	}
+	if claims.Purpose != mfaChallengeKind {
+		return nil, errors.New("not a verification token")
+	}
+	return claims, nil
+}
+
 var errBadCredentials = errors.New("invalid email or password")
 
 // authenticate verifies an email/password pair against the stored credential.
 func (s *Server) authenticate(ctx context.Context, email, password string) (authedUser, error) {
 	var (
-		uid, role, name  string
-		algo             string
-		hash, salt       *string
-		disabled         bool
+		uid, role, name string
+		algo            string
+		hash, salt      *string
+		disabled        bool
 	)
 	err := s.db.QueryRow(ctx,
 		`SELECT id, role, name, disabled, password_algo, password_hash, password_salt
@@ -128,6 +164,54 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
+	// The password is correct. What happens next depends on the second factor.
+	state, err := s.mfaStateFor(r.Context(), u.UID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read security settings")
+		return
+	}
+
+	switch {
+	case state.Enabled:
+		// This browser may already have proved the second factor within the last 30 days.
+		if s.trustedDeviceValid(r.Context(), r, u.UID) {
+			s.completeLogin(w, u, "trusted device")
+			return
+		}
+		challenge, err := s.issueChallengeToken(u)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not start verification")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mfaRequired": true,
+			"challenge":   challenge,
+			"backupCodes": s.backupCodesRemaining(r.Context(), u.UID),
+		})
+
+	case mfaEnforced():
+		// Required but not set up. Enrolment is offered here rather than refused, so turning the
+		// requirement on does not lock out accounts that predate it - they enrol on next sign-in.
+		challenge, err := s.issueChallengeToken(u)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not start enrolment")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mfaEnrollRequired": true,
+			"challenge":         challenge,
+			"email":             u.Email,
+		})
+
+	default:
+		s.completeLogin(w, u, "password only")
+	}
+}
+
+// completeLogin issues the real session token. Every successful sign-in ends here, whatever route
+// it took, so there is exactly one place a session can be minted.
+func (s *Server) completeLogin(w http.ResponseWriter, u authedUser, _ string) {
 	token, err := s.issueToken(u)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not issue session")
@@ -137,6 +221,249 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"token": token,
 		"user":  map[string]any{"uid": u.UID, "email": u.Email},
 	})
+}
+
+// userFromChallenge re-reads the account named by a challenge token.
+//
+// Re-read rather than trusted from the token: an account disabled in the seconds between the
+// password step and the code step must not be able to finish signing in.
+func (s *Server) userFromChallenge(r *http.Request) (authedUser, *Claims, error) {
+	claims, err := s.parseChallengeToken(r.Header.Get("Authorization"))
+	if err != nil {
+		return authedUser{}, nil, err
+	}
+	var u authedUser
+	var disabled bool
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT id, email, role, name, disabled FROM users WHERE id = $1`, claims.UID).
+		Scan(&u.UID, &u.Email, &u.Role, &u.Name, &disabled); err != nil {
+		return authedUser{}, nil, errors.New("unknown account")
+	}
+	if disabled {
+		return authedUser{}, nil, errors.New("this account has been disabled")
+	}
+	return u, claims, nil
+}
+
+// handleMFAVerify is the second step of signing in: a 6-digit code, or a backup code.
+func (s *Server) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
+	u, _, err := s.userFromChallenge(r)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "your verification window expired - please sign in again")
+		return
+	}
+	var body struct {
+		Code        string `json:"code"`
+		TrustDevice bool   `json:"trustDevice"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request")
+		return
+	}
+
+	state, err := s.mfaStateFor(r.Context(), u.UID)
+	if err != nil || !state.Enabled {
+		writeErr(w, http.StatusBadRequest, "multi-factor authentication is not set up for this account")
+		return
+	}
+
+	// A 6-digit authenticator code, or one single-use backup code.
+	if !validateTOTP(body.Code, state.Secret) && !s.consumeBackupCode(r.Context(), u.UID, body.Code) {
+		s.recordLoginAudit(r.Context(), u, "MFA code rejected")
+		writeErr(w, http.StatusUnauthorized, "that code is not valid")
+		return
+	}
+
+	if body.TrustDevice {
+		raw, expires, err := s.issueTrustedDevice(r.Context(), u.UID, r.UserAgent())
+		if err == nil {
+			setTrustedCookie(w, r, raw, expires)
+		}
+		// A failure to record the device is not a reason to refuse a correct code: the user
+		// simply gets asked again next time.
+	}
+	s.recordLoginAudit(r.Context(), u, "MFA verified")
+	s.completeLogin(w, u, "mfa")
+}
+
+// handleMFAEnrollStart returns a fresh secret and the otpauth:// URI for the QR code.
+// Reachable with a challenge token (first-time enrolment during sign-in) or a full session
+// (setting it up from Settings).
+func (s *Server) handleMFAEnrollStart(w http.ResponseWriter, r *http.Request) {
+	u, err := s.actorFor(r)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "please sign in again")
+		return
+	}
+	secret, uri, err := s.beginEnrolment(r.Context(), u.UID, u.Email)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"secret":  secret,
+		"otpauth": uri,
+		"issuer":  mfaIssuer,
+		"account": u.Email,
+	})
+}
+
+// handleMFAEnrollConfirm turns enrolment on once the user has produced a working code, and
+// returns the backup codes - the only time they are ever shown.
+func (s *Server) handleMFAEnrollConfirm(w http.ResponseWriter, r *http.Request) {
+	u, err := s.actorFor(r)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "please sign in again")
+		return
+	}
+	var body struct {
+		Code        string `json:"code"`
+		TrustDevice bool   `json:"trustDevice"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request")
+		return
+	}
+	codes, err := s.completeEnrolment(r.Context(), u.UID, body.Code)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.TrustDevice {
+		if raw, expires, err := s.issueTrustedDevice(r.Context(), u.UID, r.UserAgent()); err == nil {
+			setTrustedCookie(w, r, raw, expires)
+		}
+	}
+	s.recordLoginAudit(r.Context(), u, "MFA enabled")
+
+	// Enrolling mid-login finishes the login; enrolling from Settings leaves the existing session
+	// alone, so no second token is issued there.
+	resp := map[string]any{"backupCodes": codes}
+	if _, _, err := s.userFromChallenge(r); err == nil {
+		if token, err := s.issueToken(u); err == nil {
+			resp["token"] = token
+			resp["user"] = map[string]any{"uid": u.UID, "email": u.Email}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// actorFor resolves the account behind either a full session or an in-progress challenge, for the
+// endpoints that legitimately serve both.
+func (s *Server) actorFor(r *http.Request) (authedUser, error) {
+	if u, _, err := s.userFromChallenge(r); err == nil {
+		return u, nil
+	}
+	claims, err := s.parseToken(strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
+	if err != nil || claims.Purpose != "" {
+		return authedUser{}, errors.New("not authenticated")
+	}
+	var u authedUser
+	var disabled bool
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT id, email, role, name, disabled FROM users WHERE id = $1`, claims.UID).
+		Scan(&u.UID, &u.Email, &u.Role, &u.Name, &disabled); err != nil || disabled {
+		return authedUser{}, errors.New("unknown account")
+	}
+	return u, nil
+}
+
+// handleMFAStatus reports the signed-in user's own security state, for the Settings screen.
+func (s *Server) handleMFAStatus(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	state, err := s.mfaStateFor(r.Context(), u.UID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read security settings")
+		return
+	}
+	devices, err := s.listTrustedDevices(r.Context(), r, u.UID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not list trusted devices")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":           state.Enabled,
+		"enforced":          mfaEnforced(),
+		"backupCodesLeft":   s.backupCodesRemaining(r.Context(), u.UID),
+		"trustedDevices":    devices,
+		"trustedDeviceDays": int(trustedDeviceTTL.Hours() / 24),
+	})
+}
+
+// handleMFADisable turns MFA off, which also ends every trusted device for the account.
+// The current password is required: an unlocked browser must not be enough to remove a factor.
+func (s *Server) handleMFADisable(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	var body struct{ Password string }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request")
+		return
+	}
+	if _, err := s.authenticate(r.Context(), u.Email, body.Password); err != nil {
+		writeErr(w, http.StatusUnauthorized, "that password is not correct")
+		return
+	}
+	if mfaEnforced() {
+		writeErr(w, http.StatusForbidden, "multi-factor authentication is required for all accounts and cannot be turned off")
+		return
+	}
+	if err := s.disableMFA(r.Context(), u.UID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not disable multi-factor authentication")
+		return
+	}
+	clearTrustedCookie(w, r)
+	s.recordLoginAudit(r.Context(), u, "MFA disabled")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleListDevices / handleRevokeDevice / handleRevokeAllDevices back the Trusted Devices screen.
+func (s *Server) handleListDevices(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	devices, err := s.listTrustedDevices(r.Context(), r, u.UID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not list trusted devices")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"devices": devices})
+}
+
+func (s *Server) handleRevokeDevice(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	id := r.PathValue("id")
+	ok, err := s.revokeTrustedDevice(r.Context(), u.UID, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not revoke that device")
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "that device is not on your list")
+		return
+	}
+	s.recordLoginAudit(r.Context(), u, "Trusted device revoked")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleRevokeAllDevices(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	n, err := s.revokeAllTrustedDevices(r.Context(), u.UID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not revoke trusted devices")
+		return
+	}
+	// Including this browser: "revoke all" that quietly spared the device you are sitting at
+	// would not be all.
+	clearTrustedCookie(w, r)
+	s.recordLoginAudit(r.Context(), u, "All trusted devices revoked")
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": n})
+}
+
+// recordLoginAudit writes a security event to the existing login_audit table, so MFA activity
+// appears alongside sign-ins rather than in a new log nobody reads.
+func (s *Server) recordLoginAudit(ctx context.Context, u authedUser, action string) {
+	_, _ = s.db.Exec(ctx,
+		`INSERT INTO login_audit (id, "user", action, role, timestamp)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		newUID(), u.Name, action, u.Role, time.Now().UTC().Format(time.RFC3339))
 }
 
 // handleMe re-validates a stored token on page load, standing in for onAuthStateChanged.
@@ -260,10 +587,22 @@ func (s *Server) setPassword(ctx context.Context, uid, password string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(ctx,
+	if _, err = s.db.Exec(ctx,
 		`UPDATE users SET password_algo = 'bcrypt', password_hash = $2, password_salt = NULL WHERE id = $1`,
-		uid, string(hash))
-	return err
+		uid, string(hash)); err != nil {
+		return err
+	}
+
+	// A password change ends device trust for that account - whether the user changed it
+	// themselves or an administrator reset it. Device trust records that someone already proved
+	// the second factor; after a credential change that assurance is stale, and the usual reason
+	// for changing a password is suspecting someone else has had access. Every trusted browser
+	// must therefore re-verify. Placed here rather than in the handlers so a future code path
+	// that sets a password cannot forget to do it.
+	if _, err := s.revokeAllTrustedDevices(ctx, uid); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ---------- middleware ----------
@@ -294,7 +633,35 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		claims, err := s.parseToken(token)
 		if err != nil {
+			// Not one of ours. When Firebase auth is configured, it may be a Firebase ID token.
+			//
+			// Both are accepted deliberately: a switch to Firebase cannot be atomic across every
+			// signed-in browser, and refusing our own tokens the moment FIREBASE_PROJECT_ID is set
+			// would sign everyone out mid-shift. Set FIREBASE_ONLY=true to stop accepting local
+			// sessions once the changeover is done.
+			if pid := firebaseProjectID(); pid != "" {
+				id, ferr := verifyFirebaseIDToken(r.Context(), token, pid)
+				if ferr == nil {
+					u, uerr := s.resolveFirebaseUser(r.Context(), id)
+					if uerr != nil {
+						writeErr(w, http.StatusForbidden, uerr.Error())
+						return
+					}
+					next(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
+					return
+				}
+			}
 			writeErr(w, http.StatusUnauthorized, "session expired")
+			return
+		}
+		if env("FIREBASE_ONLY", "false") == "true" {
+			writeErr(w, http.StatusUnauthorized, "please sign in again")
+			return
+		}
+		// A challenge token means the password was right and nothing else. It must never reach an
+		// application endpoint, or the second factor becomes decorative.
+		if claims.Purpose != "" {
+			writeErr(w, http.StatusUnauthorized, "verification is not complete")
 			return
 		}
 

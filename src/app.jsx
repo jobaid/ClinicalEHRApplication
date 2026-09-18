@@ -1,8 +1,10 @@
-import React, { useState, useMemo, useEffect, useRef, useContext, createContext } from "react";
+import React, { useState, useMemo, useEffect, useRef, useCallback, useContext, createContext } from "react";
 import Papa from "papaparse";
 import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
-import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPassword, adminResetPassword } from "./firebase/authService";
+import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPassword, adminResetPassword,
+  verifyMfa, startMfaEnrollment, confirmMfaEnrollment, securityStatus, listTrustedDevices,
+  revokeTrustedDevice, revokeAllTrustedDevices } from "./firebase/authService";
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import {
@@ -197,6 +199,38 @@ function daysBetween(dateStr, todayStr) {
   return Math.max(0, Math.round((d2 - d1) / 86400000));
 }
 
+// ---------- Service identity ----------
+//
+// A *service* is one patient + one date of service + one CPT. Memos, postings, payments and
+// debits are *activity* recorded against that service — they are never services themselves, so
+// they must never produce a row of their own in a report. These two helpers build the key that
+// keeps that distinction.
+
+// Compared as plain calendar strings, never through Date(): new Date("2026-08-24") is parsed as
+// UTC midnight and slips to the 23rd in any western timezone, which would split one service into
+// two. Accepts the ISO form the database stores and the MM/DD/YYYY form the UI shows.
+function isoDay(value) {
+  const s = String(value ?? "").trim();
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s);
+  if (us) return `${us[3]}-${us[1].padStart(2, "0")}-${us[2].padStart(2, "0")}`;
+  return s;
+}
+
+// CPT is free text here (numeric CPT, alphanumeric HCPCS such as J1100) and is typed by hand in
+// places, so it is trimmed and case-folded before it is compared.
+function normCpt(value) { return String(value ?? "").trim().toUpperCase(); }
+
+// "2026-08-24T09:15:00" -> "09:15 AM". Empty for date-only input, so a record with no recorded
+// time shows its date alone rather than an invented midnight.
+function fmtTime(value) {
+  const m = /^\d{4}-\d{2}-\d{2}[T ](\d{2}):(\d{2})/.exec(String(value ?? ""));
+  if (!m) return "";
+  const h = Number(m[1]);
+  return `${String(h % 12 || 12).padStart(2, "0")}:${m[2]} ${h < 12 ? "AM" : "PM"}`;
+}
+
 function agingBucket(days) {
   if (days <= 30) return "0-30";
   if (days <= 60) return "31-60";
@@ -220,8 +254,381 @@ function exportCSV(filename, rows) {
   downloadBlob(filename, new Blob([csv], { type: "text/csv;charset=utf-8;" }));
 }
 
+// Used only by the Daily Transaction modal's Print button, which is a browser print of its own
+// printable block and always has been. The Aging Report does not use this: it generates a real
+// PDF document (below) and never opens a print dialog.
 function printReport() {
   window.print();
+}
+
+// ---------- Aging Report: Accounts Receivable Statement (PDF) ----------
+//
+// A dedicated document, not a rendering of the screen. The dashboard is built for filtering and
+// drill-down; this is built to be printed, filed and handed to a manager or an accountant, so it
+// is laid out as a statement: letterhead, the criteria it was run under, the money summarised,
+// the aging distribution, then the detail.
+//
+// Every figure comes from the rows the table and the CSV already use. Nothing is recalculated on
+// the way out, which is what makes it impossible for the PDF to disagree with the screen.
+
+const PDF_PAGE = { format: "letter", marginX: 14, marginTop: 14, marginBottom: 18 };
+
+/** Strips characters that break downloads, and collapses runs of separators. */
+function safeFilename(...parts) {
+  const base = parts.filter(Boolean).join("_")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+  return (base || "Aging_Report").slice(0, 120);
+}
+
+/** Currency for the PDF: right-alignable, no locale surprises. */
+const pdfMoney = (n) => money(Number(n) || 0);
+
+/**
+ * Folds typographic punctuation to ASCII before it reaches the PDF.
+ *
+ * jsPDF's built-in fonts are WinAnsi-encoded and silently DROP characters they cannot represent
+ * rather than substituting anything visible. An em dash therefore disappears without trace, so
+ * "System debited — Check $73.00" prints as "System debited  Check $73.00" and a memo written
+ * with smart quotes loses them. Accented Latin-1 letters (José, Müller) are in WinAnsi and are
+ * deliberately left alone.
+ */
+// Built from code points at load time rather than written as literal characters, so this source
+// stays pure ASCII - a literal non-breaking space here is invisible and easy to break later.
+const PDF_TEXT_FOLDS = [
+  { codes: [0x2014, 0x2013, 0x2212, 0x2010, 0x2011], to: "-" },   // em/en dash, minus, hyphens
+  { codes: [0x2018, 0x2019, 0x201b], to: "'" },                    // single curly quotes
+  { codes: [0x201c, 0x201d, 0x201f], to: '"' },                    // double curly quotes
+  { codes: [0x2026], to: "..." },                                  // ellipsis
+  { codes: [0x00b7, 0x2022], to: "-" },                            // middle dot, bullet
+  { codes: [0x00a0], to: " " },                                    // non-breaking space
+].map(f => ({
+  re: new RegExp("[" + f.codes.map(c => String.fromCharCode(c)).join("") + "]", "g"),
+  to: f.to,
+}));
+
+function pdfText(value) {
+  let out = String(value ?? "");
+  for (const f of PDF_TEXT_FOLDS) out = out.replace(f.re, f.to);
+  return out;
+}
+
+/**
+ * Builds and opens the Accounts Receivable Statement.
+ *
+ * @param {object}   o
+ * @param {object[]} o.rows        grouped service rows (one per patient + DOS + CPT)
+ * @param {object}   o.criteria    label -> value, printed as the report criteria block
+ * @param {object}   o.groupTotals subtotal per Group value
+ * @param {string}   o.groupLabel  what Group means for this run ("Physician" / "Insurance")
+ * @param {string}   o.filename
+ * @returns {{ok: boolean, error?: string, popupBlocked?: boolean}}
+ */
+function openAgingStatementPDF({ rows, criteria, groupTotals, groupLabel, filename }) {
+  if (!rows || !rows.length) {
+    return { ok: false, error: "There are no outstanding services in this report to put in a PDF." };
+  }
+
+  // Opened synchronously inside the click. Popup blockers permit a window opened during a user
+  // gesture but block one opened later from an async continuation, and laying out several hundred
+  // services takes long enough to lose that association.
+  const tab = window.open("", "_blank");
+
+  try {
+    const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: PDF_PAGE.format });
+    const W = doc.internal.pageSize.getWidth();
+    const H = doc.internal.pageSize.getHeight();
+    const L = PDF_PAGE.marginX;
+    const R = W - PDF_PAGE.marginX;
+
+    // ---- totals, summed from the same rows the table shows ----
+    const sum = (k) => rows.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+    const totals = {
+      charge: sum("Charge"),
+      paid: sum("Paid"),
+      adjustment: sum("Adjustment"),
+      credit: sum("Credit"),
+      balance: sum("Balance"),
+    };
+    const insuranceAR = rows.filter(r => r._responsibility === "insurance").reduce((s, r) => s + r.Balance, 0);
+    const patientAR = totals.balance - insuranceAR;
+
+    const buckets = new Map();
+    for (const r of rows) {
+      const b = buckets.get(r.Bucket) || { amount: 0, count: 0 };
+      b.amount += r.Balance;
+      b.count += 1;
+      buckets.set(r.Bucket, b);
+    }
+    // Printed in aging order rather than whatever order the data happened to arrive in.
+    const bucketOrder = ["0-30", "31-60", "61-90", "90+"];
+    const bucketRows = [...buckets.entries()]
+      .sort((a, b) => bucketOrder.indexOf(a[0]) - bucketOrder.indexOf(b[0]));
+
+    // ---------- section helpers ----------
+    let y = PDF_PAGE.marginTop;
+
+    const heading = (text) => {
+      if (y > H - 40) { doc.addPage(); y = PDF_PAGE.marginTop; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(15, 23, 42);
+      doc.text(pdfText(text).toUpperCase(), L, y);
+      y += 1.6;
+      doc.setDrawColor(203, 213, 225);
+      doc.setLineWidth(0.3);
+      doc.line(L, y, R, y);
+      y += 5;
+    };
+
+    /** label left, value right-aligned — the shape every money block here uses. */
+    const lineItem = (label, value, opts = {}) => {
+      doc.setFont("helvetica", opts.bold ? "bold" : "normal");
+      doc.setFontSize(opts.bold ? 9.5 : 8.5);
+      doc.setTextColor(opts.bold ? 15 : 71, opts.bold ? 23 : 85, opts.bold ? 42 : 105);
+      doc.text(pdfText(label), L + (opts.indent || 0), y);
+      doc.text(pdfText(value), R, y, { align: "right" });
+      y += opts.bold ? 6 : 4.8;
+    };
+
+    // ---------- letterhead ----------
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.setTextColor(15, 23, 42);
+    doc.text(pdfText(PRACTICE_INFO.name), L, y + 4);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(100, 116, 139);
+    doc.text(pdfText(PRACTICE_INFO.address), L, y + 9);
+    doc.text(pdfText(`Tax ID ${PRACTICE_INFO.taxId}`), L, y + 13);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(15, 23, 42);
+    doc.text("AGING REPORT", R, y + 4, { align: "right" });
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(100, 116, 139);
+    doc.text("Accounts Receivable Statement", R, y + 9, { align: "right" });
+    doc.setFontSize(8);
+    doc.text(`Generated ${fmtDate(TODAY)}`, R, y + 13, { align: "right" });
+
+    y += 18;
+    doc.setDrawColor(15, 23, 42);
+    doc.setLineWidth(0.6);
+    doc.line(L, y, R, y);
+    y += 8;
+
+    // ---------- report criteria ----------
+    heading("Report criteria");
+    const entries = Object.entries(criteria).filter(([, v]) => v !== "" && v != null);
+    doc.setFontSize(8.5);
+    // Two columns, so the criteria block stays compact however many filters are set.
+    const half = Math.ceil(entries.length / 2);
+    const colX = [L, L + (R - L) / 2];
+    let maxRow = 0;
+    entries.forEach(([label, value], i) => {
+      const col = i < half ? 0 : 1;
+      const row = i < half ? i : i - half;
+      maxRow = Math.max(maxRow, row);
+      const yy = y + row * 4.6;
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(100, 116, 139);
+      doc.text(pdfText(`${label}:`), colX[col], yy);
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(30, 41, 59);
+      doc.text(pdfText(value), colX[col] + 34, yy);
+    });
+    y += (maxRow + 1) * 4.6 + 5;
+
+    // ---------- A/R summary ----------
+    heading("Accounts receivable summary");
+    lineItem("Total charges", pdfMoney(totals.charge));
+    lineItem("Total payments", pdfMoney(totals.paid));
+    // This application records one write-off/adjustment figure per charge; it is not split into
+    // separate "adjustment" and "write-off" columns, so it is reported once under both names
+    // rather than invented twice.
+    lineItem("Total adjustments / write-offs", pdfMoney(totals.adjustment));
+    lineItem("Total credits", pdfMoney(totals.credit));
+    doc.setDrawColor(203, 213, 225);
+    doc.setLineWidth(0.3);
+    doc.line(R - 60, y - 2, R, y - 2);
+    y += 2;
+    lineItem("OUTSTANDING A/R", pdfMoney(totals.balance), { bold: true });
+    y += 2;
+
+    const pct = (n) => (totals.balance ? ((n / totals.balance) * 100).toFixed(1) : "0.0") + "%";
+    lineItem(`Insurance A/R  (${pct(insuranceAR)})`, pdfMoney(insuranceAR));
+    lineItem(`Patient A/R  (${pct(patientAR)})`, pdfMoney(patientAR));
+    y += 4;
+
+    // ---------- aging summary ----------
+    heading("Aging summary");
+    autoTable(doc, {
+      head: [["Age bucket", "Services", "Amount", "% of A/R"]],
+      body: bucketRows.map(([name, b]) => [pdfText(name), String(b.count), pdfMoney(b.amount), pct(b.amount)]),
+      foot: [["TOTAL", String(rows.length), pdfMoney(totals.balance), "100.0%"]],
+      startY: y,
+      margin: { left: L, right: PDF_PAGE.marginX },
+      theme: "grid",
+      styles: { fontSize: 8, cellPadding: 1.8 },
+      headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold", lineColor: [203, 213, 225] },
+      footStyles: { fillColor: [255, 255, 255], textColor: [15, 23, 42], fontStyle: "bold", lineColor: [203, 213, 225] },
+      bodyStyles: { lineColor: [226, 232, 240] },
+      columnStyles: { 1: { halign: "right", cellWidth: 22 }, 2: { halign: "right", cellWidth: 32 }, 3: { halign: "right", cellWidth: 24 } },
+    });
+    y = doc.lastAutoTable.finalY + 8;
+
+    // ---------- group summary (insurance or provider, whichever the run is grouped by) ----------
+    const groupNames = Object.keys(groupTotals || {});
+    if (groupNames.length > 1) {
+      heading(`${groupLabel} summary`);
+      autoTable(doc, {
+        head: [[groupLabel, "Services", "Outstanding", "% of A/R"]],
+        body: groupNames
+          .map(g => [pdfText(g), String(rows.filter(r => r.Group === g).length), pdfMoney(groupTotals[g]), pct(groupTotals[g])])
+          .sort((a, b) => Number(String(b[2]).replace(/[^0-9.]/g, "")) - Number(String(a[2]).replace(/[^0-9.]/g, ""))),
+        startY: y,
+        margin: { left: L, right: PDF_PAGE.marginX },
+        theme: "grid",
+        styles: { fontSize: 8, cellPadding: 1.8 },
+        headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold", lineColor: [203, 213, 225] },
+        bodyStyles: { lineColor: [226, 232, 240] },
+        columnStyles: { 1: { halign: "right", cellWidth: 22 }, 2: { halign: "right", cellWidth: 32 }, 3: { halign: "right", cellWidth: 24 } },
+      });
+      y = doc.lastAutoTable.finalY + 8;
+    }
+
+    // ---------- account detail ----------
+    heading("Account detail");
+
+    const detailHead = ["Account", "Patient", "DOS", "CPT", "Insurance", "Age", "Charge", "Paid", "Balance"];
+    const body = [];
+    let lastGroup = null;
+
+    for (const r of rows) {
+      if (r.Group !== lastGroup) {
+        lastGroup = r.Group;
+        body.push([{
+          content: pdfText(`${groupLabel}: ${r.Group}`),
+          colSpan: detailHead.length - 1,
+          styles: { fillColor: [226, 232, 240], textColor: [15, 23, 42], fontStyle: "bold" },
+        }, {
+          content: pdfMoney(groupTotals[r.Group] || 0),
+          styles: { fillColor: [226, 232, 240], textColor: [15, 23, 42], fontStyle: "bold", halign: "right" },
+        }]);
+      }
+
+      body.push([
+        pdfText(r.Account), pdfText(r.Patient), r.DOS, pdfText(r.CPT), pdfText(r["Insurance name"]), pdfText(r.Bucket),
+        pdfMoney(r.Charge), pdfMoney(r.Paid), pdfMoney(r.Balance),
+      ]);
+
+      // ONE memo box per service, on its own full-width row directly beneath it. Activity never
+      // creates another service row - a service with twenty memos is still one line above one box.
+      if (r._activity && r._activity.length) {
+        const memo = r._activity
+          .map(a => pdfText(`${a.date}${a.time ? "  " + a.time : ""}   ${a.type}${a.user ? "   Posted by: " + a.user : ""}\n${a.text}`))
+          .join("\n\n");
+        body.push([{
+          content: `MEMO / ACTIVITY  (${r._activity.length})\n${memo}`,
+          colSpan: detailHead.length,
+          styles: {
+            fillColor: [248, 250, 252], textColor: [51, 65, 85], fontSize: 6.8,
+            cellPadding: { top: 2, right: 3, bottom: 2.5, left: 6 },
+          },
+        }]);
+      }
+    }
+
+    autoTable(doc, {
+      head: [detailHead],
+      body,
+      startY: y,
+      margin: { left: L, right: PDF_PAGE.marginX, top: PDF_PAGE.marginTop + 12, bottom: PDF_PAGE.marginBottom },
+      theme: "grid",
+      styles: { fontSize: 7.4, cellPadding: 1.7, overflow: "linebreak", valign: "top", lineColor: [226, 232, 240] },
+      headStyles: { fillColor: [15, 23, 42], textColor: 255, fontSize: 7.4, fontStyle: "bold" },
+      // The header repeats on every page, and a service row is never separated from the memo box
+      // that belongs to it.
+      showHead: "everyPage",
+      rowPageBreak: "avoid",
+      columnStyles: {
+        0: { cellWidth: 18 },
+        1: { cellWidth: 32 },
+        2: { cellWidth: 19 },
+        3: { cellWidth: 15 },
+        4: { cellWidth: 30 },
+        5: { cellWidth: 13 },
+        6: { cellWidth: 19, halign: "right" },
+        7: { cellWidth: 18, halign: "right" },
+        8: { cellWidth: 21, halign: "right", fontStyle: "bold" },
+      },
+      // Compact running header on every page after the first, so a page found on its own is still
+      // identifiable.
+      didDrawPage: (data) => {
+        if (data.pageNumber > 1) {
+          doc.setFont("helvetica", "bold");
+          doc.setFontSize(8.5);
+          doc.setTextColor(15, 23, 42);
+          doc.text(pdfText(PRACTICE_INFO.name), L, PDF_PAGE.marginTop);
+          doc.setFont("helvetica", "normal");
+          doc.setFontSize(7.5);
+          doc.setTextColor(100, 116, 139);
+          doc.text(pdfText("Aging Report — Accounts Receivable Statement"), L, PDF_PAGE.marginTop + 4);
+          doc.text(`As of ${fmtDate(TODAY)}`, R, PDF_PAGE.marginTop, { align: "right" });
+          doc.setDrawColor(203, 213, 225);
+          doc.setLineWidth(0.3);
+          doc.line(L, PDF_PAGE.marginTop + 6, R, PDF_PAGE.marginTop + 6);
+        }
+      },
+    });
+
+    // ---------- closing total ----------
+    let endY = doc.lastAutoTable.finalY + 7;
+    if (endY > H - 24) { doc.addPage(); endY = PDF_PAGE.marginTop + 10; }
+    doc.setDrawColor(15, 23, 42);
+    doc.setLineWidth(0.5);
+    doc.line(R - 76, endY - 4, R, endY - 4);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.setTextColor(15, 23, 42);
+    doc.text("TOTAL OUTSTANDING A/R", R - 76, endY + 1);
+    doc.text(pdfMoney(totals.balance), R, endY + 1, { align: "right" });
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(100, 116, 139);
+    doc.text(`${rows.length} outstanding service${rows.length === 1 ? "" : "s"}`, L, endY + 1);
+
+    // ---------- footers ----------
+    // Written after every page exists, so "Page 1 of 9" is right on page 1 too - a per-page
+    // footer drawn during layout can only ever know the count so far.
+    const pages = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= pages; i++) {
+      doc.setPage(i);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(7);
+      doc.setTextColor(120, 130, 145);
+      doc.text(pdfText(`${PRACTICE_INFO.name} — Aging Report — generated ${fmtDate(TODAY)}`), L, H - 9);
+      doc.text(`Page ${i} of ${pages}`, R, H - 9, { align: "right" });
+    }
+
+    // A real application/pdf document handed to the browser's own viewer. Never window.print():
+    // printing is the reader's decision, taken from the viewer's toolbar.
+    const blob = doc.output("blob");
+    const url = URL.createObjectURL(blob);
+    if (tab) {
+      tab.location = url;
+      return { ok: true };
+    }
+    downloadBlob(filename, blob);
+    return { ok: true, popupBlocked: true };
+  } catch (err) {
+    if (tab) tab.close();
+    return { ok: false, error: `The PDF could not be generated: ${err?.message || err}` };
+  }
 }
 
 // ---------- Report PDF ----------
@@ -504,6 +911,57 @@ const DAILY_TXN_PAGE_SIZE = 25;
 // stamping them later), so those columns render as "—" rather than guessing an operator.
 const UNATTRIBUTED = "—";
 
+// ---------- Daily Transaction: accounting classification ----------
+//
+// The report has always carried `charge`, `adjustment` and `receipt`. Those three are left exactly
+// as they were - the CSV columns, the on-screen table and the existing totals all read them, and
+// changing them would silently restate historical reports.
+//
+// The fields below are ADDED alongside, and they exist because "receipt" lumps together three
+// things a manager must not see summed:
+//
+//   payment         real money received today
+//   creditTransfer  an existing credit moved onto another charge - NOT new money
+//   refund          money paid back out - NOT a collection
+//
+// Net collection is therefore payments minus refunds, with credit transfers and write-offs
+// deliberately excluded. A transfer that counted as a collection would overstate the day's
+// takings by exactly the amount that was already collected on some earlier day.
+
+// Applying a credit balance posts an ordinary Patient/Insurance Credit whose notes record where it
+// came from (see applyCreditBalance). That note is the only marker distinguishing moved money from
+// money received, so it is what this reads.
+function isAppliedCreditTransfer(posting) {
+  return typeof posting?.notes === "string" && posting.notes.startsWith("Applied from ");
+}
+
+// The five buckets §5 asks for, derived from the posting rather than invented.
+function dailyTxnMethodOf(posting) {
+  switch (posting.type) {
+    case "Check": return "Check";
+    case "Credit Card": return "Credit Card";
+    case "Insurance Credit": return "Insurance";
+    case "Patient Credit": {
+      const m = String(posting.method || "").toLowerCase();
+      if (m.includes("check")) return "Check";
+      if (m.includes("card")) return "Credit Card";
+      if (m.includes("cash")) return "Cash / Self";
+      return "Cash / Self";
+    }
+    default: return "Other";
+  }
+}
+
+// One of: Charge, Payment, Refund, Credit Transfer, Adjustment.
+function dailyTxnTypeOf(posting) {
+  if (posting.type === "Debit") {
+    // A debit is money leaving only when it is an actual refund; the "Credit Balance" variants
+    // keep the money in the practice as a credit pool, so they are a transfer, not a refund.
+    return String(posting.debitType || "").includes("Refund") ? "Refund" : "Credit Transfer";
+  }
+  return isAppliedCreditTransfer(posting) ? "Credit Transfer" : "Payment";
+}
+
 // posting.type is an internal posting kind, not a payment method. Map it onto the payment types
 // billing staff expect to see on a receipt report.
 function receiptPaymentType(posting) {
@@ -520,7 +978,7 @@ function receiptPaymentType(posting) {
 
 // Flattens charges + their postings into one uniform row shape. Both row kinds carry every field
 // the report can filter or group on, so downstream filtering never has to branch on kind.
-function buildDailyTransactionRows({ charges, patientById, transactions }) {
+function buildDailyTransactionRows({ charges, patientById, transactions, policies }) {
   // posting id -> batchId. Only payment-side transactions carry postingId (see addCharge and the
   // posting handlers in ClinicApp), which is the only link from a posting back to its batch.
   const batchByPostingId = new Map();
@@ -531,6 +989,10 @@ function buildDailyTransactionRows({ charges, patientById, transactions }) {
     const p = patientById[c.patientId] || {};
     const patientName = p.name || "";
     const patientAccount = c.patientId || "";
+
+    // The payer this charge is billed to, using the application's own rule rather than a second
+    // one invented here, so the report can never disagree with the Claim/Ledger screen.
+    const insurance = payerLabel(c, policies || []);
 
     rows.push({
       kind: "charge",
@@ -550,6 +1012,19 @@ function buildDailyTransactionRows({ charges, patientById, transactions }) {
       balance: balanceOf(c),
       user: c.postedBy || "",
       batchId: c.batchId || "",
+
+      // ---- added, never summed into the three above ----
+      insurance,
+      txnType: "Charge",
+      method: "",
+      payment: 0,
+      refund: 0,
+      creditTransfer: 0,
+      // Write-off and DOS credit are separate lines in the summary even though the existing
+      // `adjustment` column keeps showing their sum.
+      writeOff: Number(c.writeoff) || 0,
+      credit: Number(c.credits) || 0,
+      reason: "", notes: "",
     });
 
     // field === "paid" is money actually received. Write-off and DOS-credit postings are
@@ -558,6 +1033,8 @@ function buildDailyTransactionRows({ charges, patientById, transactions }) {
     (c.postings || []).forEach(pt => {
       if (pt.field !== "paid") return;
       const isDebit = pt.type === "Debit";
+      const txnType = dailyTxnTypeOf(pt);
+      const amount = Math.abs(Number(pt.amount) || 0);
       rows.push({
         kind: "receipt",
         key: `rct-${c.id}-${pt.id}`,
@@ -577,6 +1054,22 @@ function buildDailyTransactionRows({ charges, patientById, transactions }) {
         balance: 0,
         user: pt.postedBy || "",
         batchId: batchByPostingId.get(pt.id) || "",
+
+        // ---- added ----
+        // An insurance posting names its own payer; anything else is billed to the charge's payer.
+        insurance: pt.insuranceName || insurance,
+        txnType,
+        method: dailyTxnMethodOf(pt),
+        // Exactly one of these three carries the amount, so no summary can count it twice.
+        payment: txnType === "Payment" ? amount : 0,
+        refund: txnType === "Refund" ? amount : 0,
+        creditTransfer: txnType === "Credit Transfer" ? amount : 0,
+        writeOff: 0,
+        credit: 0,
+        reason: pt.reason || "",
+        notes: pt.notes || "",
+        checkNumber: pt.checkNumber || "",
+        reference: pt.reference || "",
       });
     });
   });
@@ -609,7 +1102,19 @@ const DAILY_TXN_DEFAULTS = {
   batchIds: [],
   includeCharges: true,
   includeReceipts: true,
+
+  // Added filters. "all" keeps every existing report behaving exactly as before.
+  insuranceMode: "all",       // "all" | "specific"
+  insurances: [],
+  txnTypeMode: "all",         // "all" | "specific"
+  txnTypes: [],
+  methodMode: "all",          // "all" | "specific"
+  methods: [],
+  patientQuery: "",           // free text: name or account
 };
+
+const DAILY_TXN_TYPES = ["Charge", "Payment", "Refund", "Credit Transfer"];
+const DAILY_TXN_METHODS = ["Check", "Credit Card", "Cash / Self", "Insurance", "Other"];
 
 function validateDailyTxnFilters(f) {
   const errors = {};
@@ -669,6 +1174,16 @@ function generateDailyTransactionReport(filters, rows) {
   if (f.batchMode === "specific") { const s = new Set(f.batchIds); out = out.filter(r => r.batchId && s.has(r.batchId)); }
   if (f.procedureMode === "specific") { const s = new Set(f.procedureCodes); out = out.filter(r => s.has(r.cpt)); }
 
+  // Added filters, applied in the same pipeline so the detail table, every summary section, the
+  // CSV and the PDF are all narrowed by exactly the same pass.
+  if (f.insuranceMode === "specific") { const s = new Set(f.insurances); out = out.filter(r => s.has(r.insurance)); }
+  if (f.txnTypeMode === "specific") { const s = new Set(f.txnTypes); out = out.filter(r => s.has(r.txnType)); }
+  if (f.methodMode === "specific") { const s = new Set(f.methods); out = out.filter(r => r.method && s.has(r.method)); }
+  if (String(f.patientQuery || "").trim()) {
+    const q = f.patientQuery.trim().toLowerCase();
+    out = out.filter(r => `${r.patientName} ${r.patientAccount}`.toLowerCase().includes(q));
+  }
+
   out = [...out].sort((a, b) =>
     (dailyTxnDateOf(a, f.basedOn) || "").localeCompare(dailyTxnDateOf(b, f.basedOn) || "") ||
     a.patientName.localeCompare(b.patientName) ||
@@ -685,7 +1200,121 @@ function generateDailyTransactionReport(filters, rows) {
     remainingBalance: out.reduce((s, r) => s + r.balance, 0),
   };
 
-  return { rows: out, totals, filters: f };
+  // One summary, computed once from the filtered rows and carried on the result, so the preview,
+  // the CSV, the PDF and the print view cannot each arrive at a different number.
+  return { rows: out, totals, summary: buildDailyTxnSummary(out), filters: f };
+}
+
+// ---------- Daily Transaction: summary engine ----------
+//
+// Every summary section in the report, the PDF and the print view is produced here, from the
+// SAME filtered rows the detail table shows. That is what makes "web = CSV = PDF" structurally
+// true rather than a promise: there is one dataset and one set of totals, and no section
+// recomputes anything from the raw charges.
+//
+// The accounting rules it enforces, from the report's own definitions:
+//   - a credit transfer is movement of money already collected, never a new collection;
+//   - a refund is money returned, never a negative payment folded into the payment total;
+//   - net collection = payments - refunds, with write-offs and transfers deliberately excluded.
+
+/** Adds `row` into `bucket`, creating it on first sight. */
+function dailyTxnAccumulate(map, key, row) {
+  let b = map.get(key);
+  if (!b) {
+    b = { name: key, count: 0, charges: 0, payments: 0, writeOffs: 0, credits: 0, refunds: 0, creditTransfers: 0, balance: 0 };
+    map.set(key, b);
+  }
+  b.count += 1;
+  b.charges += row.charge;
+  b.payments += row.payment;
+  b.writeOffs += row.writeOff;
+  b.credits += row.credit;
+  b.refunds += row.refund;
+  b.creditTransfers += row.creditTransfer;
+  b.balance += row.balance;
+  return b;
+}
+
+const dailyTxnSorted = (map) => [...map.values()].sort((a, b) => (b.charges + b.payments) - (a.charges + a.payments));
+
+function buildDailyTxnSummary(rows) {
+  const totals = {
+    charges: 0, payments: 0, writeOffs: 0, credits: 0, refunds: 0, creditTransfers: 0, balance: 0,
+  };
+  const byMethod = new Map();
+  const byInsurance = new Map();
+  const byPhysician = new Map();
+  const byUser = new Map();
+  const byCpt = new Map();
+
+  const checks = [];
+  const cards = [];
+  const selfPayments = [];
+  const refundRows = [];
+  const transferRows = [];
+  const writeOffRows = [];
+
+  const counts = {
+    charges: 0, payments: 0, checks: 0, creditCards: 0, selfPayments: 0,
+    insurancePayments: 0, creditTransfers: 0, refunds: 0, writeOffs: 0,
+  };
+
+  for (const r of rows) {
+    totals.charges += r.charge;
+    totals.payments += r.payment;
+    totals.writeOffs += r.writeOff;
+    totals.credits += r.credit;
+    totals.refunds += r.refund;
+    totals.creditTransfers += r.creditTransfer;
+    totals.balance += r.balance;
+
+    dailyTxnAccumulate(byInsurance, r.insurance || "Unassigned", r);
+    dailyTxnAccumulate(byPhysician, r.doctor || UNATTRIBUTED, r);
+    dailyTxnAccumulate(byUser, r.user || UNATTRIBUTED, r);
+    if (r.cpt) dailyTxnAccumulate(byCpt, r.cpt, r);
+
+    if (r.kind === "charge") {
+      counts.charges += 1;
+      if (r.writeOff > 0) { counts.writeOffs += 1; writeOffRows.push(r); }
+      continue;
+    }
+
+    // Only real payments belong in the payment-method breakdown. A refund or a transfer carries a
+    // method too, but putting either here would make the method totals stop agreeing with the
+    // payment total.
+    if (r.txnType === "Payment") {
+      counts.payments += 1;
+      dailyTxnAccumulate(byMethod, r.method || "Other", r);
+      if (r.method === "Check") { counts.checks += 1; checks.push(r); }
+      else if (r.method === "Credit Card") { counts.creditCards += 1; cards.push(r); }
+      else if (r.method === "Insurance") counts.insurancePayments += 1;
+      else { counts.selfPayments += 1; selfPayments.push(r); }
+    } else if (r.txnType === "Refund") {
+      counts.refunds += 1;
+      refundRows.push(r);
+    } else if (r.txnType === "Credit Transfer") {
+      counts.creditTransfers += 1;
+      transferRows.push(r);
+    }
+  }
+
+  // The headline figure, and the only one people act on. Stated as a formula in the UI too, so
+  // nobody has to guess whether write-offs were deducted.
+  totals.netCollection = totals.payments - totals.refunds;
+
+  return {
+    totals,
+    counts,
+    byMethod: dailyTxnSorted(byMethod),
+    byInsurance: dailyTxnSorted(byInsurance),
+    byPhysician: dailyTxnSorted(byPhysician),
+    byUser: dailyTxnSorted(byUser),
+    byCpt: dailyTxnSorted(byCpt),
+    checks, cards, selfPayments,
+    refunds: refundRows,
+    transfers: transferRows,
+    writeOffs: writeOffRows,
+  };
 }
 
 // Column visibility is derived once here and consumed by the preview table, the CSV and the
@@ -740,6 +1369,19 @@ function dailyTxnFilename(filters, batchLabelById = {}) {
   else if (f.batchMode === "specific" && f.batchIds.length === 1) scope = `_Batch_${safe(batchLabelById[f.batchIds[0]] || f.batchIds[0])}`;
   const span = f.reportFrom === "closing" ? "Closing" : `${f.startDate || "all"}_to_${f.endDate || "all"}`;
   return `Daily_Transaction_Report${scope}_${span}.csv`;
+}
+
+// Same naming rules as the CSV, plus the insurance scope, and sanitised so a payer name with a
+// slash or an ampersand cannot produce a file the browser refuses to save.
+function dailyTxnPdfFilename(filters, batchLabelById = {}) {
+  const f = { ...DAILY_TXN_DEFAULTS, ...filters };
+  const parts = ["Daily_Transaction_Report"];
+  if (f.insuranceMode === "specific" && f.insurances.length === 1) parts.push(f.insurances[0]);
+  if (f.doctorMode === "specific" && f.doctors.length === 1) parts.push(f.doctors[0]);
+  if (f.userMode === "specific" && f.users.length === 1) parts.push(f.users[0]);
+  if (f.batchMode === "specific" && f.batchIds.length === 1) parts.push("Batch_" + (batchLabelById[f.batchIds[0]] || f.batchIds[0]));
+  parts.push(f.reportFrom === "closing" ? "Closing" : `${f.startDate || "all"}_to_${f.endDate || "all"}`);
+  return safeFilename(...parts) + ".pdf";
 }
 
 // Opens an uploaded ID document in a separate, small popup window — never a same-tab navigation
@@ -1030,6 +1672,290 @@ function FileDrop({ label, value, onChange }) {
 
 // ---------- Main App ----------
 
+// ---------- Multi-factor authentication ----------
+//
+// Sits between the existing password step and the application. The password screen below is
+// untouched: when the API answers "a second factor is outstanding" it hands control here, and
+// this component hands back a completed credential exactly as signIn() would have.
+
+/** Six separate boxes that behave like one field: paste, arrow keys and backspace all work. */
+function CodeInput({ value, onChange, onComplete, disabled }) {
+  const refs = useRef([]);
+  const digits = String(value || "").padEnd(6, " ").slice(0, 6).split("");
+
+  function setAt(i, ch) {
+    const next = digits.map((d, j) => (j === i ? ch : d)).join("").replace(/\s/g, "");
+    onChange(next);
+    if (ch && i < 5) refs.current[i + 1]?.focus();
+    if (next.length === 6 && onComplete) onComplete(next);
+  }
+
+  return (
+    <div className="flex gap-2 justify-center" role="group" aria-label="Six digit verification code">
+      {digits.map((d, i) => (
+        <input
+          key={i}
+          ref={(el) => (refs.current[i] = el)}
+          inputMode="numeric"
+          autoComplete={i === 0 ? "one-time-code" : "off"}
+          maxLength={1}
+          disabled={disabled}
+          aria-label={`Digit ${i + 1}`}
+          value={d.trim()}
+          onChange={(e) => setAt(i, e.target.value.replace(/\D/g, "").slice(-1))}
+          onKeyDown={(e) => {
+            if (e.key === "Backspace" && !d.trim() && i > 0) refs.current[i - 1]?.focus();
+            if (e.key === "ArrowLeft" && i > 0) refs.current[i - 1]?.focus();
+            if (e.key === "ArrowRight" && i < 5) refs.current[i + 1]?.focus();
+          }}
+          onPaste={(e) => {
+            const pasted = e.clipboardData.getData("text").replace(/\D/g, "").slice(0, 6);
+            if (!pasted) return;
+            e.preventDefault();
+            onChange(pasted);
+            if (pasted.length === 6 && onComplete) onComplete(pasted);
+            refs.current[Math.min(pasted.length, 5)]?.focus();
+          }}
+          className="w-11 h-13 py-3 text-center text-lg font-semibold border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-teal-500 disabled:bg-slate-100"
+        />
+      ))}
+    </div>
+  );
+}
+
+/** The "trust this device" choice, with the warning that belongs next to it. */
+function TrustDeviceCheckbox({ checked, onChange, disabled }) {
+  return (
+    <div className="mt-5 border border-slate-200 rounded-lg p-3 bg-slate-50">
+      <label className="flex items-start gap-2.5 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.checked)}
+          className="mt-0.5 w-4 h-4 accent-teal-600"
+        />
+        <span>
+          <span className="text-sm font-medium text-slate-700 block">Trust this device for 30 days</span>
+          <span className="text-xs text-slate-500 block mt-0.5">
+            You won&apos;t be asked for your authenticator code again on this device for 30 days.
+          </span>
+        </span>
+      </label>
+      <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1.5 mt-2.5 flex items-start gap-1.5">
+        <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+        <span>Only select this on a private, trusted computer — never on a shared, public or library machine.</span>
+      </p>
+    </div>
+  );
+}
+
+/** Step 2 of signing in: enter the 6-digit code. */
+function MfaVerifyScreen({ challenge, onVerified, onCancel }) {
+  const [code, setCode] = useState("");
+  const [trust, setTrust] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [useBackup, setUseBackup] = useState(false);
+  const [backup, setBackup] = useState("");
+
+  async function submit(value) {
+    const entered = (useBackup ? backup : value ?? code).trim();
+    if (!entered) return;
+    setBusy(true);
+    setError("");
+    try {
+      const credential = await verifyMfa(challenge, entered, trust);
+      onVerified(credential);
+    } catch (err) {
+      // Stays on this screen, as required - a rejected code is not a reason to send someone back
+      // to re-type their password.
+      setError(err?.message || "That code is not valid. Check your authenticator app and try again.");
+      setCode("");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AuthShell title="Authenticator verification" subtitle="Enter the 6-digit code from your authenticator app.">
+      {!useBackup ? (
+        <>
+          <label className="text-xs text-slate-500 block mb-2 text-center">Verification code</label>
+          <CodeInput value={code} onChange={setCode} onComplete={(v) => submit(v)} disabled={busy} />
+        </>
+      ) : (
+        <>
+          <label className="text-xs text-slate-500 block mb-2">Backup code</label>
+          <input
+            className={inputCls}
+            placeholder="XXXXX-XXXXX"
+            value={backup}
+            onChange={(e) => setBackup(e.target.value.toUpperCase())}
+            disabled={busy}
+          />
+          <p className="text-xs text-slate-400 mt-1">Each backup code works once.</p>
+        </>
+      )}
+
+      <TrustDeviceCheckbox checked={trust} onChange={setTrust} disabled={busy} />
+
+      {error && <p className="text-rose-600 text-xs mt-3 text-center">{error}</p>}
+
+      <button
+        onClick={() => submit()}
+        disabled={busy || (useBackup ? !backup.trim() : code.length !== 6)}
+        className="w-full mt-4 bg-teal-600 text-white text-sm font-medium py-2.5 rounded-lg hover:bg-teal-700 disabled:opacity-50"
+      >
+        {busy ? "Verifying…" : "Verify & continue"}
+      </button>
+
+      <div className="flex items-center justify-between mt-4 text-xs">
+        <button onClick={() => { setUseBackup(!useBackup); setError(""); }} className="text-teal-700 hover:underline">
+          {useBackup ? "Use authenticator code" : "Use a backup code"}
+        </button>
+        <button onClick={onCancel} className="text-slate-500 hover:underline">Back to sign in</button>
+      </div>
+    </AuthShell>
+  );
+}
+
+/** First-time enrolment: scan the QR, confirm a code, save the backup codes. */
+function MfaEnrollScreen({ challenge, email, onEnrolled, onCancel }) {
+  const [setup, setSetup] = useState(null);
+  const [qr, setQr] = useState("");
+  const [code, setCode] = useState("");
+  const [trust, setTrust] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [codes, setCodes] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [pending, setPending] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    startMfaEnrollment(challenge)
+      .then(async (s) => {
+        if (cancelled) return;
+        setSetup(s);
+        // Rendered locally: the secret never leaves the browser to become a QR somewhere else.
+        const QRCode = (await import("qrcode")).default;
+        const url = await QRCode.toDataURL(s.otpauth, { width: 220, margin: 1 });
+        if (!cancelled) setQr(url);
+      })
+      .catch((e) => !cancelled && setError(e?.message || "Could not start setup."));
+    return () => { cancelled = true; };
+  }, [challenge]);
+
+  async function confirm() {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await confirmMfaEnrollment(challenge, code.trim(), trust);
+      setCodes(res.backupCodes || []);
+      setPending(res.token ? { uid: res.user?.uid, email: res.user?.email } : null);
+      setBusy(false);
+    } catch (err) {
+      setError(err?.message || "That code is not valid.");
+      setCode("");
+      setBusy(false);
+    }
+  }
+
+  // Backup codes are shown once and never again, so finishing is gated on acknowledging them.
+  if (codes) {
+    return (
+      <AuthShell title="Save your backup codes" subtitle="These are shown once. Store them somewhere safe.">
+        <div className="grid grid-cols-2 gap-1.5 bg-slate-50 border border-slate-200 rounded-lg p-3 font-mono text-sm text-slate-700">
+          {codes.map((c) => <div key={c} className="text-center py-0.5">{c}</div>)}
+        </div>
+        <p className="text-xs text-slate-500 mt-3">
+          Each code signs you in once if you lose your phone. Print them or put them in a password manager.
+        </p>
+        <button
+          onClick={() => { navigator.clipboard?.writeText(codes.join("\n")); setSaved(true); }}
+          className="w-full mt-3 border border-slate-300 text-slate-700 text-sm py-2 rounded-lg hover:bg-slate-50"
+        >
+          {saved ? "Copied" : "Copy codes"}
+        </button>
+        <button
+          onClick={() => onEnrolled(pending)}
+          className="w-full mt-2 bg-teal-600 text-white text-sm font-medium py-2.5 rounded-lg hover:bg-teal-700"
+        >
+          I&apos;ve saved them — continue
+        </button>
+      </AuthShell>
+    );
+  }
+
+  return (
+    <AuthShell title="Set up authenticator" subtitle="Two-step verification is required for this account.">
+      <ol className="text-xs text-slate-500 space-y-1 mb-3 list-decimal list-inside">
+        <li>Install Google Authenticator, Authy, 1Password or Microsoft Authenticator.</li>
+        <li>Scan this code with it.</li>
+        <li>Enter the 6-digit code it shows.</li>
+      </ol>
+
+      <div className="flex justify-center mb-3">
+        {qr
+          ? <img src={qr} alt="Authenticator setup QR code" className="border border-slate-200 rounded-lg" />
+          : <div className="w-[220px] h-[220px] bg-slate-100 rounded-lg animate-pulse" />}
+      </div>
+
+      {setup && (
+        <details className="mb-3">
+          <summary className="text-xs text-teal-700 cursor-pointer">Can&apos;t scan? Enter the key manually</summary>
+          <div className="mt-2 text-xs">
+            <div className="text-slate-400">Account</div>
+            <div className="text-slate-700 mb-1.5">{email || setup.account}</div>
+            <div className="text-slate-400">Key</div>
+            <code className="block bg-slate-50 border border-slate-200 rounded px-2 py-1.5 break-all text-slate-700">{setup.secret}</code>
+          </div>
+        </details>
+      )}
+
+      <label className="text-xs text-slate-500 block mb-2 text-center">Enter the 6-digit code</label>
+      <CodeInput value={code} onChange={setCode} onComplete={() => {}} disabled={busy || !setup} />
+
+      <TrustDeviceCheckbox checked={trust} onChange={setTrust} disabled={busy} />
+
+      {error && <p className="text-rose-600 text-xs mt-3 text-center">{error}</p>}
+
+      <button
+        onClick={confirm}
+        disabled={busy || code.length !== 6 || !setup}
+        className="w-full mt-4 bg-teal-600 text-white text-sm font-medium py-2.5 rounded-lg hover:bg-teal-700 disabled:opacity-50"
+      >
+        {busy ? "Verifying…" : "Turn on two-step verification"}
+      </button>
+      <button onClick={onCancel} className="w-full mt-2 text-slate-500 text-xs hover:underline">Back to sign in</button>
+    </AuthShell>
+  );
+}
+
+/** Shared frame for the auth screens, matching the existing login card. */
+function AuthShell({ title, subtitle, children }) {
+  return (
+    <div className="min-h-[700px] bg-slate-50 flex items-center justify-center p-6 font-sans">
+      <div className="w-full max-w-sm">
+        <div className="flex items-center gap-2 justify-center mb-6">
+          <div className="w-9 h-9 rounded-lg bg-teal-500 flex items-center justify-center text-white">
+            <Stethoscope size={18} />
+          </div>
+          <div className="text-slate-800 font-semibold text-lg">{PRACTICE_INFO.name}</div>
+        </div>
+        <Card className="p-6">
+          <div className="flex items-center gap-2 mb-1">
+            <ShieldCheck size={16} className="text-teal-600" />
+            <h1 className="text-base font-semibold text-slate-800">{title}</h1>
+          </div>
+          <p className="text-xs text-slate-500 mb-5">{subtitle}</p>
+          {children}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 function LoginPage({ onLogin }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -1038,12 +1964,53 @@ function LoginPage({ onLogin }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // Set when the API says a second factor is outstanding. The password form below is unchanged;
+  // this simply swaps which screen is rendered until verification completes.
+  const [mfa, setMfa] = useState(null);
+
+  // Shared tail of a successful sign-in, reached either straight from the password step (when no
+  // second factor is outstanding) or after verification. One place, so the profile and disabled
+  // checks cannot drift apart between the two routes.
+  async function finishLogin(credential) {
+    const profile = await fetchUserProfile(credential.user.uid);
+    if (!profile) {
+      await signOutUser();
+      setMfa(null);
+      setError("No profile found for this account. Ask an admin to provision your access.");
+      setLoading(false);
+      return;
+    }
+    if (profile.disabled) {
+      await signOutUser();
+      setMfa(null);
+      setError("This account has been deactivated. Contact an administrator.");
+      setLoading(false);
+      return;
+    }
+    setLoading(false);
+    onLogin({ uid: credential.user.uid, email: credential.user.email, name: profile.name, role: profile.role });
+  }
+
+  if (mfa) {
+    const back = () => { setMfa(null); setPassword(""); setError(""); };
+    return mfa.enroll
+      ? <MfaEnrollScreen challenge={mfa.challenge} email={mfa.email} onCancel={back}
+          onEnrolled={(user) => user ? finishLogin({ user }) : back()} />
+      : <MfaVerifyScreen challenge={mfa.challenge} onCancel={back} onVerified={finishLogin} />;
+  }
+
   async function submit(e) {
     e.preventDefault();
     setLoading(true);
     setError("");
     try {
       const credential = await signIn(email.trim(), password);
+      // No session token was stored: a code (or first-time setup) is still outstanding.
+      if (credential.mfa) {
+        setMfa(credential.mfa);
+        setLoading(false);
+        return;
+      }
       const profile = await fetchUserProfile(credential.user.uid);
       if (!profile) {
         await signOutUser();
@@ -1371,6 +2338,7 @@ function ClinicApp({
   const [showPracticeCatalog, setShowPracticeCatalog] = useState(false);
   const [showInsuranceAdmin, setShowInsuranceAdmin] = useState(false);
   const [showChangePassword, setShowChangePassword] = useState(false);
+  const [showSecurity, setShowSecurity] = useState(false);
   const [showSupportPanel, setShowSupportPanel] = useState(false);
   const [showTicklerPanel, setShowTicklerPanel] = useState(false);
   const [ticklerPrefill, setTicklerPrefill] = useState(null); // set to open the Tickler panel pre-filled from a charge
@@ -1435,6 +2403,40 @@ function ClinicApp({
   // The batch this user currently has open, if any — a user can only ever have one (batches are
   // keyed by userId+date, see openBatch), so there's at most one OPEN doc for this uid at a time.
   const myOpenBatch = batches.find(b => b.userId === session.uid && b.status === "OPEN") || null;
+
+  // ----- Posting sessions with money still to allocate -----
+  //
+  // A cheque or remittance is entered with a total, and the biller allocates it across claims one
+  // at a time. That leftover lives only in the posting screen's own state - it is not a database
+  // figure - so closing the batch is the last moment anything can notice it. Each posting screen
+  // reports its progress here, and closeBatch() refuses while any of it is unallocated.
+  const [postingSessions, setPostingSessions] = useState({});
+  const [blockedClose, setBlockedClose] = useState(null);
+
+  // Stable identity, and a no-op when nothing actually changed: the posting screens call this from
+  // an effect, so returning a new object every time would loop.
+  const reportPostingSession = useCallback((key, sessionInfo) => {
+    setPostingSessions(prev => {
+      if (!sessionInfo) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      const cur = prev[key];
+      if (cur && cur.total === sessionInfo.total && cur.allocated === sessionInfo.allocated && cur.reference === sessionInfo.reference) {
+        return prev;
+      }
+      return { ...prev, [key]: sessionInfo };
+    });
+  }, []);
+
+  const unallocatedSessions = useMemo(
+    () => Object.entries(postingSessions)
+      .map(([key, v]) => ({ key, ...v, remaining: (Number(v.total) || 0) - (Number(v.allocated) || 0) }))
+      .filter(v => v.remaining > BALANCE_EPSILON),
+    [postingSessions]
+  );
   const isBillingOversightRole = session.role === "SUPER_ADMIN" || session.role === "MANAGER";
   const insurancePerms = useInsurancePermissions(session, rolePermissions);
   // Badge on the floating Tickler button: open items assigned to me that are due today or overdue.
@@ -2067,6 +3069,13 @@ function ClinicApp({
 
   function closeBatch() {
     if (!myOpenBatch) return;
+    // Money entered but not yet posted would be stranded by a closed batch: the payment screens
+    // reset, and nothing in the database records that a cheque was short-allocated. Refuse, and
+    // say exactly how much is outstanding on which payment.
+    if (unallocatedSessions.length > 0) {
+      setBlockedClose(unallocatedSessions);
+      return;
+    }
     updateDocument("batches", myOpenBatch.id, { status: "CLOSED", closedAt: nowIso() });
     addAudit(null, "Batch closed", "batch", myOpenBatch.id, "OPEN", "CLOSED");
   }
@@ -2136,6 +3145,7 @@ function ClinicApp({
               isAccountAdmin={isAccountAdmin}
               onOpenBatchManagement={() => setShowBatchManagement(true)}
               onOpenChangePassword={() => setShowChangePassword(true)}
+              onOpenSecurity={() => setShowSecurity(true)}
               onOpenUserAdmin={() => setShowUserAdmin(true)}
               onOpenManageRoles={() => setShowManageRoles(true)}
               onOpenPracticeCatalog={() => setShowPracticeCatalog(true)}
@@ -2262,6 +3272,9 @@ function ClinicApp({
                 policies={policies}
                 onPostManualLine={postManualLinePayment}
                 onPostERA={postERABatch}
+                onSelectChargeInsurance={selectInsuranceForCharge}
+                onSetSelfPay={setSelfPayForCharge}
+                onPostingSession={reportPostingSession}
                 hasOpenBatch={!!myOpenBatch}
               />
             )}
@@ -2359,6 +3372,42 @@ function ClinicApp({
       {showBatchManagement && (
         <Modal title="Batch Management" onClose={() => setShowBatchManagement(false)} wide>
           <BatchManagement batches={batches} session={session} isOversight={isBillingOversightRole} myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
+        </Modal>
+      )}
+
+      {showSecurity && (
+        <Modal title="Security & trusted devices" onClose={() => setShowSecurity(false)}>
+          <SecuritySettings />
+        </Modal>
+      )}
+
+      {blockedClose && (
+        <Modal title="Batch still has money to post" onClose={() => setBlockedClose(null)}>
+          <p className="text-sm text-slate-600 mb-3">
+            This batch cannot be closed yet. The payment{blockedClose.length === 1 ? "" : "s"} below
+            still {blockedClose.length === 1 ? "has" : "have"} an amount that has not been posted to a claim.
+          </p>
+          <div className="space-y-2 mb-4">
+            {blockedClose.map(u => (
+              <div key={u.key} className="border border-amber-200 bg-amber-50 rounded-lg px-3 py-2.5">
+                <div className="text-sm font-medium text-slate-800">{u.label}</div>
+                {u.reference && <div className="text-xs text-slate-500">Reference {u.reference}</div>}
+                <div className="grid grid-cols-3 gap-2 mt-1.5 text-xs">
+                  <div><span className="text-slate-400 block">Payment</span>{money(u.total)}</div>
+                  <div><span className="text-slate-400 block">Posted</span>{money(u.allocated)}</div>
+                  <div><span className="text-slate-400 block">Left to post</span>
+                    <span className="font-semibold text-amber-700">{money(u.remaining)}</span></div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-slate-500 mb-4">
+            Post the remaining amount against a claim, or clear the payment amount if it was entered in
+            error. Closing the batch now would leave that money unrecorded.
+          </p>
+          <button onClick={() => setBlockedClose(null)} className="w-full bg-slate-800 text-white text-sm font-medium py-2 rounded-lg hover:bg-slate-900">
+            Go back and finish posting
+          </button>
         </Modal>
       )}
 
@@ -2491,7 +3540,7 @@ function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
 // The gear menu is the app's admin surface: everyone gets batch management and their own
 // password; a Super Admin additionally gets the two account screens, which is why User accounts
 // no longer sits in the top nav.
-function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassword, onOpenUserAdmin, onOpenManageRoles, onOpenPracticeCatalog, onOpenInsuranceAdmin, canManageInsurance }) {
+function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassword, onOpenSecurity, onOpenUserAdmin, onOpenManageRoles, onOpenPracticeCatalog, onOpenInsuranceAdmin, canManageInsurance }) {
   const [open, setOpen] = useState(false);
   const itemCls = "w-full text-left px-3 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2";
   return (
@@ -2503,6 +3552,7 @@ function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassw
         <div onMouseLeave={() => setOpen(false)} className="absolute right-0 top-full mt-2 w-56 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50 text-slate-700">
           <button onClick={() => { onOpenBatchManagement(); setOpen(false); }} className={itemCls}><Landmark size={13} /> Batch Management</button>
           <button onClick={() => { onOpenChangePassword(); setOpen(false); }} className={itemCls}><KeyRound size={13} /> Change password…</button>
+          <button onClick={() => { onOpenSecurity(); setOpen(false); }} className={itemCls}><ShieldCheck size={13} /> Security &amp; trusted devices</button>
           {(isAccountAdmin || canManageInsurance) && (
             <div className="border-t border-slate-100 mt-1.5 pt-1.5 px-3 pb-1 text-[10px] font-medium uppercase tracking-wide text-slate-400">Administration</div>
           )}
@@ -2517,6 +3567,168 @@ function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassw
             </>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Settings: Security / Trusted Devices ----------
+//
+// Shows only what the browser can actually tell us: the User-Agent it sent, when the device was
+// last used, and when its trust expires. No hardware model, no location, no "device fingerprint" -
+// presenting a guess would invite people to make a security decision on a value we cannot stand
+// behind.
+
+function SecuritySettings() {
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const [confirmAll, setConfirmAll] = useState(false);
+
+  async function load() {
+    try {
+      const next = await securityStatus();
+      setStatus(next);
+      setError("");
+    } catch (e) {
+      setError(e?.message || "Could not load your security settings.");
+    }
+  }
+
+  useEffect(() => {
+    // Guarded so a close-then-reopen in flight cannot write into an unmounted component.
+    let live = true;
+    securityStatus()
+      .then((next) => live && setStatus(next))
+      .catch((e) => live && setError(e?.message || "Could not load your security settings."));
+    return () => { live = false; };
+  }, []);
+
+  async function revokeOne(id) {
+    setBusy(id);
+    try {
+      await revokeTrustedDevice(id);
+      const devices = await listTrustedDevices();
+      setStatus((s) => ({ ...s, trustedDevices: devices }));
+    } catch (e) {
+      setError(e?.message || "Could not revoke that device.");
+    }
+    setBusy("");
+  }
+
+  async function revokeEverything() {
+    setBusy("all");
+    try {
+      await revokeAllTrustedDevices();
+      await load();
+      setConfirmAll(false);
+    } catch (e) {
+      setError(e?.message || "Could not revoke your trusted devices.");
+    }
+    setBusy("");
+  }
+
+  if (!status) {
+    return <Card className="p-4"><p className="text-sm text-slate-400">{error || "Loading…"}</p></Card>;
+  }
+
+  const devices = status.trustedDevices || [];
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <SectionTitle>Two-step verification</SectionTitle>
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="flex items-center gap-2 text-sm">
+              <ShieldCheck size={15} className={status.enabled ? "text-emerald-600" : "text-slate-400"} />
+              <span className={status.enabled ? "text-emerald-700 font-medium" : "text-slate-500"}>
+                {status.enabled ? "On — authenticator app" : "Not set up"}
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">
+              {status.enforced
+                ? "Required for every account in this practice."
+                : "Optional for your account."}
+            </p>
+          </div>
+          {status.enabled && (
+            <div className="text-right">
+              <div className="text-xs text-slate-400">Backup codes left</div>
+              <div className={`text-lg font-semibold ${status.backupCodesLeft <= 2 ? "text-amber-600" : "text-slate-700"}`}>
+                {status.backupCodesLeft}
+              </div>
+            </div>
+          )}
+        </div>
+        {status.enabled && status.backupCodesLeft <= 2 && (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1.5 mt-2">
+            You are running low on backup codes. If you lose your phone with none left, an administrator
+            will have to reset your account.
+          </p>
+        )}
+      </Card>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-1">
+          <SectionTitle>Trusted devices</SectionTitle>
+          {devices.length > 0 && (
+            <button onClick={() => setConfirmAll(true)} className="text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2.5 py-1.5 hover:bg-rose-100">
+              Revoke all
+            </button>
+          )}
+        </div>
+        <p className="text-xs text-slate-500 mb-3">
+          Browsers that can sign in without an authenticator code, for up to {status.trustedDeviceDays} days.
+        </p>
+
+        {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+
+        <div className="space-y-2">
+          {devices.map((d) => (
+            <div key={d.id} className="flex items-center justify-between border border-slate-200 rounded-lg px-3 py-2.5">
+              <div>
+                <div className="text-sm text-slate-700 flex items-center gap-2">
+                  {d.label || "Unknown browser"}
+                  {d.current && <span className="text-[10px] bg-teal-50 text-teal-700 border border-teal-200 rounded-full px-1.5 py-0.5">This device</span>}
+                </div>
+                <div className="text-xs text-slate-400 mt-0.5">
+                  Last used {d.lastUsedAt ? fmtDateTime(d.lastUsedAt.slice(0, 16).replace("T", " ")) : "never"}
+                  {" · "}Trusted until {fmtDate(d.expiresAt.slice(0, 10))}
+                </div>
+              </div>
+              <button
+                onClick={() => revokeOne(d.id)}
+                disabled={busy === d.id}
+                className="text-xs text-slate-600 border border-slate-200 rounded-lg px-2.5 py-1.5 hover:bg-slate-50 disabled:opacity-50"
+              >
+                {busy === d.id ? "Revoking…" : "Revoke"}
+              </button>
+            </div>
+          ))}
+          {devices.length === 0 && (
+            <p className="text-sm text-slate-400">
+              No trusted devices. Every sign-in asks for an authenticator code.
+            </p>
+          )}
+        </div>
+      </Card>
+
+      {confirmAll && (
+        <Modal title="Revoke all trusted devices?" onClose={() => setConfirmAll(false)}>
+          <p className="text-sm text-slate-600 mb-1">
+            All devices will be required to complete verification again — including this one.
+          </p>
+          <p className="text-xs text-slate-400 mb-4">
+            You will stay signed in now, but your next sign-in here will ask for a code.
+          </p>
+          <div className="flex gap-2">
+            <button onClick={() => setConfirmAll(false)} className="flex-1 border border-slate-200 text-slate-600 text-sm py-2 rounded-lg hover:bg-slate-50">Cancel</button>
+            <button onClick={revokeEverything} disabled={busy === "all"} className="flex-1 bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700 disabled:opacity-50">
+              {busy === "all" ? "Revoking…" : "Revoke all"}
+            </button>
+          </div>
+        </Modal>
       )}
     </div>
   );
@@ -3116,7 +4328,7 @@ function BillingSearch({ patients, policies, patientBalance, onSelect }) {
 
 // ---------- Billing: post payments (manual + electronic 835) ----------
 
-function PaymentPosting({ charges, claims, patients, patientById, chargeById, policies, onPostManualLine, onPostERA, hasOpenBatch }) {
+function PaymentPosting({ charges, claims, patients, patientById, chargeById, policies, onPostManualLine, onPostERA, onSelectChargeInsurance, onSetSelfPay, onPostingSession, hasOpenBatch }) {
   const [mode, setMode] = useState("manual");
   return (
     <div>
@@ -3137,110 +4349,545 @@ function PaymentPosting({ charges, claims, patients, patientById, chargeById, po
         </button>
       </div>
 
-      {mode === "manual" && <ManualPosting charges={charges} patientById={patientById} policies={policies} onPostManualLine={onPostManualLine} hasOpenBatch={hasOpenBatch} />}
-      {mode === "electronic" && <ElectronicRemittance charges={charges} claims={claims} patientById={patientById} chargeById={chargeById} onPostERA={onPostERA} hasOpenBatch={hasOpenBatch} />}
+      {mode === "manual" && <ManualPosting charges={charges} claims={claims} patients={patients} patientById={patientById} policies={policies} onPostManualLine={onPostManualLine} onSelectChargeInsurance={onSelectChargeInsurance} onSetSelfPay={onSetSelfPay} onPostingSession={onPostingSession} hasOpenBatch={hasOpenBatch} />}
+      {mode === "electronic" && <ElectronicRemittance charges={charges} claims={claims} patientById={patientById} chargeById={chargeById} onPostERA={onPostERA} onPostingSession={onPostingSession} hasOpenBatch={hasOpenBatch} />}
     </div>
   );
 }
 
-function ManualPosting({ charges, patientById, policies, onPostManualLine, hasOpenBatch }) {
-  const openCharges = charges.filter(c => balanceOf(c) > 0);
-  const [search, setSearch] = useState("");
-  const [checkNumber, setCheckNumber] = useState("");
+// ---------- Billing: Manual Posting ----------
+//
+// The workflow is payment-source first, then patient, then one claim at a time:
+//
+//   payment type + reference + amount  ->  find patient  ->  that patient's OPEN claims only
+//   ->  pick one  ->  post  ->  the claim's balance is recalculated and it leaves the list at zero
+//
+// Two rules shape it. A claim is eligible only while balanceOf() is above zero, using the same
+// balance function the Claim/Ledger screen bills from rather than a second status system. And the
+// list is scoped to one selected patient, so a biller working a cheque cannot post against
+// somebody else's account by clicking the wrong row.
+
+const MANUAL_PAYMENT_TYPES = [
+  { id: "check", label: "Check", refLabel: "Check number", refPlaceholder: "e.g. 4471029", requiresRef: true },
+  { id: "card", label: "Credit Card", refLabel: "Transaction / reference", refPlaceholder: "e.g. CC-123456", requiresRef: true },
+  { id: "eft", label: "Insurance EFT", refLabel: "EFT / trace number", refPlaceholder: "e.g. EFT-88213", requiresRef: true },
+  { id: "cash", label: "Cash / Self", refLabel: "Receipt reference", refPlaceholder: "optional", requiresRef: false },
+];
+
+/**
+ * Has this reference already been posted against any charge?
+ *
+ * Scans the postings the application already stores rather than a new index, so it sees every
+ * payment however it was keyed. A match is a warning, never a block: the same cheque legitimately
+ * covers several claims, which is the whole point of the allocation tracking below.
+ */
+function findExistingPaymentsByReference(charges, reference) {
+  const ref = String(reference || "").trim().toLowerCase();
+  if (!ref) return [];
+  const hits = [];
+  for (const c of charges || []) {
+    for (const p of c.postings || []) {
+      if (p.field !== "paid" || p.type === "Debit") continue;
+      const candidates = [p.checkNumber, p.reference].filter(Boolean).map(x => String(x).trim().toLowerCase());
+      if (candidates.includes(ref)) hits.push({ charge: c, posting: p });
+    }
+  }
+  return hits;
+}
+
+function ManualPosting({ charges, claims, patients, patientById, policies, onPostManualLine, onSelectChargeInsurance, onSetSelfPay, onPostingSession, hasOpenBatch }) {
+  // ----- payment source -----
+  const [paymentType, setPaymentType] = useState("check");
+  const [reference, setReference] = useState("");
+  const [paymentAmount, setPaymentAmount] = useState("");
   const [postDate, setPostDate] = useState(TODAY);
+
+  // ----- patient selection -----
+  const [search, setSearch] = useState("");
+  const [patientId, setPatientId] = useState(null);
+
+  // ----- posting -----
   const [postingCharge, setPostingCharge] = useState(null);
   const [postedLines, setPostedLines] = useState([]);
+  // Set after a payment that leaves a balance, so the biller can send the remainder to the next
+  // payer without leaving this screen.
+  const [routeAfterPost, setRouteAfterPost] = useState(null);
+  const [sortKey, setSortKey] = useState("dos");
+  const [sortDir, setSortDir] = useState("asc");
+
+  const typeDef = MANUAL_PAYMENT_TYPES.find(t => t.id === paymentType) || MANUAL_PAYMENT_TYPES[0];
+
+  // A claim is open while it still owes money. Same balanceOf() the rest of the application bills
+  // from, so this list can never disagree with the Claim/Ledger screen about what is outstanding.
+  const openCharges = useMemo(() => charges.filter(c => balanceOf(c) > BALANCE_EPSILON), [charges]);
 
   const query = search.trim().toLowerCase();
-  const filtered = query
-    ? openCharges.filter(c => {
-        const name = patientById[c.patientId]?.name?.toLowerCase() || "";
-        return name.includes(query) || c.patientId.toLowerCase().includes(query) || c.id.toLowerCase().includes(query);
-      })
-    : [];
+  const patientMatches = useMemo(() => {
+    if (!query) return [];
+    // Only patients who actually have something postable are offered, so selecting one can never
+    // lead to an empty list for a reason the biller cannot see.
+    const withOpen = new Set(openCharges.map(c => c.patientId));
+    return (patients || [])
+      .filter(p => withOpen.has(p.id))
+      .filter(p =>
+        (p.name || "").toLowerCase().includes(query) ||
+        (p.id || "").toLowerCase().includes(query) ||
+        (p.dob || "").includes(query) ||
+        (p.phone || "").replace(/\D/g, "").includes(query.replace(/\D/g, "") || "no-match"))
+      .slice(0, 25);
+  }, [query, patients, openCharges]);
+
+  const patient = patientId ? patientById[patientId] : null;
+
+  const claimByChargeId = useMemo(() => {
+    const m = {};
+    (claims || []).forEach(cl => { if (cl.chargeId) m[cl.chargeId] = cl; });
+    return m;
+  }, [claims]);
+
+  // The selected patient's open claims, and nobody else's.
+  const patientClaims = useMemo(() => {
+    if (!patientId) return [];
+    const rows = openCharges
+      .filter(c => c.patientId === patientId)
+      .map(c => ({
+        charge: c,
+        claim: claimByChargeId[c.id] || null,
+        insurance: payerLabel(c, policies || []),
+        balance: balanceOf(c),
+      }));
+    const dir = sortDir === "asc" ? 1 : -1;
+    const get = {
+      dos: r => r.charge.dos || "",
+      claim: r => r.claim?.id || "",
+      cpt: r => r.charge.cpt || "",
+      insurance: r => r.insurance || "",
+      balance: r => r.balance,
+    }[sortKey] || (r => r.charge.dos || "");
+    return rows.sort((a, b) => {
+      const x = get(a), y = get(b);
+      const cmp = typeof x === "number" ? x - y : String(x).localeCompare(String(y));
+      // Oldest first by default: a biller works the oldest outstanding claim first. The charge id
+      // is the final tie-break so two claims on the same date keep a stable, repeatable order -
+      // rows that reshuffle between renders are how the wrong claim gets clicked.
+      return cmp * dir || String(a.charge.id).localeCompare(String(b.charge.id));
+    });
+  }, [patientId, openCharges, claimByChargeId, policies, sortKey, sortDir]);
+
+  // ----- allocation tracking -----
+  const totalPayment = Number(paymentAmount) || 0;
+  const allocated = postedLines.reduce((s, l) => s + l.amount, 0);
+  const remainingToAllocate = totalPayment > 0 ? totalPayment - allocated : 0;
+  const fullyAllocated = totalPayment > 0 && Math.abs(remainingToAllocate) < BALANCE_EPSILON;
+
+  // Reported upward so closing the batch can refuse while a cheque is short-allocated. Cleared on
+  // unmount, so navigating away from a finished payment does not leave a phantom block behind.
+  useEffect(() => {
+    if (!onPostingSession) return undefined;
+    if (totalPayment > 0) {
+      onPostingSession("manual", {
+        label: `Manual posting - ${typeDef.label}`,
+        reference: reference.trim(),
+        total: totalPayment,
+        allocated,
+      });
+    } else {
+      onPostingSession("manual", null);
+    }
+    return () => onPostingSession("manual", null);
+  }, [onPostingSession, totalPayment, allocated, reference, typeDef.label]);
+
+  const duplicateHits = useMemo(
+    () => (typeDef.requiresRef ? findExistingPaymentsByReference(charges, reference) : []),
+    [charges, reference, typeDef.requiresRef]
+  );
+  // Postings made in this session are the expected duplicates, so they are not warned about.
+  const priorDuplicates = duplicateHits.filter(h => !postedLines.some(l => l.postingIds?.includes(h.posting.id)));
+
+  const sourceReady = Boolean(reference.trim()) || !typeDef.requiresRef;
+
+  function sortBy(key) {
+    if (sortKey === key) setSortDir(d => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(key); setSortDir("asc"); }
+  }
 
   function handleSubmit(form) {
-    onPostManualLine(postingCharge.id, form);
-    const patientName = patientById[postingCharge.patientId]?.name || postingCharge.patientId;
+    const chargeId = postingCharge.id;
+    // Concurrency: re-read the charge from the live collection at the moment of posting rather
+    // than trusting the copy captured when the row was clicked. Two billers working the same
+    // cheque would otherwise each post against a balance that no longer exists.
+    const current = charges.find(c => c.id === chargeId);
+    if (!current) {
+      return { error: "That claim is no longer available. Refresh and try again." };
+    }
+    const liveBalance = balanceOf(current);
+    if (liveBalance <= BALANCE_EPSILON) {
+      return { error: "This claim has already been paid in full, most likely by another user. Nothing was posted." };
+    }
+    const amt = Number(form.amount) || 0;
+    if (amt > liveBalance + BALANCE_EPSILON && !form.allowOverpayment) {
+      return {
+        error: `Payment exceeds the remaining claim balance of ${money(liveBalance)}. Review the amount, or tick "post as an overpayment" to create a patient credit.`,
+        overpayment: true,
+      };
+    }
+
+    onPostManualLine(chargeId, { ...form, checkNumber: reference || form.checkNumber, paymentDate: postDate });
+
+    const name = patientById[current.patientId]?.name || current.patientId;
     const parts = [];
-    if (Number(form.amount) > 0) parts.push(`${money(Number(form.amount))} payment`);
+    if (amt > 0) parts.push(`${money(amt)} payment`);
     if (Number(form.writeoff) > 0) parts.push(`${money(Number(form.writeoff))} write-off`);
-    setPostedLines(prev => [{ id: uid("LOG"), text: `${patientName} (${postingCharge.patientId}) — ${fmtDate(postingCharge.dos)} · ${postingCharge.cpt}: ${parts.join(" + ")}` }, ...prev].slice(0, 8));
+    setPostedLines(prev => [{
+      id: uid("LOG"),
+      amount: amt,
+      chargeId,
+      text: `${name} (${current.patientId}) — ${fmtDate(current.dos)} · ${current.cpt}: ${parts.join(" + ")}`,
+    }, ...prev]);
     setPostingCharge(null);
+
+    // Coordination of benefits: a primary payment that does not clear the claim leaves a balance
+    // somebody else owes. Offering the routing here means the biller does it while looking at the
+    // payment, rather than remembering to go to Claim/Ledger later - the usual way a balance ends
+    // up sitting unbilled against the wrong payer.
+    const remaining = liveBalance - amt - (Number(form.writeoff) || 0);
+    if (remaining > BALANCE_EPSILON) {
+      setRouteAfterPost({ chargeId, remaining, dos: current.dos, cpt: current.cpt, patientId: current.patientId });
+    }
+    return { ok: true };
+  }
+
+  /** Applies the chosen payer to the charge, using the application's own routing handlers. */
+  function applyRouting(choice) {
+    if (!routeAfterPost) return;
+    if (choice === "self") onSetSelfPay?.(routeAfterPost.chargeId);
+    else if (choice) onSelectChargeInsurance?.(routeAfterPost.chargeId, choice);
+    setRouteAfterPost(null);
+  }
+
+  function resetPaymentSource() {
+    setReference(""); setPaymentAmount(""); setPostedLines([]); setPatientId(null); setSearch("");
   }
 
   return (
     <div>
+      {/* ---------- 1. payment source ---------- */}
       <Card className="p-4 mb-4">
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Check / EFT number" hint="Prefills each line below; can still be edited per posting.">
-            <input className={inputCls} value={checkNumber} onChange={(e) => setCheckNumber(e.target.value)} placeholder="e.g. 4471029" />
+        <SectionTitle>Payment source</SectionTitle>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <Field label="Payment type">
+            <select className={inputCls} value={paymentType} onChange={(e) => { setPaymentType(e.target.value); setReference(""); }}>
+              {MANUAL_PAYMENT_TYPES.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </select>
+          </Field>
+          <Field
+            label={typeDef.refLabel}
+            hint={paymentType === "card" ? "Reference only — no card number is stored." : undefined}
+          >
+            <input className={inputCls} value={reference} onChange={(e) => setReference(e.target.value)} placeholder={typeDef.refPlaceholder} />
+          </Field>
+          <Field label="Payment amount" hint="Optional. Set it to track how much is left to allocate.">
+            <input type="number" min="0" step="0.01" className={inputCls} value={paymentAmount} onChange={(e) => setPaymentAmount(e.target.value)} placeholder="0.00" />
           </Field>
           <Field label="Post date"><input type="date" className={inputCls} value={postDate} onChange={(e) => setPostDate(e.target.value)} /></Field>
         </div>
+
+        {typeDef.requiresRef && !reference.trim() && (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-2">
+            Enter the {typeDef.refLabel.toLowerCase()} before posting, so every payment can be traced back to it.
+          </p>
+        )}
+
+        {priorDuplicates.length > 0 && (
+          <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-2">
+            <strong>This reference has already been used</strong> on {priorDuplicates.length} existing payment
+            {priorDuplicates.length === 1 ? "" : "s"}. Review before continuing — nothing has been changed.
+            <ul className="mt-1 space-y-0.5">
+              {priorDuplicates.slice(0, 4).map(h => (
+                <li key={h.posting.id}>
+                  {patientById[h.charge.patientId]?.name || h.charge.patientId} · {fmtDate(h.charge.dos)} · {h.charge.cpt} — {money(h.posting.amount)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* ---------- running allocation ---------- */}
+        {totalPayment > 0 && (
+          <div className="grid grid-cols-3 gap-3 mt-3 text-sm">
+            <div className="border border-slate-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase tracking-wide text-slate-400">Payment amount</div>
+              <div className="font-semibold text-slate-800">{money(totalPayment)}</div>
+            </div>
+            <div className="border border-slate-200 rounded-lg px-3 py-2">
+              <div className="text-[10px] uppercase tracking-wide text-slate-400">Already posted</div>
+              <div className="font-semibold text-slate-800">{money(allocated)}</div>
+            </div>
+            <div className={`border rounded-lg px-3 py-2 ${remainingToAllocate < -BALANCE_EPSILON ? "border-rose-200 bg-rose-50" : fullyAllocated ? "border-emerald-200 bg-emerald-50" : "border-slate-200"}`}>
+              <div className="text-[10px] uppercase tracking-wide text-slate-400">Remaining to allocate</div>
+              <div className={`font-semibold ${remainingToAllocate < -BALANCE_EPSILON ? "text-rose-600" : fullyAllocated ? "text-emerald-700" : "text-slate-800"}`}>
+                {money(remainingToAllocate)}
+              </div>
+            </div>
+          </div>
+        )}
+        {fullyAllocated && (
+          <p className="text-xs text-emerald-700 mt-2 flex items-center gap-1.5">
+            <CheckCircle2 size={13} /> Payment fully allocated.
+          </p>
+        )}
+        {remainingToAllocate < -BALANCE_EPSILON && (
+          <p className="text-xs text-rose-700 mt-2">
+            {money(-remainingToAllocate)} more has been posted than this payment covers. Review the postings below.
+          </p>
+        )}
+
+        {(reference || postedLines.length > 0) && (
+          <button onClick={resetPaymentSource} className="text-xs text-slate-500 border border-slate-200 rounded-lg px-2.5 py-1.5 mt-3 hover:bg-slate-50">
+            Start a new payment
+          </button>
+        )}
       </Card>
 
-      <div className="relative mb-3 max-w-sm">
-        <Search size={15} className="absolute left-3 top-2.5 text-slate-400" />
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search open charges by patient name, patient ID, or charge ID" className={`${inputCls} pl-9`} />
-      </div>
+      {/* ---------- 2. patient ---------- */}
+      {!patient ? (
+        <>
+          <div className="relative mb-3 max-w-lg">
+            <Search size={15} className="absolute left-3 top-2.5 text-slate-400" />
+            <input
+              value={search} onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search patient by name, account number, date of birth, or phone"
+              className={`${inputCls} pl-9`}
+            />
+          </div>
 
-      {!query ? (
-        <SearchFirstPrompt
-          icon={Search}
-          total={openCharges.length}
-          noun={{ one: "open charge", many: "open charges" }}
-          hint="Search by patient name, patient ID, or charge ID to find the charge you're posting against."
-        />
+          {!query ? (
+            <SearchFirstPrompt
+              icon={Search}
+              total={new Set(openCharges.map(c => c.patientId)).size}
+              noun={{ one: "patient with open claims", many: "patients with open claims" }}
+              hint="Find the patient this payment belongs to. Only patients with unpaid or partially paid claims are listed."
+            />
+          ) : (
+            <Card>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+                    <th className="px-4 py-2.5 font-medium">Patient</th>
+                    <th className="px-4 py-2.5 font-medium">Account</th>
+                    <th className="px-4 py-2.5 font-medium">DOB</th>
+                    <th className="px-4 py-2.5 font-medium text-right">Open claims</th>
+                    <th className="px-4 py-2.5 font-medium text-right">Total balance</th>
+                    <th className="px-4 py-2.5"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {patientMatches.map(p => {
+                    const mine = openCharges.filter(c => c.patientId === p.id);
+                    const bal = mine.reduce((s, c) => s + balanceOf(c), 0);
+                    return (
+                      <tr key={p.id} onClick={() => setPatientId(p.id)} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 cursor-pointer">
+                        <td className="px-4 py-2.5 font-medium text-slate-800">{p.name}</td>
+                        <td className="px-4 py-2.5 text-slate-500 text-xs">{p.id}</td>
+                        <td className="px-4 py-2.5 text-slate-600">{fmtDate(p.dob)}</td>
+                        <td className="px-4 py-2.5 text-right text-slate-600">{mine.length}</td>
+                        <td className="px-4 py-2.5 text-right font-medium text-rose-600">{money(bal)}</td>
+                        <td className="px-4 py-2.5 text-slate-300"><ChevronRight size={16} /></td>
+                      </tr>
+                    );
+                  })}
+                  {patientMatches.length === 0 && (
+                    <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">
+                      No patient with open claims matches &ldquo;{search.trim()}&rdquo;.
+                    </td></tr>
+                  )}
+                </tbody>
+              </table>
+            </Card>
+          )}
+        </>
       ) : (
-      <Card>
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
-              <th className="px-4 py-2.5 font-medium">Patient</th>
-              <th className="px-4 py-2.5 font-medium">Account</th>
-              <th className="px-4 py-2.5 font-medium">DOS / CPT</th>
-              <th className="px-4 py-2.5 font-medium text-right">Billed</th>
-              <th className="px-4 py-2.5 font-medium text-right">Balance</th>
-              <th className="px-4 py-2.5"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map(c => {
-              const bal = balanceOf(c);
-              return (
-                <tr key={c.id} className="border-b border-slate-100 last:border-0">
-                  <td className="px-4 py-2.5 text-slate-700">{patientById[c.patientId]?.name}</td>
-                  <td className="px-4 py-2.5 text-slate-500 text-xs">{c.patientId}</td>
-                  <td className="px-4 py-2.5 text-slate-500 text-xs">{fmtDate(c.dos)} · {c.cpt}</td>
-                  <td className="px-4 py-2.5 text-right text-slate-600">{money(c.charge)}</td>
-                  <td className="px-4 py-2.5 text-right font-medium text-rose-600">{money(bal)}</td>
-                  <td className="px-4 py-2.5 text-right">
-                    <button onClick={() => setPostingCharge(c)} disabled={!hasOpenBatch} title={hasOpenBatch ? "" : "Open your batch first"} className="flex items-center gap-1.5 bg-teal-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-teal-700 ml-auto disabled:opacity-40 disabled:cursor-not-allowed">
-                      <CreditCard size={13} /> Post
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-            {filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No open balances match "{search.trim()}".</td></tr>}
-          </tbody>
-        </table>
-      </Card>
+        <>
+          {/* ---------- 3. selected patient ---------- */}
+          <div className="flex items-start justify-between mb-3">
+            <div>
+              <div className="text-xs text-slate-400">Selected patient</div>
+              <h3 className="text-lg font-semibold text-slate-800">{patient.name}</h3>
+              <p className="text-xs text-slate-500">
+                Account {patient.id} · DOB {fmtDate(patient.dob)}
+              </p>
+            </div>
+            <button onClick={() => { setPatientId(null); setSearch(""); }} className="text-xs text-slate-600 border border-slate-200 rounded-lg px-2.5 py-1.5 hover:bg-slate-50">
+              Change patient
+            </button>
+          </div>
+
+          {/* ---------- 4. open claims, this patient only ---------- */}
+          {patientClaims.length === 0 ? (
+            <Card className="p-8 text-center">
+              <p className="font-medium text-slate-700">No open claims</p>
+              <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+                This patient currently has no unpaid or partially paid claims available for manual posting.
+                Paid-off claims are deliberately not listed here.
+              </p>
+            </Card>
+          ) : (
+            <Card className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+                    {[["DOS", "dos"], ["Claim #", "claim"], ["CPT", "cpt"], ["Insurance", "insurance"]].map(([label, key]) => (
+                      <th key={key} className="px-3 py-2.5 font-medium">
+                        <button onClick={() => sortBy(key)} className="hover:text-slate-700">
+                          {label}{sortKey === key ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+                        </button>
+                      </th>
+                    ))}
+                    <th className="px-3 py-2.5 font-medium">Physician</th>
+                    <th className="px-3 py-2.5 font-medium text-right">Charge</th>
+                    <th className="px-3 py-2.5 font-medium text-right">Paid</th>
+                    <th className="px-3 py-2.5 font-medium text-right">Write-off</th>
+                    <th className="px-3 py-2.5 font-medium text-right">
+                      <button onClick={() => sortBy("balance")} className="hover:text-slate-700">
+                        Balance{sortKey === "balance" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+                      </button>
+                    </th>
+                    <th className="px-3 py-2.5 font-medium">Status</th>
+                    <th className="px-3 py-2.5"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {patientClaims.map(({ charge: c, claim, insurance, balance }) => (
+                    <tr key={c.id} className="border-b border-slate-100 last:border-0 hover:bg-slate-50">
+                      <td className="px-3 py-2.5 text-slate-700 whitespace-nowrap">{fmtDate(c.dos)}</td>
+                      <td className="px-3 py-2.5 text-slate-500 text-xs">{claim?.id || "Not billed"}</td>
+                      <td className="px-3 py-2.5 font-medium text-slate-800">{c.cpt}</td>
+                      <td className="px-3 py-2.5 text-slate-600">{insurance}</td>
+                      <td className="px-3 py-2.5 text-slate-600">{c.provider || "—"}</td>
+                      <td className="px-3 py-2.5 text-right text-slate-600">{money(c.charge)}</td>
+                      <td className="px-3 py-2.5 text-right text-emerald-700">{money(c.paid)}</td>
+                      <td className="px-3 py-2.5 text-right text-slate-500">{money(c.writeoff + (c.credits || 0))}</td>
+                      <td className="px-3 py-2.5 text-right font-medium text-rose-600">{money(balance)}</td>
+                      <td className="px-3 py-2.5"><StatusPill status={chargeStatus(c)} /></td>
+                      <td className="px-3 py-2.5 text-right">
+                        <button
+                          onClick={() => setPostingCharge(c)}
+                          disabled={!hasOpenBatch || !sourceReady}
+                          title={!hasOpenBatch ? "Open your batch first" : !sourceReady ? `Enter the ${typeDef.refLabel.toLowerCase()} first` : ""}
+                          className="flex items-center gap-1.5 bg-teal-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-teal-700 ml-auto disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+                        >
+                          <CreditCard size={13} /> Post
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="text-xs text-slate-400 px-3 py-2 border-t border-slate-100">
+                Open claims only — a claim disappears from this list once its balance reaches zero. Post one claim at a time.
+              </p>
+            </Card>
+          )}
+        </>
       )}
 
+      {/* ---------- session log ---------- */}
       {postedLines.length > 0 && (
-        <div className="mt-4 space-y-1">
-          {postedLines.map(l => <p key={l.id} className="text-emerald-600 text-xs">{l.text}</p>)}
-        </div>
+        <Card className="p-3 mt-4">
+          <SectionTitle>Posted with this payment</SectionTitle>
+          <div className="space-y-1">
+            {postedLines.map(l => <p key={l.id} className="text-emerald-700 text-xs">✓ {l.text}</p>)}
+          </div>
+          <p className="text-xs text-slate-500 mt-2 border-t border-slate-100 pt-2">
+            {postedLines.length} posting{postedLines.length === 1 ? "" : "s"} · {money(allocated)} allocated
+            {totalPayment > 0 && ` of ${money(totalPayment)}`}
+          </p>
+        </Card>
       )}
 
+      {/* ---------- after payment: where does the remaining balance go? ---------- */}
+      {routeAfterPost && (
+        <Modal title="Balance remaining - select the next payer" onClose={() => setRouteAfterPost(null)}>
+          <p className="text-sm text-slate-600 mb-1">
+            {fmtDate(routeAfterPost.dos)} · CPT {routeAfterPost.cpt} still has a balance of{" "}
+            <strong className="text-rose-600">{money(routeAfterPost.remaining)}</strong>.
+          </p>
+          <p className="text-xs text-slate-500 mb-4">
+            Choose who it should be billed to next. This sets the claim&apos;s payer - it does not move any
+            money, and the payment you just posted is unaffected.
+          </p>
+
+          <div className="space-y-2 mb-4">
+            {(policies || [])
+              .filter(pol => pol.patientId === routeAfterPost.patientId && pol.status === "Active")
+              // Primary, then Secondary, then Tertiary: the order benefits are coordinated in.
+              .sort((a, b) => priorities.indexOf(a.priority) - priorities.indexOf(b.priority))
+              .map(pol => (
+                <button
+                  key={pol.id}
+                  onClick={() => applyRouting(pol.id)}
+                  className="w-full flex items-center justify-between border border-slate-200 rounded-lg px-3 py-2.5 hover:border-teal-400 hover:bg-teal-50/50 text-left"
+                >
+                  <span className="flex items-center gap-2">
+                    <PriorityBadge priority={pol.priority} />
+                    <span className="text-sm text-slate-700">{pol.insuranceCompany}</span>
+                    {pol.insuranceType && (
+                      <span className="text-[10px] bg-slate-100 border border-slate-200 rounded-full px-1.5 py-0.5 text-slate-600">
+                        {pol.insuranceType}
+                      </span>
+                    )}
+                    {pol.memberId && <span className="text-xs text-slate-400">· {pol.memberId}</span>}
+                  </span>
+                  <ChevronRight size={15} className="text-slate-300" />
+                </button>
+              ))}
+
+            <button
+              onClick={() => applyRouting("self")}
+              className="w-full flex items-center justify-between border border-slate-200 rounded-lg px-3 py-2.5 hover:border-teal-400 hover:bg-teal-50/50 text-left"
+            >
+              <span className="flex items-center gap-2">
+                <Users size={14} className="text-slate-400" />
+                <span className="text-sm text-slate-700">Self / Patient responsibility</span>
+              </span>
+              <ChevronRight size={15} className="text-slate-300" />
+            </button>
+          </div>
+
+          {(policies || []).filter(pol => pol.patientId === routeAfterPost.patientId && pol.status === "Active").length === 0 && (
+            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">
+              This patient has no active insurance on file, so the balance can only be billed to the patient.
+            </p>
+          )}
+
+          <button
+            onClick={() => setRouteAfterPost(null)}
+            className="w-full border border-slate-200 text-slate-600 text-sm py-2 rounded-lg hover:bg-slate-50"
+          >
+            Leave the payer unchanged
+          </button>
+        </Modal>
+      )}
+
+      {/* ---------- 5. posting panel ---------- */}
       {postingCharge && (
-        <Modal title={`Post payment · ${patientById[postingCharge.patientId]?.name || postingCharge.patientId} · ${fmtDate(postingCharge.dos)}`} onClose={() => setPostingCharge(null)}>
+        <Modal
+          title={`Post payment · ${patientById[postingCharge.patientId]?.name || postingCharge.patientId} · ${fmtDate(postingCharge.dos)}`}
+          onClose={() => setPostingCharge(null)}
+        >
+          <div className="text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-3">
+            <div className="font-medium text-slate-700 mb-1">Payment source</div>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-slate-600">
+              <span>Type: <strong>{typeDef.label}</strong></span>
+              <span>{typeDef.refLabel}: <strong>{reference || "—"}</strong></span>
+              <span>Post date: <strong>{fmtDate(postDate)}</strong></span>
+              {totalPayment > 0 && <span>Remaining to allocate: <strong>{money(remainingToAllocate)}</strong></span>}
+            </div>
+          </div>
           <ManualLinePostingForm
             charge={postingCharge}
             policies={policies.filter(p => p.patientId === postingCharge.patientId && p.status === "Active")}
-            defaultCheckNumber={checkNumber}
+            defaultCheckNumber={reference}
             defaultPostDate={postDate}
             onSubmit={handleSubmit}
           />
@@ -3277,6 +4924,10 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
 
   const amtNum = Number(f.amount) || 0;
   const willOverpay = amtNum > bal + BALANCE_EPSILON;
+  // Overpayment is supported by the ledger (balanceOf goes negative and the surplus becomes a
+  // patient credit), so it is offered as a deliberate confirmation rather than silently allowed.
+  const [allowOver, setAllowOver] = useState(false);
+  const [offerOverpayment, setOfferOverpayment] = useState(false);
 
   function submit() {
     const amt = Number(f.amount) || 0;
@@ -3287,7 +4938,13 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
     if (writeoffAmt > Math.max(0, bal) + BALANCE_EPSILON) { setError(`Write-off can't exceed the remaining balance (${money(Math.max(0, bal))}).`); return; }
     if (writeoffAmt > 0 && !f.writeoffReason.trim()) { setError("A write-off reason is required."); return; }
     setError("");
-    onSubmit({ ...f, amount: amt, writeoff: writeoffAmt, billedAmount: charge.charge });
+    // onSubmit re-checks the claim against live data and can refuse: the balance may have been
+    // paid by another biller since this panel opened, or the amount may exceed what is owed.
+    const outcome = onSubmit({ ...f, amount: amt, writeoff: writeoffAmt, billedAmount: charge.charge, allowOverpayment: allowOver });
+    if (outcome && outcome.error) {
+      setError(outcome.error);
+      setOfferOverpayment(Boolean(outcome.overpayment));
+    }
   }
 
   return (
@@ -3304,7 +4961,13 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
         <Field label="Insurance">
           <select className={inputCls} value={f.insuranceName} onChange={set("insuranceName")}>
             <option value="">Self / Patient payment</option>
-            {policies.map(p => <option key={p.id} value={p.insuranceCompany}>{p.insuranceCompany}</option>)}
+            {policies.map(p => (
+              <option key={p.id} value={p.insuranceCompany}>
+                {p.insuranceCompany}
+                {p.insuranceType ? ` - ${p.insuranceType}` : ""}
+                {p.priority ? ` (${p.priority})` : ""}
+              </option>
+            ))}
           </select>
         </Field>
         <AmountField label={`Amount received (balance ${money(bal)})`} value={f.amount} onChange={set("amount")} />
@@ -3338,12 +5001,24 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
 
       <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
+      {/* Shown only after a payment was refused for exceeding the balance. The ledger supports
+          overpayments - the surplus becomes a patient credit - so this is a confirmation, not a
+          way around the check. */}
+      {offerOverpayment && (
+        <label className="flex items-start gap-2 text-xs text-slate-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-2 cursor-pointer">
+          <input type="checkbox" checked={allowOver} onChange={(e) => setAllowOver(e.target.checked)} className="mt-0.5 accent-amber-600" />
+          <span>
+            Post as an overpayment. The amount above the balance becomes a patient credit that can be
+            refunded or applied to another claim.
+          </span>
+        </label>
+      )}
       <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Post payment</button>
     </div>
   );
 }
 
-function ElectronicRemittance({ claims, patientById, chargeById, onPostERA, hasOpenBatch }) {
+function ElectronicRemittance({ claims, patientById, chargeById, onPostERA, onPostingSession, hasOpenBatch }) {
   const [rawText, setRawText] = useState("");
   const [parsed, setParsed] = useState(null);
   const [error, setError] = useState("");
@@ -3389,6 +5064,29 @@ function ElectronicRemittance({ claims, patientById, chargeById, onPostERA, hasO
   }) : [];
 
   const matchedCount = rowsForPosting.filter(r => r.chargeId).length;
+
+  // A remittance states its own total in the BPR segment. Anything whose claim could not be
+  // matched to a charge is money the file paid but this application has not posted - the
+  // electronic equivalent of a cheque with an amount left over.
+  const eraTotal = parsed ? Number(parsed.totalPaymentAmount) || 0 : 0;
+  const eraPostable = rowsForPosting.filter(r => r.chargeId).reduce((sum, r) => sum + (Number(r.paid) || 0), 0);
+
+  useEffect(() => {
+    if (!onPostingSession) return undefined;
+    if (parsed && eraTotal > 0) {
+      onPostingSession("era", {
+        label: `Electronic remittance (835) - ${parsed.payerName || "payer"}`,
+        reference: parsed.checkEft || "",
+        total: eraTotal,
+        // What WOULD be posted if the biller posted now. While claims are unmatched this is less
+        // than the remittance total, and that gap is what blocks the batch.
+        allocated: eraPostable,
+      });
+    } else {
+      onPostingSession("era", null);
+    }
+    return () => onPostingSession("era", null);
+  }, [onPostingSession, parsed, eraTotal, eraPostable]);
 
   function postAllMatched() {
     const matched = rowsForPosting.filter(r => r.chargeId);
@@ -6644,18 +8342,81 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
       ? openCharges.filter(c => !currentPrimaryPolicy(c.patientId, policies))
       : openCharges;
 
-    return base.map(c => {
-      const p = patientById[c.patientId] || {};
+    // ONE SERVICE = ONE ROW. `base` is already filtered above, so grouping happens after
+    // filtering and the totals always describe exactly what is on screen.
+    //
+    // The invariant that keeps the money right: Balance is accumulated once per CHARGE, in the
+    // outer loop below, and never inside the memo loop. A service with twenty memos therefore
+    // still has the balance of its charge(s) — activity cannot inflate it.
+    const services = new Map();
+
+    for (const c of base) {
+      const p = patientById[c.patientId] || null;
       const primary = currentPrimaryPolicy(c.patientId, policies);
-      const lastMemo = c.memos && c.memos.length ? c.memos[c.memos.length - 1] : null;
-      const days = daysBetween(c.dos, TODAY);
-      return {
-        Group: groupBy === "physician" ? c.provider : groupBy === "insurance" ? (primary ? primary.insuranceCompany : "Self-pay") : "Self-pay",
-        Patient: p.name || "", Account: p.id || "", DOB: fmtDate(p.dob), Phone: p.phone || "",
-        SSN: maskSSN(p.ssn), "Insurance name": primary ? primary.insuranceCompany : "Self-pay", "Insurance ID": primary ? primary.memberId : "",
-        CPT: c.cpt, DOS: fmtDate(c.dos), Bucket: agingBucket(days), Balance: balanceOf(c),
-        Memo: lastMemo ? `${fmtDate(lastMemo.date)} — ${lastMemo.text}` : "",
-      };
+      const group = groupBy === "physician" ? c.provider : groupBy === "insurance" ? (primary ? primary.insuranceCompany : "Self-pay") : "Self-pay";
+      const key = JSON.stringify([group, c.patientId, isoDay(c.dos), normCpt(c.cpt)]);
+
+      let svc = services.get(key);
+      if (!svc) {
+        svc = {
+          Group: group,
+          // A charge always carries its own account number, so an account whose patient record is
+          // missing is still identified rather than rendered as a blank row. Reading these only
+          // out of patientById is why charges belonging to many DIFFERENT accounts all appeared
+          // with an empty Patient/Account/DOB/Phone and read as the same row repeated.
+          Patient: p ? p.name : "(patient record missing)",
+          Account: p ? p.id : c.patientId,
+          DOB: p ? fmtDate(p.dob) : "",
+          Phone: p ? p.phone || "" : "",
+          SSN: p ? maskSSN(p.ssn) : "",
+          "Insurance name": primary ? primary.insuranceCompany : "Self-pay",
+          "Insurance ID": primary ? primary.memberId : "",
+          CPT: c.cpt,
+          DOS: fmtDate(c.dos),
+          Bucket: agingBucket(daysBetween(c.dos, TODAY)),
+          Charge: 0,
+          Paid: 0,
+          Adjustment: 0,
+          Credit: 0,
+          Balance: 0,
+          // Whose money this is, derived exactly as the Insurance name above is, so the
+          // statement's split can never disagree with the column beside it.
+          _responsibility: primary ? "insurance" : "patient",
+          _activity: [],
+        };
+        services.set(key, svc);
+      }
+
+      // Once per charge row. A service split across two charge rows (the same lab billed twice on
+      // one visit) sums to one row instead of appearing twice. These are the charge's own stored
+      // columns and balanceOf() - the same figures every other screen bills from, not a second
+      // calculation - so Charge - Paid - Adjustment - Credit still equals Balance.
+      svc.Charge += c.charge;
+      svc.Paid += c.paid;
+      svc.Adjustment += c.writeoff;
+      svc.Credit += c.credits || 0;
+      svc.Balance += balanceOf(c);
+
+      // Activity is collected, never counted. Nothing in this loop touches Balance.
+      for (const m of c.memos || []) {
+        svc._activity.push({
+          date: fmtDate(m.date),
+          time: fmtTime(m.at),
+          sort: `${isoDay(m.date)}T${String(m.at || "").slice(11) || "00:00:00"}`,
+          user: m.user || "",
+          type: m.type || "Note",
+          text: m.text || "",
+        });
+      }
+    }
+
+    return [...services.values()].map(svc => {
+      // Oldest first inside the box, so the follow-up trail reads top to bottom.
+      svc._activity.sort((a, b) => a.sort.localeCompare(b.sort));
+      // One cell for CSV and the PDF, which cannot draw a box. Same content, flattened.
+      svc.Memo = svc._activity.map(a => `${a.date}${a.time ? " " + a.time : ""} ${a.user}: ${a.text}`).join(" | ");
+      svc["Memo count"] = svc._activity.length;
+      return svc;
     }).sort((a, b) => a.Group.localeCompare(b.Group) || b.Balance - a.Balance);
   }, [reportType, groupBy, openCharges, patientById, policies]);
 
@@ -6699,12 +8460,22 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
   }, [reportType, transactions, charges, patientById, fromDate, toDate]);
 
   const reportTitle = {
-    aging: `Aging report — by ${groupBy === "physician" ? "physician" : groupBy === "insurance" ? "insurance type" : "self-pay"}`,
-    debit: "Debit report — charges posted",
-    credit: "Credit report — payments & write-offs posted",
+    aging: `Aging report  by ${groupBy === "physician" ? "physician" : groupBy === "insurance" ? "insurance type" : "self-pay"}`,
+    debit: "Debit report charges posted",
+    credit: "Credit report payments & write-offs posted",
   }[reportType];
 
-  const exportRows = reportType === "aging" ? agingDetailRows : reportType === "debit" ? debitRows : creditRows;
+  // CSV and the PDF read their columns straight off the row objects, so the structured activity
+  // list is dropped here — its flattened text is already in the Memo column. Both therefore get
+  // exactly the same grouped rows the table shows: one per service, never one per activity.
+  const exportRows = useMemo(() => {
+    const rows = reportType === "aging" ? agingDetailRows : reportType === "debit" ? debitRows : creditRows;
+    return rows.map(r => {
+      const out = {};
+      for (const [k, v] of Object.entries(r)) if (!k.startsWith("_")) out[k] = v;
+      return out;
+    });
+  }, [reportType, agingDetailRows, debitRows, creditRows]);
   const filenameBase = reportType === "aging" ? `aging-report-${groupBy}` : reportType === "debit" ? "debit-report" : "credit-report";
 
   const grandTotal = reportType === "aging"
@@ -6717,21 +8488,39 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
   // the two can never disagree, and no report calculation is repeated here.
   function handleExportPDF() {
     setPdfError("");
-    const meta = reportType === "aging"
-      ? [`Grouped by ${groupBy === "physician" ? "physician" : groupBy === "insurance" ? "insurance type" : "self-pay"}`,
-         "Open balances as at " + fmtDate(TODAY)]
-      : [`Date range: ${fromDate ? fmtDate(fromDate) : "all dates"} to ${toDate ? fmtDate(toDate) : "all dates"}`,
-         "Generated " + fmtDate(TODAY)];
 
-    const result = openReportPDF({
-      title: reportTitle,
-      meta,
-      rows: exportRows,
-      totalLabel: "Total",
-      totalValue: grandTotal,
-      filename: `${filenameBase}.pdf`,
-      groupTotals: reportType === "aging" ? agingGroupTotals : null,
-    });
+    // The aging report gets a dedicated Accounts Receivable Statement. The debit and credit
+    // reports keep the existing table-style PDF untouched - they are transaction listings, not
+    // statements, and nothing about them was asked to change.
+    const result = reportType === "aging"
+      ? openAgingStatementPDF({
+          // agingDetailRows, not exportRows: the statement needs the structured activity list
+          // that CSV cannot carry. Both come from the same grouped, already-filtered array.
+          rows: agingDetailRows,
+          groupTotals: agingGroupTotals,
+          groupLabel: groupBy === "physician" ? "Physician" : groupBy === "insurance" ? "Insurance" : "Self-pay",
+          criteria: {
+            "Report type": "Aging — accounts receivable",
+            "Grouped by": groupBy === "physician" ? "Physician" : groupBy === "insurance" ? "Insurance type" : "Self-pay accounts",
+            "Aging as-of date": fmtDate(TODAY),
+            "Balances included": "Outstanding only",
+            "Services": String(agingDetailRows.length),
+            "Prepared by": session?.name || "",
+          },
+          filename: safeFilename("Aging_Report", groupBy === "self" ? "Self_Pay" : groupBy, TODAY) + ".pdf",
+        })
+      : openReportPDF({
+          title: reportTitle,
+          meta: [
+            `Date range: ${fromDate ? fmtDate(fromDate) : "all dates"} to ${toDate ? fmtDate(toDate) : "all dates"}`,
+            "Generated " + fmtDate(TODAY),
+          ],
+          rows: exportRows,
+          totalLabel: "Total",
+          totalValue: grandTotal,
+          filename: `${filenameBase}.pdf`,
+          groupTotals: null,
+        });
 
     if (!result.ok) setPdfError(result.error);
     else if (result.popupBlocked) {
@@ -6810,7 +8599,7 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
 
       <div id="printable-report">
         <div className="hidden print:block mb-4">
-          <h2 className="text-lg font-semibold">Harborview Clinic — {reportTitle}</h2>
+          <h2 className="text-lg font-semibold">Retro EHR {reportTitle}</h2>
           <p className="text-xs text-slate-500">Generated {TODAY}</p>
         </div>
 
@@ -6865,7 +8654,23 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
                           <td className="py-2 pr-3 text-slate-600">{r.CPT}</td>
                           <td className="py-2 pr-3 text-slate-600">{r.DOS}</td>
                           <td className="py-2 pr-3"><StatusPill status={r.Bucket === "0-30" ? "Open" : r.Bucket === "90+" ? "Denied" : "Partial"} /></td>
-                          <td className="py-2 pr-3 text-slate-500 text-xs max-w-[180px] whitespace-normal">{r.Memo || "—"}</td>
+                          {/* ONE memo box per service. It scrolls rather than growing, so a
+                              service with forty activities is still one normal-height row. */}
+                          <td className="py-2 pr-3 align-top">
+                            {r._activity && r._activity.length > 0 ? (
+                              <div className="w-[260px] max-h-24 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50/60 divide-y divide-slate-200">
+                                {r._activity.map((a, ai) => (
+                                  <div key={ai} className="px-2 py-1.5 text-xs whitespace-normal">
+                                    <div className="text-slate-400">
+                                      {a.date}{a.time ? ` ${a.time}` : ""}{a.type && a.type !== "Note" ? ` · ${a.type}` : ""}
+                                    </div>
+                                    <div className="text-slate-600">{a.text}</div>
+                                    {a.user && <div className="text-slate-400">Posted by: {a.user}</div>}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : <span className="text-xs text-slate-400">No memo</span>}
+                          </td>
                           <td className="py-2 pr-3 text-right font-medium text-rose-600">{money(r.Balance)}</td>
                         </tr>
                       );
@@ -6940,7 +8745,7 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
 
       {showDailyTxn && (
         <DailyTransactionModal
-          charges={charges} patientById={patientById} transactions={transactions}
+          charges={charges} patientById={patientById} transactions={transactions} policies={policies || []}
           batches={batches || []} userAccounts={userAccounts || []} session={session} isOversight={isOversight}
           onClose={() => { setShowDailyTxn(false); setDailyTxnResult(null); }}
           onResult={setDailyTxnResult}
@@ -7106,6 +8911,514 @@ function DailyTxnTable({ rows, columns }) {
   );
 }
 
+// ---------- Daily Transaction: PDF document ----------
+//
+// A dedicated financial document, not a rendering of the screen and never window.print(). It is
+// built from result.summary and result.rows - the same filtered data the web report and the CSV
+// use - so the three agree by construction.
+//
+// Landscape Letter throughout: the transaction detail carries fifteen columns, and portrait would
+// mean either dropping columns or shrinking type past readability.
+
+/**
+ * @param {object} result   a generateDailyTransactionReport() result
+ * @param {object[]} criteria [label, value] pairs describing the filters used
+ * @param {string} generatedBy
+ * @returns {{ok: boolean, error?: string, popupBlocked?: boolean}}
+ */
+function openDailyTxnPDF({ result, criteria, generatedBy, filename }) {
+  if (!result || !result.rows.length) {
+    return { ok: false, error: "There are no transactions in this report to put in a PDF." };
+  }
+
+  // Opened synchronously inside the click; a popup opened later from an async continuation is
+  // blocked, and laying out a few thousand rows easily takes that long.
+  const tab = window.open("", "_blank");
+
+  try {
+    const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "letter" });
+    const W = doc.internal.pageSize.getWidth();
+    const H = doc.internal.pageSize.getHeight();
+    const L = 12;
+    const R = W - L;
+    const s = result.summary;
+    const t = s.totals;
+
+    const tableBase = {
+      margin: { left: L, right: L, top: 24, bottom: 16 },
+      theme: "grid",
+      styles: { fontSize: 7.5, cellPadding: 1.6, overflow: "linebreak", lineColor: [226, 232, 240] },
+      headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold" },
+      footStyles: { fillColor: [255, 255, 255], textColor: [15, 23, 42], fontStyle: "bold" },
+      showHead: "everyPage",
+      rowPageBreak: "avoid",
+    };
+
+    let y = 14;
+    const heading = (text) => {
+      if (y > H - 34) { doc.addPage(); y = 24; }
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(15, 23, 42);
+      doc.text(pdfText(text).toUpperCase(), L, y);
+      y += 1.6;
+      doc.setDrawColor(203, 213, 225);
+      doc.setLineWidth(0.3);
+      doc.line(L, y, R, y);
+      y += 4.5;
+    };
+
+    /** Draws a table and leaves `y` below it. Sections with no rows say so instead of
+        rendering an empty grid, which reads as a bug rather than as "nothing happened". */
+    const section = (title, head, body, opts = {}) => {
+      heading(title);
+      if (!body.length) {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(7.5);
+        doc.setTextColor(120, 130, 145);
+        doc.text(pdfText(opts.empty || "None in this report."), L, y);
+        y += 7;
+        return;
+      }
+      autoTable(doc, { ...tableBase, ...opts.table, head: [head], body, startY: y });
+      y = doc.lastAutoTable.finalY + 7;
+    };
+
+    // ---------- 1. header ----------
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(15);
+    doc.setTextColor(15, 23, 42);
+    doc.text(pdfText(PRACTICE_INFO.name), L, y + 3);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(100, 116, 139);
+    doc.text(pdfText(PRACTICE_INFO.address), L, y + 8);
+    doc.text(pdfText(`Tax ID ${PRACTICE_INFO.taxId}`), L, y + 12);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(15, 23, 42);
+    doc.text("DAILY TRANSACTION REPORT", R, y + 3, { align: "right" });
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(100, 116, 139);
+    doc.text(pdfText("Daily Financial & Reconciliation Report"), R, y + 8, { align: "right" });
+    doc.setFontSize(8);
+    doc.text(pdfText(`Generated ${fmtDateTime(nowIso())}`), R, y + 12, { align: "right" });
+
+    y += 16;
+    doc.setDrawColor(15, 23, 42);
+    doc.setLineWidth(0.6);
+    doc.line(L, y, R, y);
+    y += 7;
+
+    // ---------- 2. criteria ----------
+    heading("Report criteria");
+    doc.setFontSize(8);
+    const entries = (criteria || []).filter(([, v]) => v !== "" && v != null);
+    const per = Math.ceil(entries.length / 3) || 1;
+    const colW = (R - L) / 3;
+    let maxRow = 0;
+    entries.forEach(([label, value], i) => {
+      const col = Math.floor(i / per);
+      const row = i % per;
+      maxRow = Math.max(maxRow, row);
+      const yy = y + row * 4.4;
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(100, 116, 139);
+      doc.text(pdfText(`${label}:`), L + col * colW, yy);
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(30, 41, 59);
+      doc.text(pdfText(String(value)).slice(0, 44), L + col * colW + 34, yy);
+    });
+    y += (maxRow + 1) * 4.4 + 6;
+
+    // ---------- 3. summary cards ----------
+    heading("Daily financial summary");
+    const cards = [
+      ["Total charges", money(t.charges)], ["Total payments", money(t.payments)],
+      ["Net collection", money(t.netCollection)], ["Write-offs", money(t.writeOffs)],
+      ["Credits", money(t.credits)], ["Credit transfers", money(t.creditTransfers)],
+      ["Refunds", `(${money(t.refunds)})`], ["Transactions", String(result.rows.length)],
+    ];
+    const cardW = (R - L - 7 * 2) / 8;
+    cards.forEach(([label, value], i) => {
+      const x = L + i * (cardW + 2);
+      doc.setDrawColor(203, 213, 225);
+      doc.setLineWidth(0.3);
+      doc.roundedRect(x, y, cardW, 13, 1.2, 1.2);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(5.8);
+      doc.setTextColor(100, 116, 139);
+      doc.text(pdfText(label.toUpperCase()), x + 2, y + 4.5);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8.5);
+      doc.setTextColor(label === "Refunds" ? 190 : 15, label === "Refunds" ? 40 : 23, label === "Refunds" ? 60 : 42);
+      doc.text(pdfText(value), x + 2, y + 10);
+    });
+    y += 17;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(100, 116, 139);
+    doc.text(pdfText("Net collection = payments - refunds. Write-offs are not cash. Credit transfers move money collected earlier and are excluded."), L, y);
+    y += 7;
+
+    const m = (n) => money(Number(n) || 0);
+
+    // ---------- 4-8. rollups ----------
+    section("Payment method summary",
+      ["Method", "Transactions", "Total"],
+      s.byMethod.map(r => [pdfText(r.name), String(r.count), m(r.payments)]),
+      { empty: "No payments in this report.", table: { columnStyles: { 1: { halign: "right" }, 2: { halign: "right" } } },
+        });
+
+    section("Insurance summary",
+      ["Insurance", "Charges", "Paid", "Write-off", "Credit", "Refund", "Balance"],
+      s.byInsurance.map(r => [pdfText(r.name), m(r.charges), m(r.payments), m(r.writeOffs), m(r.credits), m(r.refunds), m(r.balance)]),
+      { empty: "No insurance activity.", table: { columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" }, 6: { halign: "right" } } } });
+
+    section("Physician summary",
+      ["Physician", "Charges", "Payments", "Write-off", "Refund", "Balance"],
+      s.byPhysician.map(r => [pdfText(r.name), m(r.charges), m(r.payments), m(r.writeOffs), m(r.refunds), m(r.balance)]),
+      { empty: "No physician activity.", table: { columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" } } } });
+
+    section("Posted-by summary",
+      ["Posted by", "Charges", "Payments", "Write-off", "Refund", "Transfers"],
+      s.byUser.map(r => [pdfText(r.name), m(r.charges), m(r.payments), m(r.writeOffs), m(r.refunds), m(r.creditTransfers)]),
+      { empty: "No attributed activity.", table: { columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" } } } });
+
+    section("Procedure (CPT) summary",
+      ["CPT", "Services", "Charges", "Payments", "Write-off", "Credits", "Balance"],
+      s.byCpt.map(r => [pdfText(r.name), String(r.count), m(r.charges), m(r.payments), m(r.writeOffs), m(r.credits), m(r.balance)]),
+      { empty: "No procedure-coded activity.", table: { columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" }, 5: { halign: "right" }, 6: { halign: "right" } } } });
+
+    // ---------- 9-11. movement out, and money that is not a collection ----------
+    section("Credit transfer summary",
+      ["Date", "Patient", "DOS", "CPT", "Detail", "Posted by", "Amount"],
+      s.transfers.map(r => [fmtDate(r.receiptDate || r.transactionDate), pdfText(r.patientName), fmtDate(r.serviceDate), pdfText(r.cpt), pdfText(r.notes || r.reason).slice(0, 70), pdfText(r.user), m(r.creditTransfer)]),
+      { empty: "No credit transfers in this report.", table: { columnStyles: { 6: { halign: "right" } } } });
+
+    section("Refund summary",
+      ["Date", "Patient", "Type", "Reason", "Posted by", "Amount"],
+      s.refunds.map(r => [fmtDate(r.receiptDate || r.transactionDate), pdfText(r.patientName), pdfText(r.paymentType), pdfText(r.reason || r.notes).slice(0, 60), pdfText(r.user), m(r.refund)]),
+      { empty: "No refunds in this report.", table: { columnStyles: { 5: { halign: "right" } } } });
+
+    section("Write-off summary",
+      ["Patient", "DOS", "CPT", "Insurance", "Physician", "Posted by", "Amount"],
+      s.writeOffs.map(r => [pdfText(r.patientName), fmtDate(r.serviceDate), pdfText(r.cpt), pdfText(r.insurance), pdfText(r.doctor), pdfText(r.user), m(r.writeOff)]),
+      { empty: "No write-offs in this report.", table: { columnStyles: { 6: { halign: "right" } } } });
+
+    section("Check payments",
+      ["Check #", "Deposit date", "Payer", "Patient", "Posted by", "Amount"],
+      s.checks.map(r => [pdfText(r.checkNumber || r.receiptNumber), fmtDate(r.depositDate), pdfText(r.insurance), pdfText(r.patientName), pdfText(r.user), m(r.payment)]),
+      { empty: "No check payments in this report.", table: { columnStyles: { 5: { halign: "right" } } } });
+
+    // ---------- 12. detail ----------
+    doc.addPage();
+    y = 24;
+    section("Detailed transactions",
+      ["Date", "Patient", "DOS", "CPT", "Insurance", "Physician", "Type", "Method", "Charge", "Payment", "Write-off", "Refund", "Transfer", "Balance", "Posted by"],
+      result.rows.map(r => [
+        fmtDate(r.transactionDate || r.receiptDate), pdfText(r.patientName), fmtDate(r.serviceDate),
+        pdfText(r.cpt), pdfText(r.insurance), pdfText(r.doctor), pdfText(r.txnType), pdfText(r.method),
+        r.charge ? m(r.charge) : "", r.payment ? m(r.payment) : "", r.writeOff ? m(r.writeOff) : "",
+        r.refund ? m(r.refund) : "", r.creditTransfer ? m(r.creditTransfer) : "",
+        r.balance ? m(r.balance) : "", pdfText(r.user),
+      ]),
+      {
+        table: {
+          styles: { ...tableBase.styles, fontSize: 6.4, cellPadding: 1.2 },
+          columnStyles: Object.fromEntries([8, 9, 10, 11, 12, 13].map(i => [i, { halign: "right" }])),
+          foot: [[
+            "TOTAL", "", "", "", "", "", "", "",
+            m(t.charges), m(t.payments), m(t.writeOffs), m(t.refunds), m(t.creditTransfers), m(t.balance), "",
+          ]],
+        },
+      });
+
+    // ---------- 13. final totals ----------
+    if (y > H - 30) { doc.addPage(); y = 24; }
+    doc.setDrawColor(15, 23, 42);
+    doc.setLineWidth(0.5);
+    doc.line(R - 90, y - 2, R, y - 2);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.setTextColor(15, 23, 42);
+    doc.text("NET COLLECTION", R - 90, y + 4);
+    doc.text(money(t.netCollection), R, y + 4, { align: "right" });
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(100, 116, 139);
+    doc.text(pdfText(`${result.rows.length} transactions - payments ${money(t.payments)} less refunds ${money(t.refunds)}`), L, y + 4);
+
+    // ---------- 14. running header and footer on every page ----------
+    const pages = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= pages; i++) {
+      doc.setPage(i);
+      if (i > 1) {
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(8.5);
+        doc.setTextColor(15, 23, 42);
+        doc.text(pdfText(PRACTICE_INFO.name), L, 12);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(7.5);
+        doc.setTextColor(100, 116, 139);
+        doc.text("Daily Transaction Report", L, 16);
+        doc.text(pdfText(`Generated ${fmtDateTime(nowIso())}`), R, 12, { align: "right" });
+        doc.setDrawColor(203, 213, 225);
+        doc.setLineWidth(0.3);
+        doc.line(L, 18, R, 18);
+      }
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(7);
+      doc.setTextColor(120, 130, 145);
+      doc.text(pdfText(`Daily Transaction Report - ${generatedBy || ""} - generated ${fmtDateTime(nowIso())}`), L, H - 7);
+      doc.text(`Page ${i} of ${pages}`, R, H - 7, { align: "right" });
+    }
+
+    const blob = doc.output("blob");
+    const url = URL.createObjectURL(blob);
+    if (tab) { tab.location = url; return { ok: true }; }
+    downloadBlob(filename, blob);
+    return { ok: true, popupBlocked: true };
+  } catch (err) {
+    if (tab) tab.close();
+    return { ok: false, error: `The PDF could not be generated: ${err?.message || err}` };
+  }
+}
+
+// ---------- Daily Transaction: summary sections ----------
+//
+// Rendered from result.summary, which was computed once from the filtered rows. The same object
+// feeds the on-screen report, the print layout and the PDF, so the three cannot disagree.
+
+/** A labelled money figure. `tone` marks money going out. */
+function DailyTxnStat({ label, value, tone, sub }) {
+  const colour = tone === "out" ? "text-rose-600" : tone === "net" ? "text-emerald-700" : "text-slate-800";
+  return (
+    <div className="border border-slate-200 rounded-lg px-3 py-2.5 bg-white">
+      <div className="text-[10px] uppercase tracking-wide text-slate-400">{label}</div>
+      <div className={`text-lg font-semibold ${colour}`}>{tone === "out" && value > 0 ? `(${money(value)})` : money(value)}</div>
+      {sub && <div className="text-[10px] text-slate-400 mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+
+/** A breakdown table. `cols` is [label, accessor, isMoney]. */
+function DailyTxnBreakdown({ title, rows, cols, empty, note }) {
+  if (!rows || rows.length === 0) {
+    return (
+      <div className="mb-5">
+        <SectionTitle>{title}</SectionTitle>
+        <p className="text-xs text-slate-400">{empty}</p>
+      </div>
+    );
+  }
+  const totals = cols.map(([, get, isMoney]) => (isMoney ? rows.reduce((s, r) => s + (Number(get(r)) || 0), 0) : null));
+  return (
+    <div className="mb-5">
+      <SectionTitle>{title}</SectionTitle>
+      {note && <p className="text-[11px] text-slate-400 mb-1.5">{note}</p>}
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-[10px] uppercase tracking-wide text-slate-400 border-b border-slate-200">
+              {cols.map(([label, , isMoney]) => (
+                <th key={label} className={`py-1.5 pr-3 font-medium ${isMoney ? "text-right" : ""}`}>{label}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={r.name || r.key || i} className="border-b border-slate-100 last:border-0">
+                {cols.map(([label, get, isMoney]) => (
+                  <td key={label} className={`py-1.5 pr-3 ${isMoney ? "text-right font-medium text-slate-700" : "text-slate-600"}`}>
+                    {isMoney ? money(Number(get(r)) || 0) : (get(r) || UNATTRIBUTED)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr className="border-t-2 border-slate-300 font-semibold text-slate-800">
+              {cols.map(([label, , isMoney], i) => (
+                <td key={label} className={`py-1.5 pr-3 ${isMoney ? "text-right" : ""}`}>
+                  {i === 0 ? "TOTAL" : isMoney ? money(totals[i]) : ""}
+                </td>
+              ))}
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DailyTxnSummarySections({ summary }) {
+  if (!summary) return null;
+  const t = summary.totals;
+  const c = summary.counts;
+
+  return (
+    <div>
+      <SectionTitle>Daily financial summary</SectionTitle>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+        <DailyTxnStat label="Total charges" value={t.charges} sub={`${c.charges} charge${c.charges === 1 ? "" : "s"}`} />
+        <DailyTxnStat label="Total payments" value={t.payments} sub={`${c.payments} payment${c.payments === 1 ? "" : "s"}`} />
+        <DailyTxnStat label="Write-offs" value={t.writeOffs} />
+        <DailyTxnStat label="Credits" value={t.credits} />
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+        <DailyTxnStat label="Credit transfers" value={t.creditTransfers} sub={`${c.creditTransfers} transfer${c.creditTransfers === 1 ? "" : "s"} — not new money`} />
+        <DailyTxnStat label="Refunds" value={t.refunds} tone="out" sub={`${c.refunds} refund${c.refunds === 1 ? "" : "s"}`} />
+        <DailyTxnStat label="Net collection" value={t.netCollection} tone="net" sub="payments − refunds" />
+        <DailyTxnStat label="Transactions" value={0} sub={`${c.charges + c.payments + c.refunds + c.creditTransfers} in total`} />
+      </div>
+      {/* Stated rather than assumed: a manager reconciling the day should not have to work out
+          which figures were netted off. */}
+      <p className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 mb-5">
+        <strong>Net collection = payments − refunds.</strong> Write-offs are not cash and are excluded.
+        Credit transfers move money collected on an earlier day and are excluded too, so they are never
+        counted as a new collection.
+      </p>
+
+      <DailyTxnBreakdown
+        title="Payment method summary"
+        rows={summary.byMethod}
+        empty="No payments in this report."
+        cols={[["Method", r => r.name], ["Transactions", r => r.count], ["Total", r => r.payments, true]]}
+      />
+
+      <DailyTxnBreakdown
+        title="Insurance summary"
+        rows={summary.byInsurance}
+        empty="No activity to break down by insurance."
+        cols={[
+          ["Insurance", r => r.name], ["Charges", r => r.charges, true], ["Paid", r => r.payments, true],
+          ["Write-off", r => r.writeOffs, true], ["Credit", r => r.credits, true],
+          ["Refund", r => r.refunds, true], ["Balance", r => r.balance, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title="Physician summary"
+        rows={summary.byPhysician}
+        empty="No activity to break down by physician."
+        cols={[
+          ["Physician", r => r.name], ["Charges", r => r.charges, true], ["Payments", r => r.payments, true],
+          ["Write-off", r => r.writeOffs, true], ["Refund", r => r.refunds, true], ["Balance", r => r.balance, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title="Posted-by summary"
+        rows={summary.byUser}
+        empty="No attributed activity."
+        note="For reconciliation: who keyed each transaction."
+        cols={[
+          ["Posted by", r => r.name], ["Charges", r => r.charges, true], ["Payments", r => r.payments, true],
+          ["Write-off", r => r.writeOffs, true], ["Refund", r => r.refunds, true], ["Transfers", r => r.creditTransfers, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title="Procedure (CPT) summary"
+        rows={summary.byCpt}
+        empty="No procedure-coded activity."
+        cols={[
+          ["CPT", r => r.name], ["Services", r => r.count], ["Charges", r => r.charges, true],
+          ["Payments", r => r.payments, true], ["Write-off", r => r.writeOffs, true],
+          ["Credits", r => r.credits, true], ["Balance", r => r.balance, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title={`Check payments — ${c.checks} check${c.checks === 1 ? "" : "s"}`}
+        rows={summary.checks}
+        empty="No check payments in this report."
+        cols={[
+          ["Check #", r => r.checkNumber || r.receiptNumber], ["Deposit date", r => fmtDate(r.depositDate)],
+          ["Payer", r => r.insurance], ["Patient", r => r.patientName],
+          ["Posted by", r => r.user], ["Amount", r => r.payment, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title={`Credit card payments — ${c.creditCards} transaction${c.creditCards === 1 ? "" : "s"}`}
+        rows={summary.cards}
+        empty="No credit card payments in this report."
+        // Only the reference the application already stores is shown. No card number is held
+        // anywhere in this system, so none can be displayed.
+        note="Reference only — no card numbers are stored by this application."
+        cols={[
+          ["Patient", r => r.patientName], ["Date", r => fmtDate(r.receiptDate || r.transactionDate)],
+          ["Reference", r => r.reference || r.receiptNumber], ["Posted by", r => r.user],
+          ["Amount", r => r.payment, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title={`Patient / self payments — ${c.selfPayments} transaction${c.selfPayments === 1 ? "" : "s"}`}
+        rows={summary.selfPayments}
+        empty="No patient-paid transactions in this report."
+        cols={[
+          ["Patient", r => r.patientName], ["Date", r => fmtDate(r.receiptDate || r.transactionDate)],
+          ["Method", r => r.paymentType], ["Posted by", r => r.user], ["Amount", r => r.payment, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title={`Credit transfers — ${c.creditTransfers}`}
+        rows={summary.transfers}
+        empty="No credit transfers in this report."
+        note="Movement of a credit already collected. Not included in payments or net collection."
+        cols={[
+          ["Date", r => fmtDate(r.receiptDate || r.transactionDate)], ["Patient", r => r.patientName],
+          ["DOS", r => fmtDate(r.serviceDate)], ["CPT", r => r.cpt],
+          ["Detail", r => r.notes || r.reason], ["Posted by", r => r.user], ["Amount", r => r.creditTransfer, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title={`Refunds — ${c.refunds}`}
+        rows={summary.refunds}
+        empty="No refunds in this report."
+        note="Money returned. Deducted from net collection, never shown as a payment."
+        cols={[
+          ["Date", r => fmtDate(r.receiptDate || r.transactionDate)], ["Patient", r => r.patientName],
+          ["Type", r => r.paymentType], ["Reason", r => r.reason || r.notes],
+          ["Posted by", r => r.user], ["Amount", r => r.refund, true],
+        ]}
+      />
+
+      <DailyTxnBreakdown
+        title="Write-offs"
+        rows={summary.writeOffs}
+        empty="No write-offs in this report."
+        cols={[
+          ["Patient", r => r.patientName], ["DOS", r => fmtDate(r.serviceDate)], ["CPT", r => r.cpt],
+          ["Insurance", r => r.insurance], ["Physician", r => r.doctor],
+          ["Posted by", r => r.user], ["Amount", r => r.writeOff, true],
+        ]}
+      />
+
+      <SectionTitle>Transaction counts</SectionTitle>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-xs text-slate-600 mb-2">
+        {[
+          ["Charges", c.charges], ["Payments", c.payments], ["Checks", c.checks],
+          ["Credit cards", c.creditCards], ["Self payments", c.selfPayments],
+          ["Insurance payments", c.insurancePayments], ["Credit transfers", c.creditTransfers],
+          ["Refunds", c.refunds], ["Write-offs", c.writeOffs],
+        ].map(([label, n]) => (
+          <div key={label} className="flex justify-between border-b border-slate-100 py-0.5">
+            <span className="text-slate-500">{label}</span><span className="font-medium">{n}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // The print view. Rendered outside the modal (the modal panel is fixed + scroll-clipped, which
 // would truncate the printout) and always over the complete filtered dataset rather than the
 // currently visible preview page.
@@ -7139,7 +9452,13 @@ function DailyTransactionPrintable({ result, columns, batchLabelById, generatedB
       {result.rows.length === 0 ? (
         <p className="text-xs">No transactions match the selected report filters and date range.</p>
       ) : (
-        <DailyTxnTable rows={result.rows} columns={columns} />
+        <>
+          {/* The print layout carries the same summary sections as the screen, so a printed copy
+              is a complete report rather than a bare table. */}
+          <DailyTxnSummarySections summary={result.summary} />
+          <h3 className="text-xs font-bold mb-1 mt-3">PATIENT TRANSACTION DETAIL</h3>
+          <DailyTxnTable rows={result.rows} columns={columns} />
+        </>
       )}
 
       <div className="mt-4 border-t-2 border-slate-800 pt-2">
@@ -7162,7 +9481,7 @@ function DailyTransactionPrintable({ result, columns, batchLabelById, generatedB
   );
 }
 
-function DailyTransactionModal({ charges, patientById, transactions, batches, userAccounts, session, isOversight, onClose, onResult }) {
+function DailyTransactionModal({ charges, patientById, transactions, policies, batches, userAccounts, session, isOversight, onClose, onResult }) {
   const providerOptions = useProviderOptions();
   const cptOptions = useCptOptions();
   const [f, setF] = useState(DAILY_TXN_DEFAULTS);
@@ -7185,8 +9504,15 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
   // Flattening every charge + posting is the expensive step, so it is memoised on the raw data
   // and re-run only when Firestore pushes new documents — never when a filter changes.
   const allRows = useMemo(
-    () => buildDailyTransactionRows({ charges, patientById, transactions }),
-    [charges, patientById, transactions]
+    () => buildDailyTransactionRows({ charges, patientById, transactions, policies }),
+    [charges, patientById, transactions, policies]
+  );
+
+  // Insurance options come from the data actually present, not a hard-coded payer list, so a
+  // payer added in Insurance Management appears here without a code change.
+  const insuranceOptions = useMemo(
+    () => [...new Set(allRows.map(r => r.insurance).filter(Boolean))].sort(),
+    [allRows]
   );
 
   const closedBatches = useMemo(
@@ -7235,10 +9561,27 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
   function handleExport() {
     const r = ensureResult();
     if (!r) return;
-    if (!r.rows.length) { setToast("Nothing to export — no transactions match these filters."); return; }
+    if (!r.rows.length) { setToast("Nothing to export no transactions match these filters."); return; }
     const cols = dailyTxnColumns(r.filters);
     exportCSV(dailyTxnFilename(r.filters, batchLabelById), dailyTxnCsvRows(r.rows, cols));
     setToast(`Exported ${r.rows.length} transaction${r.rows.length === 1 ? "" : "s"} to CSV.`);
+  }
+
+  // A real PDF document opened in the browser's own viewer. Deliberately NOT printReport(): the
+  // Print button below is the one that opens a print dialog, and it does so against the dedicated
+  // print layout rather than this modal.
+  function handlePDF() {
+    const r = ensureResult();
+    if (!r) return;
+    const result = openDailyTxnPDF({
+      result: r,
+      criteria: dailyTxnFilterSummary(r.filters, batchLabelById),
+      generatedBy: session?.name || "",
+      filename: dailyTxnPdfFilename(r.filters, batchLabelById),
+    });
+    if (!result.ok) setToast(result.error);
+    else if (result.popupBlocked) setToast("Your browser blocked the new tab, so the PDF was downloaded instead.");
+    else setToast(`PDF opened with ${r.rows.length} transaction${r.rows.length === 1 ? "" : "s"}.`);
   }
 
   function handlePrint() {
@@ -7317,7 +9660,7 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
                 />
                 {f.basedOn === "deposit" && (
                   <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mt-2">
-                    Only payments carry a deposit date, so this report covers receipts only — charge rows are excluded.
+                    Only payments carry a deposit date, so this report covers receipts only charge rows are excluded.
                   </p>
                 )}
                 {show("basedOn") && <p className="text-xs text-rose-600 mt-1">{errors.basedOn}</p>}
@@ -7392,6 +9735,58 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
                 />
               </div>
             )}
+
+            {/* Added filters. Each follows the same all/specific pattern as the existing ones,
+                and each is applied in the same single pipeline. */}
+            <SectionTitle>Insurance</SectionTitle>
+            <RadioRow
+              name="dt-ins" value={f.insuranceMode} onChange={(v) => set("insuranceMode", v)}
+              options={[{ value: "all", label: "All Insurance" }, { value: "specific", label: "Specific Insurance" }]}
+            />
+            {f.insuranceMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={insuranceOptions.map(i => ({ value: i, label: i }))} selected={f.insurances}
+                  placeholder="Search insurance…" onChange={(v) => set("insurances", v)}
+                />
+              </div>
+            )}
+
+            <SectionTitle>Transaction Type</SectionTitle>
+            <RadioRow
+              name="dt-type" value={f.txnTypeMode} onChange={(v) => set("txnTypeMode", v)}
+              options={[{ value: "all", label: "All Types" }, { value: "specific", label: "Specific Type(s)" }]}
+            />
+            {f.txnTypeMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={DAILY_TXN_TYPES.map(x => ({ value: x, label: x }))} selected={f.txnTypes}
+                  placeholder="Search transaction types…" onChange={(v) => set("txnTypes", v)}
+                />
+              </div>
+            )}
+
+            <SectionTitle>Payment Method</SectionTitle>
+            <RadioRow
+              name="dt-method" value={f.methodMode} onChange={(v) => set("methodMode", v)}
+              options={[{ value: "all", label: "All Methods" }, { value: "specific", label: "Specific Method(s)" }]}
+            />
+            {f.methodMode === "specific" && (
+              <div className="mt-2">
+                <MultiSelectSearch
+                  options={DAILY_TXN_METHODS.map(x => ({ value: x, label: x }))} selected={f.methods}
+                  placeholder="Search payment methods…" onChange={(v) => set("methods", v)}
+                />
+              </div>
+            )}
+
+            <SectionTitle>Patient</SectionTitle>
+            <input
+              className={inputCls}
+              placeholder="Filter by patient name or account number…"
+              value={f.patientQuery}
+              onChange={(e) => set("patientQuery", e.target.value)}
+            />
 
             <SectionTitle>Doctor</SectionTitle>
             <RadioRow
@@ -7476,6 +9871,9 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
             <button onClick={handleExport} className="flex items-center gap-1.5 text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-slate-50">
               <Download size={14} /> Export CSV
             </button>
+            <button onClick={handlePDF} className="flex items-center gap-1.5 text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-slate-50">
+              <FileText size={14} /> PDF
+            </button>
             <button onClick={handlePrint} className="flex items-center gap-1.5 text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-slate-50">
               <Printer size={14} /> Print Report
             </button>
@@ -7504,7 +9902,12 @@ function DailyTransactionModal({ charges, patientById, transactions, batches, us
               </div>
             ) : (
               <>
-                {/* Only the visible page is rendered; CSV and print always use result.rows in full. */}
+                {/* Every summary section, from result.summary - the same object the CSV totals and
+                    the PDF are built from. */}
+                <DailyTxnSummarySections summary={result.summary} />
+
+                <SectionTitle>Patient transaction detail</SectionTitle>
+                {/* Only the visible page is rendered; CSV, PDF and print always use result.rows in full. */}
                 <DailyTxnTable rows={pageRows} columns={columns} />
                 {pageCount > 1 && (
                   <div className="flex items-center justify-between mt-3">
@@ -7990,7 +10393,7 @@ function NotesTab({ notes, onAdd, onSign, onAmend }) {
       )}
       {amendNoteId && (
         <Modal title="Add amendment" onClose={() => setAmendNoteId(null)}>
-          <p className="text-xs text-slate-400 mb-3">Signed notes are never edited in place — this appends an amendment and keeps the original note intact.</p>
+          <p className="text-xs text-slate-400 mb-3">Signed notes are never edited in place this appends an amendment and keeps the original note intact.</p>
           <Field label="Amendment text"><textarea className={`${inputCls} h-24 resize-none`} value={amendText} onChange={(e) => setAmendText(e.target.value)} /></Field>
           <button onClick={submitAmend} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Save amendment</button>
         </Modal>
@@ -8090,7 +10493,7 @@ function AddPatientForm({ onSubmit }) {
         <Field label="Employer"><input className={inputCls} value={form.guarantor.employer} onChange={setG("employer")} /></Field>
       </div>
 
-      <p className="text-xs text-slate-400 mb-3">Insurance isn't collected here — add it from the patient's Insurance tab after registration, so it's properly versioned and never overwritten.</p>
+      <p className="text-xs text-slate-400 mb-3">Insurance isn't collected here add it from the patient's Insurance tab after registration, so it's properly versioned and never overwritten.</p>
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
       <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 mt-2">Register patient</button>
     </div>

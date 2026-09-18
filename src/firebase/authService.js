@@ -9,20 +9,101 @@
 // signs in with the password they already had. The original Firebase implementation is preserved
 // for reference in src/firebase/_legacy-firebase/.
 
-import { api, setToken, getToken } from "./apiClient";
+import { api, setToken, getToken, setTokenProvider } from "./apiClient";
+import { firebaseAuthEnabled, firebaseSignIn, firebaseSignOut, firebaseCurrentToken } from "./firebaseAuth";
 import { getCache, refetch, clearAll } from "./collectionStore";
 
-// Resolves to a Firebase-shaped credential: { user: { uid, email } }.
+// Resolves to a Firebase-shaped credential: { user: { uid, email } } when sign-in is complete.
+//
+// When a second factor is outstanding it resolves to { mfa: {...} } instead and NO session token
+// is stored - the caller must finish through verifyMfa() or confirmEnrollment(). Keeping the
+// success shape unchanged means every existing caller still works.
 export async function signIn(email, password) {
+  // Firebase path: Google verifies the password and issues an ID token; the Go API verifies that
+  // token and answers with the account's role. Sign-in fails here if the account is unknown to
+  // this practice, so a Firebase account by itself grants no access.
+  if (firebaseAuthEnabled()) {
+    const cred = await firebaseSignIn(email, password);
+    // Every later request resolves a freshly refreshed token through this provider.
+    setTokenProvider(() => firebaseCurrentToken());
+    setToken(await cred.getToken());
+    const me = await api("/api/auth/me");
+    return { user: { uid: me.uid, email: me.email } };
+  }
+
   const res = await api("/api/auth/login", {
     method: "POST",
     body: { email, password },
   });
+  if (res.mfaRequired || res.mfaEnrollRequired) {
+    return {
+      mfa: {
+        challenge: res.challenge,
+        enroll: !!res.mfaEnrollRequired,
+        email: res.email || email,
+        backupCodesLeft: res.backupCodes ?? null,
+      },
+    };
+  }
   setToken(res.token); // also opens the change feed
   return { user: { uid: res.user.uid, email: res.user.email } };
 }
 
+// ---------- multi-factor authentication ----------
+//
+// Each of these carries the challenge token explicitly rather than through the stored session,
+// because during sign-in there is no session yet - that is the whole point of the challenge.
+
+export async function verifyMfa(challenge, code, trustDevice) {
+  const res = await api("/api/auth/mfa/verify", {
+    method: "POST",
+    authToken: challenge,
+    body: { code, trustDevice: !!trustDevice },
+  });
+  setToken(res.token);
+  return { user: { uid: res.user.uid, email: res.user.email } };
+}
+
+export async function startMfaEnrollment(challenge) {
+  return api("/api/auth/mfa/enroll/start", { method: "POST", authToken: challenge });
+}
+
+export async function confirmMfaEnrollment(challenge, code, trustDevice) {
+  const res = await api("/api/auth/mfa/enroll/confirm", {
+    method: "POST",
+    authToken: challenge,
+    body: { code, trustDevice: !!trustDevice },
+  });
+  // Enrolling during sign-in completes it; enrolling from Settings returns no token and leaves
+  // the existing session alone.
+  if (res.token) setToken(res.token);
+  return res;
+}
+
+export async function securityStatus() {
+  return api("/api/auth/mfa/status");
+}
+
+export async function disableMfa(password) {
+  return api("/api/auth/mfa/disable", { method: "POST", body: { password } });
+}
+
+export async function listTrustedDevices() {
+  const res = await api("/api/auth/devices");
+  return res.devices || [];
+}
+
+export async function revokeTrustedDevice(id) {
+  return api(`/api/auth/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function revokeAllTrustedDevices() {
+  return api("/api/auth/devices", { method: "DELETE" });
+}
+
 export async function signOutUser() {
+  setTokenProvider(null);
+  if (firebaseAuthEnabled()) await firebaseSignOut();
   setToken(null); // also closes the change feed
   clearAll();
 }

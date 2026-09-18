@@ -46,6 +46,7 @@ server/firebase-hash-config.json
 .env.*
 !.env.example
 !.env.docker.example
+!.env.firebase.example
 
 # Service-account and private-key material, wherever it lands in the tree.
 **/serviceAccountKey.json
@@ -84,3 +85,9 @@ manager/dist/
 # Generated from scripts/make-icons.mjs; keep icon.ico and the tray images, which
 # the packaged build needs and which are small.
 manager/build/icon-*.png
+
+# Database dumps. These contain live patient data (names, DOB, SSN, insurance IDs) in the
+# clear — they must never reach a repository, public or private.
+*.dump
+*.sql.gz
+*.backup

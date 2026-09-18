@@ -216,6 +216,13 @@ func main() {
 		return
 	}
 
+	// Opens an empty system on first boot. Does nothing once any account exists, so it is safe to
+	// leave configured — see bootstrap.go. Fatal on a misconfiguration, because a server that
+	// silently started with no way to sign in is worse than one that says why.
+	if err := bootstrapAdmin(context.Background(), pool); err != nil {
+		log.Fatalf("bootstrap: %v", err)
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
@@ -223,6 +230,22 @@ func main() {
 	mux.HandleFunc("POST /api/auth/users", s.requireAuth(s.handleCreateUser))
 	mux.HandleFunc("POST /api/auth/password", s.requireAuth(s.handleChangePassword))
 	mux.HandleFunc("POST /api/auth/users/{id}/password", s.requireAuth(s.handleResetPassword))
+
+	// Multi-factor authentication.
+	//
+	// verify and the two enrol endpoints are NOT behind requireAuth: they are reached with the
+	// short-lived challenge token issued after the password step, which requireAuth deliberately
+	// rejects. They authenticate that token themselves. Everything else here needs a real session.
+	mux.HandleFunc("POST /api/auth/mfa/verify", s.handleMFAVerify)
+	mux.HandleFunc("POST /api/auth/mfa/enroll/start", s.handleMFAEnrollStart)
+	mux.HandleFunc("POST /api/auth/mfa/enroll/confirm", s.handleMFAEnrollConfirm)
+	mux.HandleFunc("GET /api/auth/mfa/status", s.requireAuth(s.handleMFAStatus))
+	mux.HandleFunc("POST /api/auth/mfa/disable", s.requireAuth(s.handleMFADisable))
+
+	// Trusted devices.
+	mux.HandleFunc("GET /api/auth/devices", s.requireAuth(s.handleListDevices))
+	mux.HandleFunc("DELETE /api/auth/devices/{id}", s.requireAuth(s.handleRevokeDevice))
+	mux.HandleFunc("DELETE /api/auth/devices", s.requireAuth(s.handleRevokeAllDevices))
 
 	mux.HandleFunc("GET /api/collections/{name}", s.requireAuth(s.handleList))
 	mux.HandleFunc("POST /api/collections/{name}", s.requireAuth(s.handleCreate))

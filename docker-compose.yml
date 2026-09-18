@@ -46,6 +46,12 @@ services:
       # Same-origin through nginx means CORS is never exercised, but the server requires the
       # variable under APP_ENV=production, so it is set to the origin people actually visit.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      # First boot only. A new database has no accounts, and creating one requires being signed in
+      # as a SUPER_ADMIN already — so without these a fresh deployment cannot be logged into at
+      # all. Ignored once any account exists, so leaving them set opens no back door. Unset them
+      # after the first sign-in anyway. See server/bootstrap.go.
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
     depends_on:
       db:
         condition: service_healthy

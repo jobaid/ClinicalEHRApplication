@@ -65,10 +65,28 @@ export class ApiError extends Error {
   }
 }
 
-export async function api(path, { method = "GET", body, signal } = {}) {
+let tokenProvider = null;
+
+/**
+ * Installs a function that returns the current bearer token.
+ *
+ * Used when Firebase is the identity provider: its ID tokens expire after an hour and the SDK
+ * only refreshes them on request, so the token must be resolved per call rather than captured
+ * once at sign-in.
+ */
+export function setTokenProvider(fn) {
+  tokenProvider = fn;
+}
+
+export async function api(path, { method = "GET", body, signal, authToken } = {}) {
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  // `authToken` carries the short-lived MFA challenge, which is deliberately NOT the stored
+  // session token - the stored one does not exist yet at that point in the sign-in.
+  // A provider lets Firebase hand over a freshly refreshed ID token per request; without one the
+  // stored token is used, which is how the Go API's own 12-hour session works.
+  const bearer = authToken ?? (tokenProvider ? await tokenProvider() : null) ?? token;
+  if (bearer) headers["Authorization"] = `Bearer ${bearer}`;
 
   let res;
   try {
@@ -77,6 +95,10 @@ export async function api(path, { method = "GET", body, signal } = {}) {
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
+      // The trusted-device cookie is httpOnly, so script cannot attach it by hand; the browser
+      // only sends it when the request is made with credentials. Without this, "trust this
+      // device" would appear to work and then never be recognised.
+      credentials: "include",
     });
   } catch (err) {
     // A network-level failure (API down, or this page's origin rejected by CORS) reaches the
