@@ -19,6 +19,10 @@ APP_DIR="${APP_DIR:-/opt/medbill}"
 DOMAIN="${DOMAIN:-www.2set.com}"
 DUMP="${DUMP:-}"
 
+# Every compose call must carry --env-file: compose re-interpolates docker-compose.yml each
+# time, and ${VAR:?} turns a missing value into an error rather than a blank. Wrapping it once
+# means a later command cannot silently omit it - which is exactly the bug this replaces.
+dc() { docker compose --env-file .env.docker "$@"; }
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$*"; }
@@ -63,11 +67,11 @@ ok "compose plugin present"
 
 # ---------------------------------------------------------------- 3. build & start
 bold "3. Build and start"
-docker compose --env-file .env.docker up -d --build
+dc up -d --build
 echo "  waiting for the API..."
 for i in $(seq 1 60); do
   if curl -fsS -o /dev/null http://127.0.0.1:8080/ 2>/dev/null; then break; fi
-  [ "$i" -eq 60 ] && { docker compose logs --tail 40 api; die "the API did not come up. Logs above."; }
+  [ "$i" -eq 60 ] && { dc logs --tail 40 api; die "the API did not come up. Logs above."; }
   sleep 2
 done
 ok "stack is up and answering on 127.0.0.1:8080"
@@ -80,11 +84,11 @@ DBN="$(grep '^POSTGRES_DB=' .env.docker | cut -d= -f2-)"
 if [ -n "$DUMP" ]; then
   [ -f "$DUMP" ] || die "dump file $DUMP not found"
   warn "restoring $DUMP - this REPLACES the current contents of $DBN"
-  docker compose cp "$DUMP" db:/tmp/restore.dump
-  docker compose exec -T db pg_restore -U "$DBU" -d "$DBN" \
+  dc cp "$DUMP" db:/tmp/restore.dump
+  dc exec -T db pg_restore -U "$DBU" -d "$DBN" \
     --clean --if-exists --no-owner --no-privileges /tmp/restore.dump || \
     warn "pg_restore reported errors - 'does not exist, skipping' lines are normal on a fresh database"
-  docker compose exec -T db rm -f /tmp/restore.dump
+  dc exec -T db rm -f /tmp/restore.dump
   ok "database restored"
 else
   ok "no dump given (DUMP=...) - keeping whatever is in the database"
@@ -94,20 +98,20 @@ fi
 # a migration was added will not contain its tables. Check rather than assume.
 bold "5. Schema check"
 for t in users charges patients user_mfa trusted_devices; do
-  if docker compose exec -T db psql -U "$DBU" -d "$DBN" -tAc \
+  if dc exec -T db psql -U "$DBU" -d "$DBN" -tAc \
       "SELECT to_regclass('public.$t') IS NOT NULL;" | grep -q t; then
     ok "table $t"
   else
     warn "table $t is MISSING - applying migrations by hand"
     for m in server/migrations/*.sql; do
-      docker compose exec -T db psql -U "$DBU" -d "$DBN" -q -f - < "$m" >/dev/null 2>&1 || true
+      dc exec -T db psql -U "$DBU" -d "$DBN" -q -f - < "$m" >/dev/null 2>&1 || true
     done
-    docker compose exec -T db psql -U "$DBU" -d "$DBN" -tAc "SELECT to_regclass('public.$t') IS NOT NULL;" \
+    dc exec -T db psql -U "$DBU" -d "$DBN" -tAc "SELECT to_regclass('public.$t') IS NOT NULL;" \
       | grep -q t && ok "table $t created" || die "could not create $t - check server/migrations/"
   fi
 done
 
-ROWS="$(docker compose exec -T db psql -U "$DBU" -d "$DBN" -tAc \
+ROWS="$(dc exec -T db psql -U "$DBU" -d "$DBN" -tAc \
   "SELECT (SELECT count(*) FROM patients) || ' patients, ' || (SELECT count(*) FROM charges) || ' charges, ' || (SELECT count(*) FROM users) || ' users';" | tr -d '\r')"
 ok "data: $ROWS"
 
