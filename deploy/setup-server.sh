@@ -16,7 +16,7 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/medbill}"
-DOMAIN="${DOMAIN:-www.2set.com}"
+DOMAIN="${DOMAIN:-2set.com}"
 DUMP="${DUMP:-}"
 
 # Every compose call must carry --env-file: compose re-interpolates docker-compose.yml each
