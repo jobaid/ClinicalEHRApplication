@@ -1,0 +1,21 @@
+# Optional overlay: exposes PostgreSQL on the SERVER'S LOOPBACK ONLY, so a database GUI on your
+# own machine can reach it through an SSH tunnel.
+#
+#   docker compose --env-file .env.docker -f docker-compose.yml -f docker-compose.dbaccess.yml up -d
+#
+# and to close it again:
+#
+#   docker compose --env-file .env.docker up -d --remove-orphans
+#
+# Why an overlay rather than a port in the main file: the base compose file deliberately publishes
+# nothing for the database, and that default should stay. This is a temporary, deliberate act.
+#
+# 127.0.0.1 is the important part. Binding to 0.0.0.0 would put a database holding patient names,
+# dates of birth and SSNs directly on the internet, protected by one password and no TLS. With the
+# loopback binding it is reachable only by something already on the server - which, with an SSH
+# tunnel, means only someone who can already log in over SSH.
+
+services:
+  db:
+    ports:
+      - "127.0.0.1:5433:5432"

@@ -91,3 +91,6 @@ manager/build/icon-*.png
 *.dump
 *.sql.gz
 *.backup
+
+# Plain-SQL database dumps also contain live patient data.
+medbill.sql
