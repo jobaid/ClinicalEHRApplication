@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -49,6 +50,12 @@ type Server struct {
 	// tabCache, but kept separate because the two answer different questions.
 	permMu    sync.RWMutex
 	permCache map[string]permSet
+
+	// Per-USER grants (see userpermissions.go), which is what governs Backup & Restore. Keyed by
+	// user id rather than by role, and invalidated one entry at a time so revoking one person's
+	// access does not throw away everyone else's cached answer.
+	userPermMu    sync.RWMutex
+	userPermCache map[string]permSet
 }
 
 // ---------- Configuration and its production guardrails ----------
@@ -104,12 +111,39 @@ func jwtSigningSecret() []byte {
 		log.Fatal("JWT_SECRET is not set. Session tokens would be forgeable by anyone who can read this source. " +
 			"Generate one with: openssl rand -base64 48")
 	}
+	// Development only - isProduction() has already returned above.
+	//
+	// This is persisted rather than regenerated per boot, and the reason is not convenience.
+	// mfaKey() derives the MFA secret-encryption key from this value, so a secret that changes
+	// on every restart makes every stored authenticator secret undecryptable. An enrolment
+	// started before a restart then cannot be read afterwards, which used to lock the account
+	// out of signing in entirely. Stable across restarts, the whole class of problem disappears.
+	//
+	// The file is gitignored and only ever used outside production, where an unset JWT_SECRET
+	// is a fatal error rather than something to generate.
+	path := env("DEV_JWT_SECRET_FILE", "dev-jwt-secret")
+	if existing, err := os.ReadFile(path); err == nil {
+		if v := strings.TrimSpace(string(existing)); len(v) >= minLen {
+			log.Printf("warning: JWT_SECRET is not set; using the development secret in %s", path)
+			return []byte(v)
+		}
+	}
+
 	buf := make([]byte, minLen)
 	if _, err := rand.Read(buf); err != nil {
 		log.Fatalf("could not generate a development JWT secret: %v", err)
 	}
-	log.Print("warning: JWT_SECRET is not set, generated an ephemeral one. Sessions will not survive a restart.")
-	return buf
+	secret := base64.StdEncoding.EncodeToString(buf)
+
+	// 0600: it signs sessions on this machine. If it cannot be written, carry on with the
+	// in-memory value - a read-only checkout should still be able to run the server.
+	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
+		log.Printf("warning: JWT_SECRET is not set and %s could not be written (%v); "+
+			"using an ephemeral secret. Sessions and MFA enrolments will not survive a restart.", path, err)
+	} else {
+		log.Printf("warning: JWT_SECRET is not set; generated a development secret and saved it to %s", path)
+	}
+	return []byte(secret)
 }
 
 func env(key, fallback string) string {
@@ -258,6 +292,28 @@ func main() {
 	mux.HandleFunc("POST /api/statements/preview", s.requireAuth(s.handleStatementPreview))
 	mux.HandleFunc("POST /api/statements/pdf", s.requireAuth(s.handleStatementPDF))
 
+	// Backup & Restore. Every route is registered through requirePerm rather than requireAuth:
+	// the grant is re-read from the database on each request, so a revocation takes effect
+	// immediately and calling the endpoint directly gains nothing over using the screen.
+	// See userpermissions.go and backup.go.
+	mux.HandleFunc("GET /api/admin/backups", s.requirePerm(PermBackupView, s.handleBackupList))
+	mux.HandleFunc("POST /api/admin/backups", s.requirePerm(PermBackupCreate, s.handleBackupCreate))
+	mux.HandleFunc("GET /api/admin/backups/{id}/download", s.requirePerm(PermBackupDownload, s.handleBackupDownload))
+	mux.HandleFunc("POST /api/admin/backups/upload", s.requirePerm(PermBackupUpload, s.handleBackupUpload))
+	mux.HandleFunc("POST /api/admin/backups/{id}/restore", s.requirePerm(PermBackupRestore, s.handleBackupRestore))
+	mux.HandleFunc("DELETE /api/admin/backups/{id}", s.requirePerm(PermBackupDelete, s.handleBackupDelete))
+
+	mux.HandleFunc("GET /api/admin/backup-settings", s.requirePerm(PermBackupView, s.handleBackupSettingsGet))
+	mux.HandleFunc("PUT /api/admin/backup-settings", s.requirePerm(PermBackupSettings, s.handleBackupSettingsPut))
+
+	mux.HandleFunc("GET /api/admin/backup-access", s.requirePerm(PermBackupAccessManagement, s.handleBackupAccessList))
+	mux.HandleFunc("PUT /api/admin/backup-access/{userId}", s.requirePerm(PermBackupAccessManagement, s.handleBackupAccessUpdate))
+	mux.HandleFunc("GET /api/admin/backup-access/history", s.requirePerm(PermBackupAccessManagement, s.handleBackupAccessHistory))
+
+	// What the signed-in browser may do, so the interface knows which controls to render. Any
+	// authenticated account may ask about itself; the answer is advisory, never the enforcement.
+	mux.HandleFunc("GET /api/admin/backup-permissions/me", s.requireAuth(s.handleMyBackupPermissions))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -268,6 +324,20 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "collections": len(collections)})
 	})
+
+	// Backup tables, then the timer that fills them. ensureBackupSchema is idempotent, so this
+	// runs on every boot and a deployment that only pulls new code still gets the new tables -
+	// the initdb mount would not, because it only fires on an empty data directory.
+	if err := s.ensureBackupSchema(context.Background()); err != nil {
+		// Not fatal. A billing system that refuses to start because its backup catalogue is
+		// unavailable has turned a missing feature into an outage.
+		log.Printf("backup: %v - Backup & Restore will not work until this is resolved", err)
+	} else {
+		// Picks up any dump files left on the volume by a previous container whose catalogue
+		// rows did not survive (a restore replaces the catalogue along with everything else).
+		s.reconcileCatalogue(context.Background())
+		go s.runBackupScheduler(context.Background())
+	}
 
 	log.Printf("medbill API listening on %s (db ok, %d collections)", addr, len(collections))
 	srv := &http.Server{

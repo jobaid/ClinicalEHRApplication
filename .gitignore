@@ -67,6 +67,13 @@ client_secret*.json
 server/firebase-hash-config.json
 **/firebase-hash-config.json
 
+# Development-only JWT signing secret, generated on first run when JWT_SECRET is unset. It
+# signs sessions and derives the MFA secret-encryption key on this machine, so it is a real
+# credential even though it never leaves a developer's laptop. Production refuses to start
+# without a real JWT_SECRET, so this file has no counterpart there.
+server/dev-jwt-secret
+**/dev-jwt-secret
+
 # Build output
 server/medbill-server
 server/medbill-server.exe

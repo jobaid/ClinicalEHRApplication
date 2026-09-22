@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -119,28 +120,91 @@ type mfaState struct {
 	Enrolled bool
 	Enabled  bool
 	Secret   string
+
+	// When the row was last written. Used to decide whether a PENDING enrolment is recent
+	// enough to resume rather than replace - see beginEnrolment.
+	UpdatedAt time.Time
 }
 
 func (s *Server) mfaStateFor(ctx context.Context, uid string) (mfaState, error) {
 	var enc string
 	var enabled bool
-	err := s.db.QueryRow(ctx, `SELECT secret_enc, enabled FROM user_mfa WHERE user_id = $1`, uid).
-		Scan(&enc, &enabled)
+	var updated time.Time
+	err := s.db.QueryRow(ctx,
+		`SELECT secret_enc, enabled, updated_at FROM user_mfa WHERE user_id = $1`, uid).
+		Scan(&enc, &enabled, &updated)
 	if err != nil {
 		return mfaState{}, nil // no row: not enrolled, which is not an error
 	}
 	secret, err := s.decryptSecret(enc)
 	if err != nil {
-		return mfaState{}, err
+		// A secret we can no longer read. The usual cause is that JWT_SECRET changed, because
+		// mfaKey derives the encryption key from it - and in development an unset JWT_SECRET is
+		// regenerated on every boot, so this happens on a plain restart.
+		//
+		// For a PENDING enrolment, report "not enrolled". The row grants nothing: it was never
+		// confirmed, so discarding it costs the user nothing and they can simply enrol again.
+		// Returning an error here instead meant handleLogin answered 500 before it ever reached
+		// the enforcement check, so an unconfirmed enrolment locked the account out of signing
+		// in altogether - even with MFA switched off.
+		if !enabled {
+			return mfaState{}, nil
+		}
+		// An ENABLED enrolment is different: silently treating it as absent would drop a second
+		// factor that is genuinely in force. That fails closed, loudly.
+		return mfaState{}, fmt.Errorf("stored authenticator secret cannot be decrypted (has JWT_SECRET changed?): %w", err)
 	}
-	return mfaState{Enrolled: true, Enabled: enabled, Secret: secret}, nil
+	return mfaState{Enrolled: true, Enabled: enabled, Secret: secret, UpdatedAt: updated}, nil
 }
 
-// beginEnrolment creates (or replaces) a pending enrolment and returns the secret plus the
+// How long a started-but-unconfirmed enrolment can be resumed for.
+//
+// This window is the whole fix for "I scanned the QR code and the six-digit code is rejected".
+// Any second call to the enrolment endpoint used to mint a fresh secret and overwrite the
+// stored one, so a page refresh, a re-render, or React StrictMode invoking the effect twice
+// left the phone holding a secret the server had already thrown away - and every code from it
+// failed, permanently, with no indication why.
+//
+// It is deliberately short rather than unlimited. Resuming forever would mean a secret captured
+// from an abandoned enrolment stays valid indefinitely, so an attacker who once reached this
+// screen could wait for the real user to finish setting up and then generate their codes. Ten
+// minutes covers reloading the page; it does not cover coming back tomorrow.
+const mfaPendingResumeWindow = 10 * time.Minute
+
+// otpauthURL rebuilds the QR payload for a secret that already exists.
+//
+// totp.Generate makes both the secret and the URI together, so resuming an enrolment needs the
+// URI constructed by hand. Every parameter is stated explicitly rather than left to the app's
+// defaults: an authenticator that guessed SHA256 or 8 digits would produce codes that look
+// perfectly normal and never validate.
+func otpauthURL(issuer, account, secret string) string {
+	q := url.Values{}
+	q.Set("secret", secret)
+	q.Set("issuer", issuer)
+	q.Set("algorithm", "SHA1")
+	q.Set("digits", "6")
+	q.Set("period", "30")
+
+	// The label is issuer:account, and it is escaped as a PATH segment - url.Values would turn
+	// the space in the issuer into "+", which some authenticators show literally in the name.
+	u := url.URL{
+		Scheme:   "otpauth",
+		Host:     "totp",
+		Path:     "/" + issuer + ":" + account,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+// beginEnrolment starts - or resumes - a pending enrolment, returning the secret plus the
 // otpauth:// URI the authenticator app scans.
 //
-// Replacing a pending enrolment is safe; replacing an ENABLED one is not, and is refused, or a
-// stolen session could silently swap the second factor for one the attacker controls.
+// Replacing an ENABLED enrolment is refused outright, or a stolen session could silently swap
+// the second factor for one the attacker controls.
+//
+// A pending enrolment started in the last few minutes is RESUMED rather than replaced. This is
+// what makes the displayed QR code stable across a refresh: minting a new secret on every call
+// invalidated whatever the user had already scanned. See mfaPendingResumeWindow.
 func (s *Server) beginEnrolment(ctx context.Context, uid, email string) (secret, uri string, err error) {
 	state, err := s.mfaStateFor(ctx, uid)
 	if err != nil {
@@ -148,6 +212,11 @@ func (s *Server) beginEnrolment(ctx context.Context, uid, email string) (secret,
 	}
 	if state.Enabled {
 		return "", "", errors.New("multi-factor authentication is already set up for this account")
+	}
+
+	if state.Enrolled && state.Secret != "" && time.Since(state.UpdatedAt) < mfaPendingResumeWindow {
+		// Same secret, same QR code, so a code from an earlier scan in this sitting still works.
+		return state.Secret, otpauthURL(mfaIssuer, email, state.Secret), nil
 	}
 
 	key, err := totp.Generate(totp.GenerateOpts{

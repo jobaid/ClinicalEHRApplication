@@ -23,7 +23,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/medbill
 FROM alpine:3.21
 
 # wget (busybox) is here for the compose healthcheck; ca-certificates for any outbound TLS.
-RUN apk add --no-cache ca-certificates \
+#
+# postgresql17-client provides pg_dump, pg_restore and psql, which the Backup & Restore feature
+# shells out to (see backup.go). The major version is pinned to match the postgres:17 database
+# image: pg_dump refuses to dump a server newer than itself, so a client that drifts behind the
+# server turns every backup into a failure with a cryptic version message.
+RUN apk add --no-cache ca-certificates postgresql17-client \
     && adduser -D -u 10001 medbill
 
 WORKDIR /app
@@ -31,6 +36,10 @@ WORKDIR /app
 COPY --from=build /out/medbill-server /app/medbill-server
 # Shipped so the image can also run one-off migrations, not just serve.
 COPY --from=build /src/migrations /app/migrations
+
+# Where pg_dump writes. Created with the right owner here so the unprivileged user below can
+# write to it even on the first start, before any volume is mounted over it.
+RUN mkdir -p /var/lib/medbill/backups && chown -R medbill /var/lib/medbill
 
 # Runs unprivileged. Nothing in this service needs root, and a container that never needed it is
 # one less thing to get wrong later.

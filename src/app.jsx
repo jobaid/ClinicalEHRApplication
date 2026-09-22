@@ -8,6 +8,12 @@ import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPass
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import {
+  BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, myBackupPermissions,
+  listBackups, createBackup, downloadBackup, uploadBackup, restoreBackup, deleteBackup,
+  getBackupSettings, saveBackupSettings, listBackupAccess, saveBackupAccess, backupAccessHistory,
+  formatBytes, saveBlob,
+} from "./firebase/backupService";
+import {
   LayoutDashboard, CalendarDays, Users, Receipt, FileStack, BarChart3,
   Plus, X, Search, ChevronRight, ChevronLeft, AlertCircle, CheckCircle2, Clock,
   Send, DollarSign, Stethoscope, Settings, Trash2, Pencil, MessageSquarePlus,
@@ -15,7 +21,7 @@ import {
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
   Activity, Pill, ClipboardList, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
-  KeyRound, ShieldCheck
+  KeyRound, ShieldCheck, Database
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -2339,6 +2345,23 @@ function ClinicApp({
   const [showInsuranceAdmin, setShowInsuranceAdmin] = useState(false);
   const [showChangePassword, setShowChangePassword] = useState(false);
   const [showSecurity, setShowSecurity] = useState(false);
+  const [showBackup, setShowBackup] = useState(false);
+
+  // What this account may do with backups, as the SERVER sees it. Fetched rather than derived
+  // from the role, because backup access is granted per user (see server/userpermissions.go) and
+  // the role alone cannot answer it. Used only to decide which controls to render - every call
+  // is authorised again server-side.
+  const [backupPerms, setBackupPerms] = useState({ permissions: [], superAdmin: false });
+  useEffect(() => {
+    if (!session) return undefined;
+    let live = true;
+    myBackupPermissions()
+      .then((p) => live && setBackupPerms(p))
+      // A failure here means no backup controls appear, which is the right way to be wrong.
+      .catch(() => live && setBackupPerms({ permissions: [], superAdmin: false }));
+    return () => { live = false; };
+  }, [session]);
+
   const [showSupportPanel, setShowSupportPanel] = useState(false);
   const [showTicklerPanel, setShowTicklerPanel] = useState(false);
   const [ticklerPrefill, setTicklerPrefill] = useState(null); // set to open the Tickler panel pre-filled from a charge
@@ -3146,6 +3169,8 @@ function ClinicApp({
               onOpenBatchManagement={() => setShowBatchManagement(true)}
               onOpenChangePassword={() => setShowChangePassword(true)}
               onOpenSecurity={() => setShowSecurity(true)}
+              onOpenBackup={() => setShowBackup(true)}
+              canSeeBackup={backupPerms.permissions.length > 0}
               onOpenUserAdmin={() => setShowUserAdmin(true)}
               onOpenManageRoles={() => setShowManageRoles(true)}
               onOpenPracticeCatalog={() => setShowPracticeCatalog(true)}
@@ -3381,6 +3406,15 @@ function ClinicApp({
         </Modal>
       )}
 
+      {showBackup && (
+        <Modal title="Backup & Restore" onClose={() => setShowBackup(false)} size="max-w-5xl">
+          <BackupRestore
+            perms={backupPerms.permissions}
+            superAdmin={backupPerms.superAdmin}
+          />
+        </Modal>
+      )}
+
       {blockedClose && (
         <Modal title="Batch still has money to post" onClose={() => setBlockedClose(null)}>
           <p className="text-sm text-slate-600 mb-3">
@@ -3540,7 +3574,7 @@ function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
 // The gear menu is the app's admin surface: everyone gets batch management and their own
 // password; a Super Admin additionally gets the two account screens, which is why User accounts
 // no longer sits in the top nav.
-function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassword, onOpenSecurity, onOpenUserAdmin, onOpenManageRoles, onOpenPracticeCatalog, onOpenInsuranceAdmin, canManageInsurance }) {
+function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassword, onOpenSecurity, onOpenBackup, canSeeBackup, onOpenUserAdmin, onOpenManageRoles, onOpenPracticeCatalog, onOpenInsuranceAdmin, canManageInsurance }) {
   const [open, setOpen] = useState(false);
   const itemCls = "w-full text-left px-3 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2";
   return (
@@ -3553,8 +3587,13 @@ function SettingsMenu({ isAccountAdmin, onOpenBatchManagement, onOpenChangePassw
           <button onClick={() => { onOpenBatchManagement(); setOpen(false); }} className={itemCls}><Landmark size={13} /> Batch Management</button>
           <button onClick={() => { onOpenChangePassword(); setOpen(false); }} className={itemCls}><KeyRound size={13} /> Change password…</button>
           <button onClick={() => { onOpenSecurity(); setOpen(false); }} className={itemCls}><ShieldCheck size={13} /> Security &amp; trusted devices</button>
-          {(isAccountAdmin || canManageInsurance) && (
+          {(isAccountAdmin || canManageInsurance || canSeeBackup) && (
             <div className="border-t border-slate-100 mt-1.5 pt-1.5 px-3 pb-1 text-[10px] font-medium uppercase tracking-wide text-slate-400">Administration</div>
+          )}
+          {/* Shown on the backup grant, not on the role: a Biller who has been given backup
+              access must see this, and a Manager who has not must not. */}
+          {canSeeBackup && (
+            <button onClick={() => { onOpenBackup(); setOpen(false); }} className={itemCls}><Database size={13} /> Backup &amp; Restore</button>
           )}
           {canManageInsurance && (
             <button onClick={() => { onOpenInsuranceAdmin(); setOpen(false); }} className={itemCls}><Shield size={13} /> Insurance Management</button>
@@ -3726,6 +3765,659 @@ function SecuritySettings() {
             <button onClick={() => setConfirmAll(false)} className="flex-1 border border-slate-200 text-slate-600 text-sm py-2 rounded-lg hover:bg-slate-50">Cancel</button>
             <button onClick={revokeEverything} disabled={busy === "all"} className="flex-1 bg-rose-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-rose-700 disabled:opacity-50">
               {busy === "all" ? "Revoking…" : "Revoke all"}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------- Settings: Backup & Restore ----------
+//
+// Three screens behind one modal: the backup history and its actions, the automatic schedule,
+// and the Access Management grid that decides who sees any of it.
+//
+// Every control here is rendered conditionally on a permission, and NONE of that is the
+// enforcement. The server re-checks each grant per request (see requirePerm in
+// server/userpermissions.go), so hiding a button is a courtesy to the user, not a security
+// boundary — someone who calls the endpoint directly gets a 403 either way.
+
+function BackupRestore({ perms, superAdmin }) {
+  const can = useCallback((p) => perms.includes(p), [perms]);
+  const [tab, setTab] = useState("history");
+
+  const tabs = [
+    { id: "history", label: "Backup History", show: can("BACKUP_VIEW") },
+    { id: "schedule", label: "Automatic Backups", show: can("BACKUP_VIEW") },
+    { id: "access", label: "Access Management", show: can("BACKUP_ACCESS_MANAGEMENT") },
+  ].filter((t) => t.show);
+
+  // Derived rather than corrected in an effect. Which tabs exist depends on permissions, which
+  // arrive asynchronously, so `tab` can briefly name a tab that is not on offer; resolving that
+  // during render shows the right thing on the first paint instead of rendering nothing and then
+  // re-rendering. An effect here would also be a cascading-render warning.
+  const activeTab = tabs.some((t) => t.id === tab) ? tab : tabs[0]?.id;
+
+  if (!tabs.length) {
+    return (
+      <Card className="p-4">
+        <p className="text-sm text-slate-500">You do not have access to Backup &amp; Restore.</p>
+        <p className="text-xs text-slate-400 mt-1">A Super Admin can grant it from Access Management.</p>
+      </Card>
+    );
+  }
+
+  return (
+    <div>
+      <div className="flex items-center gap-1 mb-4 border border-slate-200 bg-white rounded-lg p-1 w-fit flex-wrap">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`px-2.5 py-1.5 text-xs rounded-md whitespace-nowrap ${activeTab === t.id ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-50"}`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === "history" && <BackupHistory can={can} />}
+      {activeTab === "schedule" && <BackupSchedule can={can} />}
+      {activeTab === "access" && <BackupAccessManagement superAdmin={superAdmin} />}
+    </div>
+  );
+}
+
+function BackupHistory({ can }) {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const [confirmRestore, setConfirmRestore] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [restoreWord, setRestoreWord] = useState("");
+  const fileRef = useRef(null);
+
+  const load = useCallback(async () => {
+    try {
+      setRows(await listBackups());
+      setError("");
+    } catch (e) {
+      setError(e?.message || "Could not load the backup history.");
+      setRows([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    let live = true;
+    listBackups()
+      .then((r) => live && setRows(r))
+      .catch((e) => live && (setError(e?.message || "Could not load the backup history."), setRows([])));
+    return () => { live = false; };
+  }, []);
+
+  async function run(label, fn) {
+    setBusy(label);
+    setError("");
+    try {
+      await fn();
+      await load();
+    } catch (e) {
+      setError(e?.message || "That did not work.");
+    }
+    setBusy("");
+  }
+
+  async function doDownload(id) {
+    setBusy("dl" + id);
+    setError("");
+    try {
+      const { blob, filename } = await downloadBackup(id);
+      saveBlob(blob, filename);
+    } catch (e) {
+      setError(e?.message || "Could not download that backup.");
+    }
+    setBusy("");
+  }
+
+  async function doUpload(file) {
+    if (!file) return;
+    await run("upload", () => uploadBackup(file));
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  if (rows === null) return <Card className="p-4"><p className="text-sm text-slate-400">Loading…</p></Card>;
+
+  return (
+    <div className="space-y-4">
+      {error && (
+        <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{error}</div>
+      )}
+
+      <div className="flex items-center gap-2 flex-wrap">
+        {can("BACKUP_CREATE") && (
+          <button
+            onClick={() => run("create", () => createBackup(""))}
+            disabled={!!busy}
+            className="text-xs bg-slate-900 text-white rounded-lg px-3 py-2 hover:bg-slate-800 disabled:opacity-50 flex items-center gap-1.5"
+          >
+            <Database size={13} /> {busy === "create" ? "Creating…" : "Create Backup Now"}
+          </button>
+        )}
+        {can("BACKUP_UPLOAD") && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".dump,.sql,.backup"
+              className="hidden"
+              onChange={(e) => doUpload(e.target.files?.[0])}
+            />
+            <button
+              onClick={() => fileRef.current?.click()}
+              disabled={!!busy}
+              className="text-xs border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50 disabled:opacity-50 flex items-center gap-1.5"
+            >
+              <Upload size={13} /> {busy === "upload" ? "Uploading…" : "Upload Backup"}
+            </button>
+          </>
+        )}
+        <button onClick={load} disabled={!!busy} className="text-xs text-slate-500 hover:text-slate-700 px-2 py-2">
+          Refresh
+        </button>
+      </div>
+
+      <Card className="p-0 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-xs text-slate-500">
+            <tr>
+              <th className="text-left px-3 py-2 font-medium">Created</th>
+              <th className="text-left px-3 py-2 font-medium">Type</th>
+              <th className="text-left px-3 py-2 font-medium">Size</th>
+              <th className="text-left px-3 py-2 font-medium">Status</th>
+              <th className="text-left px-3 py-2 font-medium">By</th>
+              <th className="text-right px-3 py-2 font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((b) => (
+              <tr key={b.id} className="border-t border-slate-100">
+                <td className="px-3 py-2">
+                  <div className="text-slate-800">{new Date(b.createdAt).toLocaleString()}</div>
+                  {b.note && <div className="text-xs text-slate-400">{b.note}</div>}
+                </td>
+                <td className="px-3 py-2 text-xs text-slate-500 capitalize">{b.kind}</td>
+                <td className="px-3 py-2 text-xs text-slate-600">{formatBytes(b.sizeBytes)}</td>
+                <td className="px-3 py-2">
+                  {b.status === "complete" && b.onDisk && (
+                    <span className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-1.5 py-0.5">Ready</span>
+                  )}
+                  {b.status === "complete" && !b.onDisk && (
+                    <span className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-1.5 py-0.5">File missing</span>
+                  )}
+                  {b.status === "running" && <span className="text-xs text-slate-500">Running…</span>}
+                  {b.status === "failed" && (
+                    <span className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-1.5 py-0.5" title={b.error}>Failed</span>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-xs text-slate-500">{b.createdBy}</td>
+                <td className="px-3 py-2">
+                  <div className="flex items-center gap-1.5 justify-end">
+                    {can("BACKUP_DOWNLOAD") && b.status === "complete" && b.onDisk && (
+                      <button
+                        onClick={() => doDownload(b.id)}
+                        disabled={!!busy}
+                        className="text-xs border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50 disabled:opacity-50"
+                      >
+                        {busy === "dl" + b.id ? "…" : "Download"}
+                      </button>
+                    )}
+                    {can("BACKUP_RESTORE") && b.status === "complete" && b.onDisk && (
+                      <button
+                        onClick={() => { setConfirmRestore(b); setRestoreWord(""); }}
+                        disabled={!!busy}
+                        className="text-xs border border-amber-300 text-amber-800 rounded-lg px-2 py-1 hover:bg-amber-50 disabled:opacity-50"
+                      >
+                        Restore
+                      </button>
+                    )}
+                    {can("BACKUP_DELETE") && (
+                      <button
+                        onClick={() => setConfirmDelete(b)}
+                        disabled={!!busy}
+                        className="text-xs text-rose-700 border border-rose-200 rounded-lg px-2 py-1 hover:bg-rose-50 disabled:opacity-50"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={6} className="px-3 py-6 text-center text-slate-400 text-sm">No backups yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+
+      {confirmRestore && (
+        <Modal title="Restore this backup?" onClose={() => setConfirmRestore(null)}>
+          <div className="text-sm text-slate-600 space-y-2 mb-3">
+            <p className="text-rose-700 font-medium">
+              This replaces all current patient, claim and payment data with the contents of this backup.
+            </p>
+            <p>
+              Backup from <span className="font-medium text-slate-800">{new Date(confirmRestore.createdAt).toLocaleString()}</span>
+              {" "}({formatBytes(confirmRestore.sizeBytes)}).
+            </p>
+            <p className="text-xs text-slate-500">
+              A safety copy of the database as it is right now is taken automatically first, so this
+              can be undone. The restore runs in a single transaction: if it fails, nothing changes.
+            </p>
+          </div>
+          <label className="block text-xs text-slate-500 mb-1">Type RESTORE to confirm</label>
+          <input
+            value={restoreWord}
+            onChange={(e) => setRestoreWord(e.target.value)}
+            className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm mb-4"
+            placeholder="RESTORE"
+          />
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setConfirmRestore(null)} className="text-sm px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg">Cancel</button>
+            <button
+              disabled={restoreWord.trim() !== "RESTORE" || !!busy}
+              onClick={async () => {
+                const id = confirmRestore.id;
+                setConfirmRestore(null);
+                await run("restore", () => restoreBackup(id));
+              }}
+              className="text-sm px-3 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-40"
+            >
+              {busy === "restore" ? "Restoring…" : "Restore now"}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {confirmDelete && (
+        <Modal title="Delete this backup?" onClose={() => setConfirmDelete(null)}>
+          <p className="text-sm text-slate-600 mb-4">
+            The file is removed permanently. Backups taken before it are not affected.
+          </p>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setConfirmDelete(null)} className="text-sm px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg">Cancel</button>
+            <button
+              onClick={async () => {
+                const id = confirmDelete.id;
+                setConfirmDelete(null);
+                await run("delete", () => deleteBackup(id));
+              }}
+              className="text-sm px-3 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700"
+            >
+              Delete
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function BackupSchedule({ can }) {
+  const [cfg, setCfg] = useState(null);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const editable = can("BACKUP_SETTINGS");
+
+  useEffect(() => {
+    let live = true;
+    getBackupSettings()
+      .then((c) => live && setCfg(c))
+      .catch((e) => live && setError(e?.message || "Could not load the backup settings."));
+    return () => { live = false; };
+  }, []);
+
+  if (!cfg) return <Card className="p-4"><p className="text-sm text-slate-400">{error || "Loading…"}</p></Card>;
+
+  const set = (patch) => { setCfg((c) => ({ ...c, ...patch })); setSaved(false); };
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      setCfg(await saveBackupSettings(cfg));
+      setSaved(true);
+    } catch (e) {
+      setError(e?.message || "Could not save the backup settings.");
+    }
+    setBusy(false);
+  }
+
+  return (
+    <div className="space-y-4">
+      {error && <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{error}</div>}
+
+      <Card className="p-4">
+        <SectionTitle>Automatic backups</SectionTitle>
+        <label className="flex items-center gap-2 text-sm text-slate-700 mb-3">
+          <input
+            type="checkbox"
+            checked={cfg.autoEnabled}
+            disabled={!editable}
+            onChange={(e) => set({ autoEnabled: e.target.checked })}
+          />
+          Run a backup automatically
+        </label>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs text-slate-500 mb-1">Frequency</label>
+            <select
+              value={cfg.frequency}
+              disabled={!editable || !cfg.autoEnabled}
+              onChange={(e) => set({ frequency: e.target.value })}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm disabled:bg-slate-50"
+            >
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+            </select>
+          </div>
+          {cfg.frequency === "weekly" && (
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Day</label>
+              <select
+                value={cfg.weekday}
+                disabled={!editable || !cfg.autoEnabled}
+                onChange={(e) => set({ weekday: Number(e.target.value) })}
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm disabled:bg-slate-50"
+              >
+                {WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}
+              </select>
+            </div>
+          )}
+          <div>
+            <label className="block text-xs text-slate-500 mb-1">Time (UTC)</label>
+            <input
+              type="time"
+              value={`${String(cfg.hourUtc).padStart(2, "0")}:${String(cfg.minuteUtc).padStart(2, "0")}`}
+              disabled={!editable || !cfg.autoEnabled}
+              onChange={(e) => {
+                const [h, m] = e.target.value.split(":").map(Number);
+                set({ hourUtc: h || 0, minuteUtc: m || 0 });
+              }}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm disabled:bg-slate-50"
+            />
+            {/* Stated in UTC because that is what is stored. Showing a local time that silently
+                shifts with daylight saving would make the schedule look wrong twice a year. */}
+            <p className="text-[11px] text-slate-400 mt-1">
+              Your local time: {new Date(Date.UTC(2000, 0, 1, cfg.hourUtc, cfg.minuteUtc)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </p>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <SectionTitle>Retention</SectionTitle>
+        <p className="text-xs text-slate-500 mb-3">
+          A scheduled backup is removed only once it is <em>both</em> older than the age limit and
+          outside the newest N. Backups you created or uploaded yourself are never removed automatically.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs text-slate-500 mb-1">Keep the newest</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number" min={1} max={365}
+                value={cfg.retentionCount}
+                disabled={!editable}
+                onChange={(e) => set({ retentionCount: Number(e.target.value) })}
+                className="w-24 border border-slate-200 rounded-lg px-3 py-2 text-sm disabled:bg-slate-50"
+              />
+              <span className="text-sm text-slate-500">backups</span>
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs text-slate-500 mb-1">Minimum age before removal</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number" min={1} max={3650}
+                value={cfg.retentionDays}
+                disabled={!editable}
+                onChange={(e) => set({ retentionDays: Number(e.target.value) })}
+                className="w-24 border border-slate-200 rounded-lg px-3 py-2 text-sm disabled:bg-slate-50"
+              />
+              <span className="text-sm text-slate-500">days</span>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      <div className="flex items-center gap-3">
+        {editable ? (
+          <>
+            <button
+              onClick={save}
+              disabled={busy}
+              className="text-sm bg-slate-900 text-white rounded-lg px-4 py-2 hover:bg-slate-800 disabled:opacity-50"
+            >
+              {busy ? "Saving…" : "Save settings"}
+            </button>
+            {saved && <span className="text-sm text-emerald-700">Saved.</span>}
+          </>
+        ) : (
+          <p className="text-xs text-slate-400">You can see these settings but not change them.</p>
+        )}
+        {cfg.lastRunAt && (
+          <span className="text-xs text-slate-400 ml-auto">
+            Last automatic backup: {new Date(cfg.lastRunAt).toLocaleString()}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BackupAccessManagement({ superAdmin }) {
+  const [users, setUsers] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [error, setError] = useState("");
+  const [editing, setEditing] = useState(null);   // { user, next: Set }
+  const [confirmRisk, setConfirmRisk] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [a, h] = await Promise.all([listBackupAccess(), backupAccessHistory()]);
+      setUsers(a.users);
+      setHistory(h);
+      setError("");
+    } catch (e) {
+      setError(e?.message || "Could not load backup access.");
+      setUsers([]);
+    }
+  }, []);
+
+  // Guarded the same way the other panels load, so a modal closed mid-flight cannot write into
+  // an unmounted component. load() above is for refreshing after a save.
+  useEffect(() => {
+    let live = true;
+    Promise.all([listBackupAccess(), backupAccessHistory()])
+      .then(([a, h]) => { if (live) { setUsers(a.users); setHistory(h); } })
+      .catch((e) => { if (live) { setError(e?.message || "Could not load backup access."); setUsers([]); } });
+    return () => { live = false; };
+  }, []);
+
+  if (users === null) return <Card className="p-4"><p className="text-sm text-slate-400">Loading…</p></Card>;
+
+  function openEditor(u) {
+    setEditing({ user: u, next: new Set(u.permissions) });
+  }
+
+  function toggle(key) {
+    setEditing((e) => {
+      const next = new Set(e.next);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return { ...e, next };
+    });
+  }
+
+  async function commit(permissions) {
+    setBusy(true);
+    setError("");
+    try {
+      await saveBackupAccess(editing.user.id, permissions);
+      setEditing(null);
+      setConfirmRisk(null);
+      await load();
+    } catch (e) {
+      setError(e?.message || "Could not save those permissions.");
+    }
+    setBusy(false);
+  }
+
+  // Section 53: granting a permission that can destroy data, or that can hand that ability to
+  // someone else, gets an explicit confirmation naming the person and the risk.
+  function attemptSave() {
+    const before = new Set(editing.user.permissions);
+    const newlyHighRisk = [...editing.next].filter((p) => !before.has(p) && HIGH_RISK_PERMISSIONS.has(p));
+    const permissions = BACKUP_PERMISSIONS.map((p) => p.key).filter((k) => editing.next.has(k));
+    if (newlyHighRisk.length) setConfirmRisk({ permissions, newlyHighRisk });
+    else commit(permissions);
+  }
+
+  return (
+    <div className="space-y-4">
+      {error && <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{error}</div>}
+
+      <Card className="p-0 overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-xs text-slate-500">
+            <tr>
+              <th className="text-left px-3 py-2 font-medium">User</th>
+              <th className="text-left px-3 py-2 font-medium">Role</th>
+              {BACKUP_PERMISSIONS.map((p) => (
+                <th key={p.key} className="px-2 py-2 font-medium text-center" title={p.help}>
+                  {p.label.replace("Backup", "").replace("History", "").trim() || "View"}
+                </th>
+              ))}
+              <th className="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map((u) => (
+              <tr key={u.id} className="border-t border-slate-100">
+                <td className="px-3 py-2">
+                  <div className="text-slate-800">{u.name || u.email}</div>
+                  <div className="text-xs text-slate-400">{u.email}{u.disabled ? " · disabled" : ""}</div>
+                </td>
+                <td className="px-3 py-2 text-xs text-slate-500">{u.role}</td>
+                {BACKUP_PERMISSIONS.map((p) => (
+                  <td key={p.key} className="px-2 py-2 text-center">
+                    {u.permissions.includes(p.key)
+                      ? <CheckCircle2 size={14} className={u.locked ? "text-slate-400 inline" : "text-emerald-600 inline"} />
+                      : <span className="text-slate-300">·</span>}
+                  </td>
+                ))}
+                <td className="px-3 py-2 text-right">
+                  {u.locked ? (
+                    <span className="text-[11px] text-slate-400" title="A Super Admin always holds full backup access">Always full</span>
+                  ) : (
+                    <button
+                      onClick={() => openEditor(u)}
+                      className="text-xs border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50"
+                    >
+                      Manage
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card className="p-4">
+        <SectionTitle>Permission history</SectionTitle>
+        {history.length === 0 ? (
+          <p className="text-sm text-slate-400">No permission changes recorded yet.</p>
+        ) : (
+          <div className="space-y-1.5 max-h-56 overflow-y-auto">
+            {history.map((h) => (
+              <div key={h.id} className="text-xs text-slate-600 flex gap-2">
+                <span className="text-slate-400 whitespace-nowrap">{new Date(h.createdAt).toLocaleString()}</span>
+                <span className="font-medium text-slate-700">{h.actorName}</span>
+                <span className="text-slate-500">→ {h.targetName}</span>
+                {h.added.length > 0 && <span className="text-emerald-700">+{h.added.map(permissionLabel).join(", ")}</span>}
+                {h.removed.length > 0 && <span className="text-rose-700">−{h.removed.map(permissionLabel).join(", ")}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {editing && (
+        <Modal title={`Manage backup access — ${editing.user.name || editing.user.email}`} onClose={() => setEditing(null)}>
+          <div className="space-y-2 mb-4">
+            {BACKUP_PERMISSIONS.map((p) => {
+              const blocked = p.key === "BACKUP_ACCESS_MANAGEMENT" && !superAdmin;
+              return (
+                <label key={p.key} className={`flex items-start gap-2 text-sm ${blocked ? "opacity-50" : ""}`}>
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={editing.next.has(p.key)}
+                    disabled={blocked}
+                    onChange={() => toggle(p.key)}
+                  />
+                  <span>
+                    <span className="text-slate-800">{p.label}</span>
+                    {HIGH_RISK_PERMISSIONS.has(p.key) && (
+                      <span className="ml-1.5 text-[10px] uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 py-0.5">High risk</span>
+                    )}
+                    <span className="block text-xs text-slate-400">{p.help}</span>
+                    {blocked && <span className="block text-xs text-slate-400">Only a Super Admin can change this.</span>}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setEditing(null)} className="text-sm px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg">Cancel</button>
+            <button
+              onClick={attemptSave}
+              disabled={busy}
+              className="text-sm px-3 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50"
+            >
+              {busy ? "Saving…" : "Save Permissions"}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {confirmRisk && (
+        <Modal title="High-Risk Permission" onClose={() => setConfirmRisk(null)}>
+          <p className="text-sm text-slate-600 mb-2">
+            You are granting <span className="font-medium text-slate-800">{editing.user.name || editing.user.email}</span> permission to:
+          </p>
+          <ul className="text-sm text-slate-800 list-disc pl-5 mb-3">
+            {confirmRisk.newlyHighRisk.map((k) => <li key={k}>{permissionLabel(k)}</li>)}
+          </ul>
+          <p className="text-sm text-rose-700 mb-4">
+            This can change production patient and billing data. Are you sure?
+          </p>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setConfirmRisk(null)} className="text-sm px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg">Cancel</button>
+            <button
+              onClick={() => commit(confirmRisk.permissions)}
+              disabled={busy}
+              className="text-sm px-3 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-50"
+            >
+              {busy ? "Saving…" : "Confirm"}
             </button>
           </div>
         </Modal>

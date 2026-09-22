@@ -54,6 +54,20 @@ services:
       # after the first sign-in anyway. See server/bootstrap.go.
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      # "all" (the default) sends every account through authenticator enrolment; "none" turns the
+      # requirement off without deleting anyone's enrolment. Defaulting to "all" here means the
+      # secure setting is what you get by forgetting to set it.
+      #
+      # This line was missing, so MFA_ENFORCEMENT in .env.docker was read by nothing and the
+      # server always enforced MFA regardless of what the file said.
+      MFA_ENFORCEMENT: ${MFA_ENFORCEMENT:-all}
+      # Where Backup & Restore keeps its dump files. See the backup-data volume below.
+      BACKUP_DIR: /var/lib/medbill/backups
+    volumes:
+      # Backups live on their own volume, deliberately NOT inside db-data. A backup stored inside
+      # the thing it is backing up is not a backup: one `docker compose down -v` would destroy the
+      # database and every copy of it in the same breath.
+      - backup-data:/var/lib/medbill/backups
     depends_on:
       db:
         condition: service_healthy
@@ -81,3 +95,4 @@ services:
 
 volumes:
   db-data:
+  backup-data:
