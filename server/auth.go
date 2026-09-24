@@ -43,6 +43,12 @@ type authedUser struct {
 	Email string
 	Role  string
 	Name  string
+
+	// Read from users.is_demo on every authentication, never from the token and never inferred
+	// from the address. This is the authority for the one MFA exemption in the system, so it has
+	// to come from the row itself - a value carried in a session token would survive the account
+	// being un-flagged.
+	IsDemo bool
 }
 
 const sessionTTL = 12 * time.Hour
@@ -112,11 +118,12 @@ func (s *Server) authenticate(ctx context.Context, email, password string) (auth
 		algo            string
 		hash, salt      *string
 		disabled        bool
+		isDemo          bool
 	)
 	err := s.db.QueryRow(ctx,
-		`SELECT id, role, name, disabled, password_algo, password_hash, password_salt
+		`SELECT id, role, name, disabled, password_algo, password_hash, password_salt, is_demo
 		   FROM users WHERE lower(email) = lower($1)`, email).
-		Scan(&uid, &role, &name, &disabled, &algo, &hash, &salt)
+		Scan(&uid, &role, &name, &disabled, &algo, &hash, &salt, &isDemo)
 	if err != nil {
 		return authedUser{}, errBadCredentials
 	}
@@ -147,7 +154,7 @@ func (s *Server) authenticate(ctx context.Context, email, password string) (auth
 	if !ok {
 		return authedUser{}, errBadCredentials
 	}
-	return authedUser{UID: uid, Email: email, Role: role, Name: name}, nil
+	return authedUser{UID: uid, Email: email, Role: role, Name: name, IsDemo: isDemo}, nil
 }
 
 // ---------- HTTP handlers ----------
@@ -173,6 +180,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case u.IsDemo:
+		// The one MFA exemption in the system, and it is narrow by construction.
+		//
+		// u.IsDemo came from users.is_demo on this request, read in authenticate() alongside the
+		// password hash - not from the submitted address, not from the session token, and not
+		// from anything the client sent. The column cannot be written through the collections
+		// API (it is absent from the users collection in schema.go), so no signed-in user can
+		// flag their own account and land in this branch.
+		//
+		// This is checked BEFORE state.Enabled so that a demo account which somehow acquired an
+		// enrolment still signs in without one, rather than stranding a published account behind
+		// an authenticator nobody has.
+		s.recordLoginAudit(r.Context(), u, "Demo sign-in (MFA not required)")
+		s.completeLogin(w, u, "demo account")
+
 	case state.Enabled:
 		// This browser may already have proved the second factor within the last 30 days.
 		if s.trustedDeviceValid(r.Context(), r, u.UID) {
@@ -219,7 +241,10 @@ func (s *Server) completeLogin(w http.ResponseWriter, u authedUser, _ string) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token": token,
-		"user":  map[string]any{"uid": u.UID, "email": u.Email},
+		// isDemo is reported so the interface can label the session visibly. It is a display
+		// hint, not a grant: every route re-reads the account, so a client that lies about it
+		// gains nothing.
+		"user": map[string]any{"uid": u.UID, "email": u.Email, "isDemo": u.IsDemo},
 	})
 }
 
@@ -235,8 +260,8 @@ func (s *Server) userFromChallenge(r *http.Request) (authedUser, *Claims, error)
 	var u authedUser
 	var disabled bool
 	if err := s.db.QueryRow(r.Context(),
-		`SELECT id, email, role, name, disabled FROM users WHERE id = $1`, claims.UID).
-		Scan(&u.UID, &u.Email, &u.Role, &u.Name, &disabled); err != nil {
+		`SELECT id, email, role, name, disabled, is_demo FROM users WHERE id = $1`, claims.UID).
+		Scan(&u.UID, &u.Email, &u.Role, &u.Name, &disabled, &u.IsDemo); err != nil {
 		return authedUser{}, nil, errors.New("unknown account")
 	}
 	if disabled {
@@ -295,6 +320,10 @@ func (s *Server) handleMFAEnrollStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "please sign in again")
 		return
 	}
+	// The demo account is exempt from MFA, so enrolling one would be a second factor nobody holds.
+	if denyDemo(w, u) {
+		return
+	}
 	secret, uri, err := s.beginEnrolment(r.Context(), u.UID, u.Email)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -314,6 +343,10 @@ func (s *Server) handleMFAEnrollConfirm(w http.ResponseWriter, r *http.Request) 
 	u, err := s.actorFor(r)
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, "please sign in again")
+		return
+	}
+	// See handleMFAEnrollStart: the demo account must never acquire an enrolment.
+	if denyDemo(w, u) {
 		return
 	}
 	var body struct {
@@ -361,8 +394,8 @@ func (s *Server) actorFor(r *http.Request) (authedUser, error) {
 	var u authedUser
 	var disabled bool
 	if err := s.db.QueryRow(r.Context(),
-		`SELECT id, email, role, name, disabled FROM users WHERE id = $1`, claims.UID).
-		Scan(&u.UID, &u.Email, &u.Role, &u.Name, &disabled); err != nil || disabled {
+		`SELECT id, email, role, name, disabled, is_demo FROM users WHERE id = $1`, claims.UID).
+		Scan(&u.UID, &u.Email, &u.Role, &u.Name, &disabled, &u.IsDemo); err != nil || disabled {
 		return authedUser{}, errors.New("unknown account")
 	}
 	return u, nil
@@ -394,6 +427,11 @@ func (s *Server) handleMFAStatus(w http.ResponseWriter, r *http.Request) {
 // The current password is required: an unlocked browser must not be enough to remove a factor.
 func (s *Server) handleMFADisable(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r.Context())
+	// Nothing to disable - the demo account never enrols - and this endpoint takes the account
+	// password, which is public for this account.
+	if denyDemo(w, u) {
+		return
+	}
 	var body struct{ Password string }
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed request")
@@ -470,7 +508,7 @@ func (s *Server) recordLoginAudit(ctx context.Context, u authedUser, action stri
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uid": u.UID, "email": u.Email,
+		"uid": u.UID, "email": u.Email, "isDemo": u.IsDemo,
 	})
 }
 
@@ -530,6 +568,11 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 // exists only to honour hashes that came out of Firebase, never to create new ones.
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r.Context())
+	// The demo account's password is published on the login page. Letting a visitor change it
+	// would lock out every visitor after them.
+	if denyDemo(w, u) {
+		return
+	}
 	var body struct{ CurrentPassword, NewPassword string }
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed request")
@@ -666,10 +709,10 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		var role, name, email string
-		var disabled bool
+		var disabled, isDemo bool
 		if err := s.db.QueryRow(r.Context(),
-			`SELECT role, name, email, disabled FROM users WHERE id = $1`, claims.UID).
-			Scan(&role, &name, &email, &disabled); err != nil {
+			`SELECT role, name, email, disabled, is_demo FROM users WHERE id = $1`, claims.UID).
+			Scan(&role, &name, &email, &disabled, &isDemo); err != nil {
 			writeErr(w, http.StatusUnauthorized, "unknown account")
 			return
 		}
@@ -678,7 +721,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		u := authedUser{UID: claims.UID, Email: email, Role: role, Name: name}
+		u := authedUser{UID: claims.UID, Email: email, Role: role, Name: name, IsDemo: isDemo}
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
 	}
 }

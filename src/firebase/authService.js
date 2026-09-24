@@ -28,7 +28,7 @@ export async function signIn(email, password) {
     setTokenProvider(() => firebaseCurrentToken());
     setToken(await cred.getToken());
     const me = await api("/api/auth/me");
-    return { user: { uid: me.uid, email: me.email } };
+    return { user: { uid: me.uid, email: me.email, isDemo: !!me.isDemo } };
   }
 
   const res = await api("/api/auth/login", {
@@ -46,7 +46,25 @@ export async function signIn(email, password) {
     };
   }
   setToken(res.token); // also opens the change feed
-  return { user: { uid: res.user.uid, email: res.user.email } };
+  return { user: { uid: res.user.uid, email: res.user.email, isDemo: !!res.user.isDemo } };
+}
+
+/**
+ * Credentials for the demonstration account, or {enabled: false}.
+ *
+ * Unauthenticated, because the login page calls it before anyone has signed in. It returns a
+ * password, which is safe for this one account and this one account only: it exists to be signed
+ * into by strangers and its password is printed on the page. The server confirms against the
+ * database that the address really is a demo account before answering, so a stale environment
+ * variable can never cause a real user's address to be shown next to a password.
+ */
+export async function demoInfo() {
+  try {
+    return await api("/api/auth/demo");
+  } catch {
+    // A demo panel that fails to load should leave the normal login form working.
+    return { enabled: false };
+  }
 }
 
 // ---------- multi-factor authentication ----------

@@ -4,7 +4,7 @@ import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
 import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPassword, adminResetPassword,
   verifyMfa, startMfaEnrollment, confirmMfaEnrollment, securityStatus, listTrustedDevices,
-  revokeTrustedDevice, revokeAllTrustedDevices } from "./firebase/authService";
+  revokeTrustedDevice, revokeAllTrustedDevices, demoInfo } from "./firebase/authService";
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import {
@@ -1974,6 +1974,31 @@ function LoginPage({ onLogin }) {
   // this simply swaps which screen is rendered until verification completes.
   const [mfa, setMfa] = useState(null);
 
+  // Demo credentials, fetched from the API rather than compiled into this bundle so the page can
+  // never advertise a password the server has stopped accepting. {enabled: false} when no demo
+  // account is configured, which is the default and hides the panel entirely.
+  const [demo, setDemo] = useState(null);
+  const [copied, setCopied] = useState("");
+
+  useEffect(() => {
+    let live = true;
+    demoInfo()
+      .then((d) => live && setDemo(d))
+      .catch(() => live && setDemo({ enabled: false }));
+    return () => { live = false; };
+  }, []);
+
+  async function copyValue(field, value) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(field);
+      setTimeout(() => setCopied(""), 1500);
+    } catch {
+      // Clipboard access is refused over plain HTTP and in some embedded browsers. The value is
+      // displayed in full either way, so there is always a way to get it.
+    }
+  }
+
   // Shared tail of a successful sign-in, reached either straight from the password step (when no
   // second factor is outstanding) or after verification. One place, so the profile and disabled
   // checks cannot drift apart between the two routes.
@@ -1994,7 +2019,15 @@ function LoginPage({ onLogin }) {
       return;
     }
     setLoading(false);
-    onLogin({ uid: credential.user.uid, email: credential.user.email, name: profile.name, role: profile.role });
+    onLogin({
+      uid: credential.user.uid,
+      email: credential.user.email,
+      name: profile.name,
+      role: profile.role,
+      // Carried so the header can label the session. Presentation only - the server decides what
+      // a demo account may actually do, on every request.
+      isDemo: !!credential.user.isDemo,
+    });
   }
 
   if (mfa) {
@@ -2005,37 +2038,32 @@ function LoginPage({ onLogin }) {
       : <MfaVerifyScreen challenge={mfa.challenge} onCancel={back} onVerified={finishLogin} />;
   }
 
-  async function submit(e) {
-    e.preventDefault();
+  // One sign-in path, used by both the form and the demo button.
+  //
+  // The demo button calls exactly this - the same signIn(), the same API, the same session. It
+  // is a pair of credentials typed for you, not a shortcut around authentication: if the demo
+  // account were deleted or its password rotated, this button would fail like any wrong password.
+  async function loginWith(emailValue, passwordValue) {
     setLoading(true);
     setError("");
     try {
-      const credential = await signIn(email.trim(), password);
+      const credential = await signIn(emailValue, passwordValue);
       // No session token was stored: a code (or first-time setup) is still outstanding.
       if (credential.mfa) {
         setMfa(credential.mfa);
         setLoading(false);
         return;
       }
-      const profile = await fetchUserProfile(credential.user.uid);
-      if (!profile) {
-        await signOutUser();
-        setError("No profile found for this account. Ask an admin to provision your access.");
-        setLoading(false);
-        return;
-      }
-      if (profile.disabled) {
-        await signOutUser();
-        setError("This account has been deactivated. Contact an administrator.");
-        setLoading(false);
-        return;
-      }
-      setLoading(false);
-      onLogin({ uid: credential.user.uid, email: credential.user.email, name: profile.name, role: profile.role });
+      await finishLogin(credential);
     } catch {
       setError("Invalid email or password.");
       setLoading(false);
     }
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    await loginWith(email.trim(), password);
   }
 
   return (
@@ -2077,6 +2105,38 @@ function LoginPage({ onLogin }) {
           </form>
         </Card>
 
+        {demo?.enabled && (
+          <Card className="p-4 mt-4 border-teal-200 bg-teal-50/70">
+            <div className="flex items-center gap-1.5 mb-0.5">
+              <Eye size={13} className="text-teal-700" />
+              <p className="text-xs font-semibold text-teal-900">Demo Access</p>
+            </div>
+            <p className="text-[11px] text-teal-700 mb-3">
+              {demo.name} &middot; {ROLE_LABELS[demo.role] || demo.role} role
+            </p>
+
+            <div className="space-y-1.5 mb-3">
+              <CredentialRow label="Username" value={demo.email} field="u" copied={copied} onCopy={copyValue} />
+              <CredentialRow label="Password" value={demo.password} field="p" copied={copied} onCopy={copyValue} />
+            </div>
+
+            <button
+              type="button"
+              onClick={() => loginWith(demo.email, demo.password)}
+              disabled={loading}
+              className="w-full bg-teal-700 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-800 disabled:opacity-60"
+            >
+              {loading ? "Signing in…" : "Login as Demo User"}
+            </button>
+
+            <p className="text-[11px] text-teal-700 mt-2 leading-relaxed">
+              {demo.notice || "This account is for demonstration purposes only."}{" "}
+              It signs in through the same API as every other account, and is the only account
+              exempt from authenticator verification.
+            </p>
+          </Card>
+        )}
+
         {SHOW_DEMO_LOGINS && (
         <Card className="p-4 mt-4 bg-amber-50 border-amber-200">
           <p className="text-xs font-medium text-amber-800 mb-2 flex items-center gap-1.5"><AlertTriangle size={13} /> Development-only credentials</p>
@@ -2092,6 +2152,28 @@ function LoginPage({ onLogin }) {
         </Card>
         )}
       </div>
+    </div>
+  );
+}
+
+// One demo credential, shown in full with a copy button.
+//
+// Shown in full deliberately: this is the published demonstration account and the whole point is
+// that a visitor can read and type it. No other credential in this application is ever rendered.
+function CredentialRow({ label, value, field, copied, onCopy }) {
+  return (
+    <div className="flex items-center justify-between gap-2 bg-white border border-teal-200 rounded-lg px-2.5 py-1.5">
+      <div className="min-w-0">
+        <div className="text-[10px] uppercase tracking-wide text-slate-400">{label}</div>
+        <div className="text-xs text-slate-800 font-mono truncate">{value}</div>
+      </div>
+      <button
+        type="button"
+        onClick={() => onCopy(field, value)}
+        className="text-[11px] text-teal-700 hover:underline shrink-0 px-1"
+      >
+        {copied === field ? "Copied" : "Copy"}
+      </button>
     </div>
   );
 }
@@ -2233,7 +2315,7 @@ export default function ClinicBilling() {
   }
 
   function handleLogin(user) {
-    const sess = { uid: user.uid, email: user.email, name: user.name, role: user.role, loginAt: Date.now(), lastActivity: Date.now() };
+    const sess = { uid: user.uid, email: user.email, name: user.name, role: user.role, isDemo: !!user.isDemo, loginAt: Date.now(), lastActivity: Date.now() };
     setSession(sess);
     lastActivityRef.current = Date.now();
     lastWriteRef.current = Date.now();
@@ -3185,6 +3267,13 @@ function ClinicApp({
                 <div className="text-white leading-tight">{session.name}</div>
                 <div className="text-slate-500 leading-tight">{ROLE_LABELS[session.role]}</div>
               </div>
+              {/* So nobody mistakes the shared demonstration account for a colleague's login,
+                  and so a screenshot taken from the demo is self-evidently not real data. */}
+              {session.isDemo && (
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-200 bg-amber-900/60 border border-amber-700 rounded px-1.5 py-0.5">
+                  Demo Account
+                </span>
+              )}
               <button onClick={onLogout} className="text-xs text-slate-400 hover:text-white ml-2">Log out</button>
             </div>
           </div>

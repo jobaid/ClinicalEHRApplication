@@ -61,6 +61,15 @@ services:
       # This line was missing, so MFA_ENFORCEMENT in .env.docker was read by nothing and the
       # server always enforced MFA regardless of what the file said.
       MFA_ENFORCEMENT: ${MFA_ENFORCEMENT:-all}
+      # The demonstration account. Unset means no demo account exists and the panel never appears
+      # on the login page - which is the right default for a practice running real billing.
+      # Setting both creates ONE extra MANAGER account whose password is published on the login
+      # page and which skips authenticator verification. It can never overwrite a real user: see
+      # ensureDemoUser in server/demo.go. Read section 26/27 of DEPLOYMENT.md before enabling it
+      # on a database that holds real patient information.
+      DEMO_USER_EMAIL: ${DEMO_USER_EMAIL:-}
+      DEMO_USER_PASSWORD: ${DEMO_USER_PASSWORD:-}
+      DEMO_USER_NAME: ${DEMO_USER_NAME:-Manager Demo}
       # Where Backup & Restore keeps its dump files. See the backup-data volume below.
       BACKUP_DIR: /var/lib/medbill/backups
     volumes:

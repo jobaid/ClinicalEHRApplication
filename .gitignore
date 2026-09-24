@@ -101,3 +101,6 @@ manager/build/icon-*.png
 
 # Plain-SQL database dumps also contain live patient data.
 medbill.sql
+
+# Local scratch databases written by Claude Code plugins. Machine-local state, not project code.
+.claude/data/

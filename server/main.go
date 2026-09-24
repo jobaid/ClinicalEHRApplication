@@ -260,6 +260,9 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	// Unauthenticated on purpose: it serves the credentials the login page prints for the one
+	// demonstration account, and nothing else. See server/demo.go.
+	mux.HandleFunc("GET /api/auth/demo", s.handleDemoInfo)
 	mux.HandleFunc("GET /api/auth/me", s.requireAuth(s.handleMe))
 	mux.HandleFunc("POST /api/auth/users", s.requireAuth(s.handleCreateUser))
 	mux.HandleFunc("POST /api/auth/password", s.requireAuth(s.handleChangePassword))
@@ -324,6 +327,18 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "collections": len(collections)})
 	})
+
+	// Demo account. The schema step is additive and idempotent; the seeder creates the account
+	// on first run and refreshes only a row already flagged is_demo on later runs. Neither step
+	// can modify a real user - see server/demo.go. Failures are logged, never fatal: a
+	// misconfigured demo account must not stop a clinic's billing system from starting.
+	if err := s.ensureDemoSchema(context.Background()); err != nil {
+		log.Printf("demo: %v - demo sign-in will not work until this is resolved", err)
+	} else if cfg, cfgErr := loadDemoConfig(); cfgErr != nil {
+		log.Printf("demo: %v - demo sign-in is disabled", cfgErr)
+	} else if err := s.ensureDemoUser(context.Background(), cfg); err != nil {
+		log.Printf("demo: could not prepare the demo account: %v", err)
+	}
 
 	// Backup tables, then the timer that fills them. ensureBackupSchema is idempotent, so this
 	// runs on every boot and a deployment that only pulls new code still gets the new tables -
