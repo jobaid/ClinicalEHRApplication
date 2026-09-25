@@ -341,6 +341,14 @@ func main() {
 	mux.HandleFunc("POST /api/him/worklist/{id}/queries", s.requirePerm(PermHIMQueryCreate, s.handleHIMQueryCreate))
 	mux.HandleFunc("POST /api/him/queries/{qid}/status", s.requirePerm(PermHIMQueryManage, s.handleHIMQueryUpdate))
 
+	// Doctor Clinical Workspace. Patient identity is always part of the query, never taken from
+	// the path alone, so changing an id in the URL cannot reach another patient's record.
+	mux.HandleFunc("GET /api/doctor/patients/{id}/header", s.requirePerm(PermDoctorPatientView, s.handleDoctorHeader))
+	mux.HandleFunc("GET /api/doctor/patients/{id}/timeline", s.requirePerm(PermDoctorRecordView, s.handleDoctorTimeline))
+	mux.HandleFunc("GET /api/doctor/patients/{id}/labs", s.requirePerm(PermDoctorLabView, s.handleLabList))
+	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/trend", s.requirePerm(PermDoctorLabView, s.handleLabTrend))
+	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/{orderId}", s.requirePerm(PermDoctorLabView, s.handleLabReport))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -357,6 +365,11 @@ func main() {
 	// holds data, so a code-only deployment would otherwise be missing every new table.
 	if err := s.ensureClinicalSchema(context.Background()); err != nil {
 		log.Printf("clinical: %v - the worklist modules will not work until this is resolved", err)
+	}
+
+	// Doctor role and the laboratory tables. Additive and idempotent, same as the others.
+	if err := s.ensureDoctorSchema(context.Background()); err != nil {
+		log.Printf("doctor: %v - the clinical workspace will not work until this is resolved", err)
 	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account

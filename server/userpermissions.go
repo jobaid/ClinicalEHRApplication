@@ -47,6 +47,20 @@ const (
 	PermHIMQueryManage  = "HIM_QUERY_MANAGE"
 	PermHIMComplete     = "HIM_COMPLETE"
 	PermHIMReport       = "HIM_REPORT"
+
+	// Doctor Clinical Workspace. Split finely on purpose: reading a chart, writing a note and
+	// SIGNING one are three different responsibilities, and a signature is an attestation that
+	// should never be inherited from the ability to type.
+	PermDoctorPatientView       = "DOCTOR_PATIENT_VIEW"
+	PermDoctorRecordView        = "DOCTOR_MEDICAL_RECORD_VIEW"
+	PermDoctorNoteCreate        = "DOCTOR_CLINICAL_NOTE_CREATE"
+	PermDoctorNoteEdit          = "DOCTOR_CLINICAL_NOTE_EDIT"
+	PermDoctorNoteSign          = "DOCTOR_CLINICAL_NOTE_SIGN"
+	PermDoctorLabView           = "DOCTOR_LAB_VIEW"
+	PermDoctorDocumentView      = "DOCTOR_DOCUMENT_VIEW"
+	PermDoctorDiagnosisManage   = "DOCTOR_DIAGNOSIS_MANAGE"
+	PermDoctorMedicationView    = "DOCTOR_MEDICATION_VIEW"
+	PermDoctorAntimicrobialView = "DOCTOR_ANTIMICROBIAL_VIEW"
 )
 
 // permissionGroup is one block of related grants on the Access Management screen. Grouping is
@@ -88,10 +102,24 @@ var himPermissionOrder = []string{
 	PermHIMReport,
 }
 
+var doctorPermissionOrder = []string{
+	PermDoctorPatientView,
+	PermDoctorRecordView,
+	PermDoctorNoteCreate,
+	PermDoctorNoteEdit,
+	PermDoctorNoteSign,
+	PermDoctorLabView,
+	PermDoctorDocumentView,
+	PermDoctorDiagnosisManage,
+	PermDoctorMedicationView,
+	PermDoctorAntimicrobialView,
+}
+
 var permissionGroups = []permissionGroup{
 	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
 	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
 	{Key: "him", Label: "HIM Coding", Permissions: himPermissionOrder},
+	{Key: "doctor", Label: "Doctor Clinical Workspace", Permissions: doctorPermissionOrder},
 }
 
 // allUserPermissionOrder is every grant, in a stable order. Built from the groups so adding a
@@ -126,6 +154,12 @@ var highRiskUserPermissions = map[string]bool{
 	PermAntimicrobialComplete: true,
 	PermHIMCodingEdit:         true,
 	PermHIMComplete:           true,
+
+	// Signing a note is a clinical attestation and, once signed, the record is protected from
+	// silent edit - so granting the ability to sign deserves the same confirmation as granting
+	// the ability to change what gets billed.
+	PermDoctorNoteSign:        true,
+	PermDoctorDiagnosisManage: true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }
