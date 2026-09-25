@@ -7,6 +7,7 @@ import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPass
   revokeTrustedDevice, revokeAllTrustedDevices, demoInfo } from "./firebase/authService";
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
+import DoctorWorkspace from "./DoctorWorkspace";
 import {
   BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, myBackupPermissions,
   listBackups, createBackup, downloadBackup, uploadBackup, restoreBackup, deleteBackup,
@@ -81,6 +82,7 @@ const DEFAULT_ROLE_TABS = {
   NURSE: ["dashboard", "schedule", "patients", "clinical"],
   RECEPTIONIST: ["dashboard", "schedule", "patients"],
   BILLER: ["dashboard", "patients", "billing", "claims", "reports"],
+  DOCTOR: ["dashboard", "schedule", "patients", "clinical", "record", "reports"],
 };
 
 // CPT catalog now lives in Firestore's cptCatalog collection (loaded once in ClinicApp) and is
@@ -2156,6 +2158,59 @@ function LoginPage({ onLogin }) {
   );
 }
 
+// Patient chooser for the Medical Record tab.
+//
+// Deliberately a plain search over the patient list the application has already loaded: picking
+// a patient is not itself clinical access, and the record only loads - and is only audited -
+// once one is opened.
+function RecordPatientPicker({ patients, onOpen }) {
+  const [q, setQ] = useState("");
+  const term = q.trim().toLowerCase();
+  const shown = term
+    ? patients.filter(p =>
+        (p.name || "").toLowerCase().includes(term) ||
+        (p.id || "").toLowerCase().includes(term) ||
+        (p.dob || "").includes(term))
+    : patients.slice(0, 25);
+
+  return (
+    <Card className="p-4">
+      <SectionTitle>Open a patient record</SectionTitle>
+      <div className="relative mb-3">
+        <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
+        <input
+          autoFocus
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search by name, MRN or date of birth"
+          className="w-full border border-slate-200 rounded-lg pl-8 pr-3 py-2 text-sm"
+        />
+      </div>
+      {shown.length === 0 && <p className="text-sm text-slate-400">No patients match that search.</p>}
+      <div className="divide-y divide-slate-100">
+        {shown.map(p => (
+          <button
+            key={p.id}
+            onClick={() => onOpen(p.id)}
+            className="w-full text-left py-2.5 px-1 hover:bg-slate-50 flex items-center justify-between gap-3"
+          >
+            <span>
+              <span className="block text-sm text-slate-800">{p.name}</span>
+              <span className="block text-xs text-slate-400">MRN {p.id} · DOB {p.dob || "Not available"}</span>
+            </span>
+            <ChevronRight size={15} className="text-slate-300 shrink-0" />
+          </button>
+        ))}
+      </div>
+      {!term && patients.length > 25 && (
+        <p className="text-xs text-slate-400 mt-3">
+          Showing the first 25 of {patients.length}. Search to narrow.
+        </p>
+      )}
+    </Card>
+  );
+}
+
 // One demo credential, shown in full with a copy button.
 //
 // Shown in full deliberately: this is the published demonstration account and the whole point is
@@ -2428,6 +2483,7 @@ function ClinicApp({
   const [showChangePassword, setShowChangePassword] = useState(false);
   const [showSecurity, setShowSecurity] = useState(false);
   const [showBackup, setShowBackup] = useState(false);
+  const [recordPatientId, setRecordPatientId] = useState(null);
 
   // What this account may do with backups, as the SERVER sees it. Fetched rather than derived
   // from the role, because backup access is granted per user (see server/userpermissions.go) and
@@ -2484,6 +2540,7 @@ function ClinicApp({
     { id: "billing", label: "Billing", icon: Receipt },
     { id: "claims", label: "Claims", icon: FileStack },
     { id: "reports", label: "Reports", icon: BarChart3 },
+    { id: "record", label: "Medical Record", icon: Stethoscope, needsPerm: "DOCTOR_MEDICAL_RECORD_VIEW" },
   ];
   // Live grants win; DEFAULT_ROLE_TABS covers the first render and any role without a row.
   // Super Admin is never read from the table - see DEFAULT_ROLE_TABS.
@@ -2494,7 +2551,9 @@ function ClinicApp({
     return DEFAULT_ROLE_TABS[session.role] || ["dashboard"];
   }, [rolePermissions, session.role]);
   const isAccountAdmin = session.role === "SUPER_ADMIN";
-  const nav = allNav.filter(item => allowedTabs.includes(item.id));
+  const nav = allNav.filter(item =>
+    allowedTabs.includes(item.id) &&
+    (!item.needsPerm || backupPerms.permissions.includes(item.needsPerm)));
   const tabAllowed = allowedTabs.includes(tab);
 
   // "users" was a nav tab until User accounts moved into the Settings menu, and the last
@@ -3459,6 +3518,21 @@ function ClinicApp({
             transactions={transactions} patients={patients} policies={policies}
             batches={batches} userAccounts={userAccounts} session={session} isOversight={isBillingOversightRole}
           />
+        )}
+
+        {/* Doctor Clinical Workspace. Pick a patient, then the one-page record opens. The
+            workspace fetches everything it shows from the server under the doctor's own grants;
+            nothing is handed down from the collections already loaded here. */}
+        {tabAllowed && tab === "record" && (
+          recordPatientId ? (
+            <DoctorWorkspace
+              patientId={recordPatientId}
+              perms={backupPerms.permissions}
+              onBack={() => setRecordPatientId(null)}
+            />
+          ) : (
+            <RecordPatientPicker patients={patients} onOpen={setRecordPatientId} />
+          )
         )}
 
       </main>
