@@ -18,8 +18,19 @@
 -- is explicit that Doctors must not manage users, security or global configuration unless a
 -- Super Admin grants it, and section 29 says the workspace stays clinical rather than billing.
 INSERT INTO role_permissions (id, tabs) VALUES
-  ('DOCTOR', '["dashboard","schedule","patients","clinical","reports"]'::jsonb)
+  ('DOCTOR', '["dashboard","schedule","patients","clinical","record","reports"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
+-- Repair for a database that received the first version of this migration, which seeded the role
+-- without the "record" tab and therefore hid the clinical workspace from the very role it was
+-- built for. ON CONFLICT DO NOTHING above cannot fix an existing row, so this does.
+--
+-- Strictly additive and scoped to one role: it appends an element to DOCTOR's tab array and only
+-- when it is absent. It removes nothing, and it never touches SUPER_ADMIN, MANAGER, NURSE,
+-- RECEPTIONIST or BILLER - an administrator's own edits to those roles are left alone.
+UPDATE role_permissions
+   SET tabs = tabs || '["record"]'::jsonb
+ WHERE id = 'DOCTOR' AND NOT (tabs @> '["record"]'::jsonb);
 
 -- ---------- Laboratory ----------
 --

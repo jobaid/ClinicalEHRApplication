@@ -77,7 +77,7 @@ const ROLE_LABELS = {
 // SUPER_ADMIN is deliberately absent from the editable path everywhere: it always holds every
 // tab, so an admin cannot revoke their own access to the screen that grants access back.
 const DEFAULT_ROLE_TABS = {
-  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "users"],
+  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "record", "billing", "claims", "reports", "users"],
   MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports"],
   NURSE: ["dashboard", "schedule", "patients", "clinical"],
   RECEPTIONIST: ["dashboard", "schedule", "patients"],
