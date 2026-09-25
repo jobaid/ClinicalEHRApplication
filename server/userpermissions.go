@@ -29,7 +29,34 @@ const (
 	PermBackupDelete           = "BACKUP_DELETE"
 	PermBackupSettings         = "BACKUP_SETTINGS"
 	PermBackupAccessManagement = "BACKUP_ACCESS_MANAGEMENT"
+
+	// Antimicrobial Review. Separate from the HIM grants below because they are different jobs -
+	// a pharmacist reviewing therapy and a coder closing an encounter should not inherit each
+	// other's access just because both modules are new.
+	PermAntimicrobialView     = "ANTIMICROBIAL_VIEW"
+	PermAntimicrobialReview   = "ANTIMICROBIAL_REVIEW"
+	PermAntimicrobialAssign   = "ANTIMICROBIAL_ASSIGN"
+	PermAntimicrobialComplete = "ANTIMICROBIAL_COMPLETE"
+	PermAntimicrobialReport   = "ANTIMICROBIAL_REPORT"
+
+	// HIM Coding Worklist.
+	PermHIMWorklistView = "HIM_WORKLIST_VIEW"
+	PermHIMCodingEdit   = "HIM_CODING_EDIT"
+	PermHIMAssign       = "HIM_ASSIGN"
+	PermHIMQueryCreate  = "HIM_QUERY_CREATE"
+	PermHIMQueryManage  = "HIM_QUERY_MANAGE"
+	PermHIMComplete     = "HIM_COMPLETE"
+	PermHIMReport       = "HIM_REPORT"
 )
+
+// permissionGroup is one block of related grants on the Access Management screen. Grouping is
+// presentation, but it lives here rather than in React so the grid cannot drift out of step with
+// what the server actually recognises.
+type permissionGroup struct {
+	Key         string   `json:"key"`
+	Label       string   `json:"label"`
+	Permissions []string `json:"permissions"`
+}
 
 // Fixed order, so a saved list and an audit diff read as a real change rather than a reshuffle.
 var backupPermissionOrder = []string{
@@ -43,16 +70,47 @@ var backupPermissionOrder = []string{
 	PermBackupAccessManagement,
 }
 
-var knownUserPermissions = map[string]bool{
-	PermBackupView:             true,
-	PermBackupCreate:           true,
-	PermBackupDownload:         true,
-	PermBackupUpload:           true,
-	PermBackupRestore:          true,
-	PermBackupDelete:           true,
-	PermBackupSettings:         true,
-	PermBackupAccessManagement: true,
+var antimicrobialPermissionOrder = []string{
+	PermAntimicrobialView,
+	PermAntimicrobialReview,
+	PermAntimicrobialAssign,
+	PermAntimicrobialComplete,
+	PermAntimicrobialReport,
 }
+
+var himPermissionOrder = []string{
+	PermHIMWorklistView,
+	PermHIMCodingEdit,
+	PermHIMAssign,
+	PermHIMQueryCreate,
+	PermHIMQueryManage,
+	PermHIMComplete,
+	PermHIMReport,
+}
+
+var permissionGroups = []permissionGroup{
+	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
+	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
+	{Key: "him", Label: "HIM Coding", Permissions: himPermissionOrder},
+}
+
+// allUserPermissionOrder is every grant, in a stable order. Built from the groups so adding a
+// permission in one place cannot leave it unsanitisable or invisible in the grid.
+var allUserPermissionOrder = func() []string {
+	out := []string{}
+	for _, g := range permissionGroups {
+		out = append(out, g.Permissions...)
+	}
+	return out
+}()
+
+var knownUserPermissions = func() map[string]bool {
+	m := map[string]bool{}
+	for _, p := range allUserPermissionOrder {
+		m[p] = true
+	}
+	return m
+}()
 
 // The grants that can destroy data or hand out the ability to destroy data. Section 53 asks for
 // a confirmation when these are granted; the frontend shows it, and this is the list it uses, so
@@ -62,15 +120,22 @@ var highRiskUserPermissions = map[string]bool{
 	PermBackupDelete:           true,
 	PermBackupSettings:         true,
 	PermBackupAccessManagement: true,
+
+	// Completing a review or an encounter closes a clinical or coding record that others rely on
+	// being final, and editing codes changes what gets billed. Both deserve the confirmation.
+	PermAntimicrobialComplete: true,
+	PermHIMCodingEdit:         true,
+	PermHIMComplete:           true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }
 
-// allBackupPermissions is what a SUPER_ADMIN holds. Built fresh each call rather than shared,
-// because a permSet is a map and a shared one could be written to by a caller.
+// allBackupPermissions is what a SUPER_ADMIN holds: every grant in the system. Built fresh each
+// call rather than shared, because a permSet is a map and a shared one could be written to by a
+// caller.
 func allBackupPermissions() permSet {
 	all := permSet{}
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		all[p] = true
 	}
 	return all
@@ -191,7 +256,7 @@ func sanitizeUserPermissions(raw any) ([]string, bool) {
 	}
 
 	out := []string{}
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		if seen[p] {
 			out = append(out, p)
 		}

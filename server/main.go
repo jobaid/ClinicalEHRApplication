@@ -317,6 +317,30 @@ func main() {
 	// authenticated account may ask about itself; the answer is advisory, never the enforcement.
 	mux.HandleFunc("GET /api/admin/backup-permissions/me", s.requireAuth(s.handleMyBackupPermissions))
 
+	// Antimicrobial Review and HIM Coding Worklist. Registered through requirePerm, not
+	// requireAuth: the grant is re-read from the database per request, so hiding a menu item is
+	// a courtesy and this is the actual boundary. Calling these directly without the grant
+	// returns 403.
+	mux.HandleFunc("GET /api/clinical/statuses", s.requireAuth(s.handleWorkflowStatuses))
+
+	mux.HandleFunc("GET /api/clinical/antimicrobial", s.requirePerm(PermAntimicrobialView, s.handleAMList))
+	mux.HandleFunc("GET /api/clinical/antimicrobial/summary", s.requirePerm(PermAntimicrobialView, s.handleAMSummary))
+	mux.HandleFunc("GET /api/clinical/antimicrobial/{id}", s.requirePerm(PermAntimicrobialView, s.handleAMDetail))
+	mux.HandleFunc("POST /api/clinical/antimicrobial", s.requirePerm(PermAntimicrobialReview, s.handleAMCreate))
+	mux.HandleFunc("POST /api/clinical/antimicrobial/{id}/reviews", s.requirePerm(PermAntimicrobialReview, s.handleAMAddReview))
+	mux.HandleFunc("POST /api/clinical/antimicrobial/{id}/assign", s.requirePerm(PermAntimicrobialAssign, s.handleAMAssign))
+
+	mux.HandleFunc("GET /api/him/worklist", s.requirePerm(PermHIMWorklistView, s.handleHIMList))
+	mux.HandleFunc("GET /api/him/summary", s.requirePerm(PermHIMWorklistView, s.handleHIMSummary))
+	mux.HandleFunc("GET /api/him/worklist/{id}", s.requirePerm(PermHIMWorklistView, s.handleHIMDetail))
+	mux.HandleFunc("POST /api/him/worklist", s.requirePerm(PermHIMCodingEdit, s.handleHIMCreate))
+	mux.HandleFunc("POST /api/him/worklist/{id}/assign", s.requirePerm(PermHIMAssign, s.handleHIMAssign))
+	mux.HandleFunc("POST /api/him/worklist/{id}/status", s.requirePerm(PermHIMCodingEdit, s.handleHIMStatus))
+	mux.HandleFunc("PUT /api/him/worklist/{id}/diagnoses", s.requirePerm(PermHIMCodingEdit, s.handleHIMDiagnoses))
+	mux.HandleFunc("PUT /api/him/worklist/{id}/procedures", s.requirePerm(PermHIMCodingEdit, s.handleHIMProcedures))
+	mux.HandleFunc("POST /api/him/worklist/{id}/queries", s.requirePerm(PermHIMQueryCreate, s.handleHIMQueryCreate))
+	mux.HandleFunc("POST /api/him/queries/{qid}/status", s.requirePerm(PermHIMQueryManage, s.handleHIMQueryUpdate))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -327,6 +351,13 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "collections": len(collections)})
 	})
+
+	// Antimicrobial Review and HIM Coding Worklist tables. Additive and idempotent, applied here
+	// for the same reason as the others: the initdb mount never runs on a database that already
+	// holds data, so a code-only deployment would otherwise be missing every new table.
+	if err := s.ensureClinicalSchema(context.Background()); err != nil {
+		log.Printf("clinical: %v - the worklist modules will not work until this is resolved", err)
+	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account
 	// on first run and refreshes only a row already flagged is_demo on later runs. Neither step

@@ -52,11 +52,11 @@ func (s *Server) handleBackupAccessList(w http.ResponseWriter, r *http.Request) 
 		a.Permissions = []string{}
 		if a.Role == "SUPER_ADMIN" {
 			a.Locked = true
-			a.Permissions = append(a.Permissions, backupPermissionOrder...)
+			a.Permissions = append(a.Permissions, allUserPermissionOrder...)
 		} else {
 			var list []string
 			if json.Unmarshal(raw, &list) == nil {
-				for _, p := range backupPermissionOrder {
+				for _, p := range allUserPermissionOrder {
 					for _, held := range list {
 						if held == p {
 							a.Permissions = append(a.Permissions, p)
@@ -75,14 +75,15 @@ func (s *Server) handleBackupAccessList(w http.ResponseWriter, r *http.Request) 
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"users":       out,
-		"permissions": backupPermissionOrder,
+		"permissions": allUserPermissionOrder,
+		"groups":      permissionGroups,
 		"highRisk":    highRiskKeys(),
 	})
 }
 
 func highRiskKeys() []string {
 	out := []string{}
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		if isHighRiskPermission(p) {
 			out = append(out, p)
 		}
@@ -209,7 +210,7 @@ func (s *Server) storedUserPermissions(ctx context.Context, uid string) []string
 		return []string{}
 	}
 	out := []string{}
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		for _, held := range list {
 			if held == p {
 				out = append(out, p)
@@ -327,7 +328,7 @@ func (s *Server) handleMyBackupPermissions(w http.ResponseWriter, r *http.Reques
 	u := userFrom(r.Context())
 	held := s.effectiveUserPerms(r.Context(), u.UID, u.Role)
 	out := []string{}
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		if held.has(p) {
 			out = append(out, p)
 		}

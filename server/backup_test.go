@@ -64,9 +64,9 @@ func TestSanitizeUserPermissionsHandlesEmptyAndNil(t *testing.T) {
 	}
 }
 
-func TestSuperAdminHoldsEveryBackupPermission(t *testing.T) {
+func TestSuperAdminHoldsEveryPermission(t *testing.T) {
 	all := allBackupPermissions()
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		if !all.has(p) {
 			t.Errorf("a Super Admin is missing %q", p)
 		}
@@ -77,15 +77,61 @@ func TestSuperAdminHoldsEveryBackupPermission(t *testing.T) {
 	}
 }
 
-// Every permission in the order list must be in the allowlist and vice versa, or a grant could
+// Every permission in the display order must be in the allowlist and vice versa, or a grant could
 // be displayed but never stored, or stored but never displayed.
 func TestPermissionOrderMatchesAllowlist(t *testing.T) {
-	if len(backupPermissionOrder) != len(knownUserPermissions) {
-		t.Fatalf("order has %d, allowlist has %d", len(backupPermissionOrder), len(knownUserPermissions))
+	if len(allUserPermissionOrder) != len(knownUserPermissions) {
+		t.Fatalf("order has %d, allowlist has %d", len(allUserPermissionOrder), len(knownUserPermissions))
 	}
-	for _, p := range backupPermissionOrder {
+	for _, p := range allUserPermissionOrder {
 		if !knownUserPermissions[p] {
 			t.Errorf("%q is in the display order but not the allowlist", p)
+		}
+	}
+}
+
+// The Access Management grid is built from the groups. A permission missing from every group
+// would be enforceable by the API but impossible for a Super Admin to grant - a grant nobody
+// could ever hold.
+func TestEveryPermissionAppearsInExactlyOneGroup(t *testing.T) {
+	seen := map[string]int{}
+	for _, g := range permissionGroups {
+		for _, p := range g.Permissions {
+			seen[p]++
+		}
+	}
+	for _, p := range allUserPermissionOrder {
+		switch seen[p] {
+		case 1:
+		case 0:
+			t.Errorf("%q is in no permission group, so it can never be granted", p)
+		default:
+			t.Errorf("%q appears in %d groups", p, seen[p])
+		}
+	}
+}
+
+// The three modules must stay independent: granting someone backup access must not hand them
+// patient-facing clinical worklists, and vice versa.
+func TestModulePermissionsDoNotOverlap(t *testing.T) {
+	groups := map[string]map[string]bool{}
+	for _, g := range permissionGroups {
+		set := map[string]bool{}
+		for _, p := range g.Permissions {
+			set[p] = true
+		}
+		groups[g.Key] = set
+	}
+	for aKey, a := range groups {
+		for bKey, b := range groups {
+			if aKey >= bKey {
+				continue
+			}
+			for p := range a {
+				if b[p] {
+					t.Errorf("%q is shared between the %s and %s groups", p, aKey, bKey)
+				}
+			}
 		}
 	}
 }
