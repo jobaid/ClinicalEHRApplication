@@ -17,6 +17,7 @@ import {
   patientHeader, patientTimeline, patientLabs, labReport, labTrend,
   flagMeta, referenceLabel, fmtDateTime, fmtDay,
 } from "./firebase/doctorService";
+import UploadedRecords from "./MedicalRecordUpload";
 
 const card = "bg-white border border-slate-200 rounded-xl";
 const input = "w-full border border-slate-200 rounded-lg px-3 py-2 text-sm";
@@ -601,7 +602,10 @@ export default function DoctorWorkspace({ patientId, perms, onBack }) {
       {/* 70/30 on desktop; the lab panel drops below the record on narrow screens rather than
           forcing horizontal scrolling. */}
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,7fr)_minmax(0,3fr)] gap-4 items-start">
-        <MedicalRecord patientId={patientId} perms={perms} />
+        <div>
+          <MedicalRecord patientId={patientId} perms={perms} />
+          <UploadedRecords patientId={patientId} header={header} perms={perms} />
+        </div>
 
         {canSeeLabs && (
           <>

@@ -45,6 +45,10 @@ var timelineKindPermission = map[string]string{
 	"lab":           PermDoctorLabView,
 	"document":      PermDoctorDocumentView,
 	"antimicrobial": PermDoctorAntimicrobialView,
+
+	// Uploaded medical records. Gated on its own grant, so an account that may read the chart
+	// does not automatically get the uploaded documents.
+	"medicalrecord": PermMedRecView,
 }
 
 // allowedKinds intersects what the caller asked for with what their grants permit.
@@ -74,7 +78,7 @@ func (s *Server) allowedKinds(ctx context.Context, u authedUser, requested []str
 // Stable order for the union branches.
 var timelineKindOrder = []string{
 	"encounter", "note", "diagnosis", "procedure", "medication",
-	"allergy", "vital", "lab", "document", "antimicrobial",
+	"allergy", "vital", "lab", "document", "antimicrobial", "medicalrecord",
 }
 
 // A date column in this application is TEXT. Legacy rows can hold anything, so every conversion
@@ -135,6 +139,15 @@ func timelineSQL(kinds []string) string {
 		       COALESCE(NULLIF(file_name,''),''), COALESCE(NULLIF(status,''),''),
 		       concat_ws(' ', id_type, file_name, uploaded_by)
 		  FROM id_documents WHERE patient_id = $1`,
+
+		// Positioned by RECORD DATE, not upload date - section 14. A discharge summary from last
+		// May belongs in last May's place in the chart however recently it was scanned in.
+		"medicalrecord": `SELECT 'medicalrecord' kind, ` + dateExpr("record_date") + `, id,
+		       record_name, COALESCE(NULLIF(provider,''),''),
+		       concat_ws(' · ', NULLIF(record_type,''), NULLIF(facility,''),
+		                 'Uploaded by ' || uploaded_by_name), record_type,
+		       concat_ws(' ', record_name, record_type, provider, facility, description, uploaded_by_name)
+		  FROM medical_records WHERE patient_id = $1 AND status = 'active'`,
 
 		"antimicrobial": `SELECT 'antimicrobial' kind, created_at, id,
 		       antimicrobial, ordering_provider, indication, status,

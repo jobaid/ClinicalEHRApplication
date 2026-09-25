@@ -349,6 +349,16 @@ func main() {
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/trend", s.requirePerm(PermDoctorLabView, s.handleLabTrend))
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/{orderId}", s.requirePerm(PermDoctorLabView, s.handleLabReport))
 
+	// Uploaded medical records. Patient id is part of every query, so editing a record id in the
+	// URL cannot reach a document belonging to someone else.
+	mux.HandleFunc("GET /api/patients/{id}/records", s.requirePerm(PermMedRecView, s.handleMedRecList))
+	mux.HandleFunc("POST /api/patients/{id}/records", s.requirePerm(PermMedRecUpload, s.handleMedRecUpload))
+	mux.HandleFunc("GET /api/patients/{id}/records/{recordId}", s.requirePerm(PermMedRecView, s.handleMedRecGet))
+	mux.HandleFunc("GET /api/patients/{id}/records/{recordId}/download", s.requirePerm(PermMedRecDownload, s.handleMedRecDownload))
+	mux.HandleFunc("POST /api/patients/{id}/records/{recordId}/email", s.requirePerm(PermMedRecEmail, s.handleMedRecEmail))
+	mux.HandleFunc("DELETE /api/patients/{id}/records/{recordId}", s.requirePerm(PermMedRecDelete, s.handleMedRecDelete))
+	mux.HandleFunc("GET /api/email/status", s.requireAuth(s.handleEmailStatus))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -370,6 +380,11 @@ func main() {
 	// Doctor role and the laboratory tables. Additive and idempotent, same as the others.
 	if err := s.ensureDoctorSchema(context.Background()); err != nil {
 		log.Printf("doctor: %v - the clinical workspace will not work until this is resolved", err)
+	}
+
+	// Uploaded medical records. Additive and idempotent, same as every other schema step here.
+	if err := s.ensureMedicalRecordSchema(context.Background()); err != nil {
+		log.Printf("medical records: %v - uploads will not work until this is resolved", err)
 	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account

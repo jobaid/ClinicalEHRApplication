@@ -61,6 +61,19 @@ const (
 	PermDoctorDiagnosisManage   = "DOCTOR_DIAGNOSIS_MANAGE"
 	PermDoctorMedicationView    = "DOCTOR_MEDICATION_VIEW"
 	PermDoctorAntimicrobialView = "DOCTOR_ANTIMICROBIAL_VIEW"
+
+	// Uploaded medical records. Each grant maps to something the SERVER can actually refuse.
+	//
+	// Section 16 also suggests separate PRINT and PDF permissions. They are deliberately not
+	// here: printing and PDF generation act on a document the browser has already been given,
+	// so neither can be enforced server-side. Adding them would advertise a control that does
+	// not exist, which section 17 warns against - both are covered by DOCUMENT_VIEW, which is
+	// the grant that decides whether the bytes are handed over at all.
+	PermMedRecUpload   = "MEDICAL_RECORD_UPLOAD"
+	PermMedRecView     = "MEDICAL_RECORD_DOCUMENT_VIEW"
+	PermMedRecDownload = "MEDICAL_RECORD_DOWNLOAD"
+	PermMedRecEmail    = "MEDICAL_RECORD_EMAIL"
+	PermMedRecDelete   = "MEDICAL_RECORD_DELETE"
 )
 
 // permissionGroup is one block of related grants on the Access Management screen. Grouping is
@@ -115,11 +128,20 @@ var doctorPermissionOrder = []string{
 	PermDoctorAntimicrobialView,
 }
 
+var medicalRecordPermissionOrder = []string{
+	PermMedRecView,
+	PermMedRecUpload,
+	PermMedRecDownload,
+	PermMedRecEmail,
+	PermMedRecDelete,
+}
+
 var permissionGroups = []permissionGroup{
 	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
 	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
 	{Key: "him", Label: "HIM Coding", Permissions: himPermissionOrder},
 	{Key: "doctor", Label: "Doctor Clinical Workspace", Permissions: doctorPermissionOrder},
+	{Key: "medicalRecords", Label: "Medical Records", Permissions: medicalRecordPermissionOrder},
 }
 
 // allUserPermissionOrder is every grant, in a stable order. Built from the groups so adding a
@@ -160,6 +182,11 @@ var highRiskUserPermissions = map[string]bool{
 	// the ability to change what gets billed.
 	PermDoctorNoteSign:        true,
 	PermDoctorDiagnosisManage: true,
+
+	// Deleting a filed record and sending one outside the application both deserve the
+	// confirmation the grant screen shows for high-risk permissions.
+	PermMedRecDelete: true,
+	PermMedRecEmail:  true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }
