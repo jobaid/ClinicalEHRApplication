@@ -9,6 +9,8 @@ import { useFirestoreCollection, setDocument, updateDocument, addDocument, delet
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import DoctorWorkspace from "./DoctorWorkspace";
 import Cms1500Modal from "./Cms1500";
+import ClaimWorkspace from "./ClaimWorkspace";
+import { normalizeDx } from "./claimService";
 import {
   BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, myBackupPermissions,
   listBackups, createBackup, downloadBackup, uploadBackup, restoreBackup, deleteBackup,
@@ -3510,7 +3512,12 @@ function ClinicApp({
         )}
 
         {tabAllowed && tab === "claims" && (
-          <Claims claims={claims} patientById={patientById} onSubmit={submitClaim} />
+          <Claims
+            claims={claims} patientById={patientById} onSubmit={submitClaim}
+            charges={charges} policies={policies} perms={backupPerms.permissions}
+            onSaveCharge={(chargeId, patch) => updateDocument("charges", chargeId, patch)}
+            onSaveClaimFields={(claimId, patch) => updateDocument("claims", claimId, patch)}
+          />
         )}
 
         {tabAllowed && tab === "reports" && (
@@ -7471,7 +7478,10 @@ function EditClaimForm({ charge, onSubmit }) {
     facilityName: charge.facilityName || PRACTICE_INFO.name, facilityAddress: charge.facilityAddress || PRACTICE_INFO.address,
     taxId: charge.taxId || PRACTICE_INFO.taxId, npi: charge.npi || "", ndc: charge.ndc || "",
     units: charge.units || 1, time: charge.time || "",
-    diagnosisCodes: charge.diagnosisCodes && charge.diagnosisCodes.length === 10 ? [...charge.diagnosisCodes] : emptyDxCodes(),
+    // Padded to twelve, never discarded. The old guard required exactly ten and fell back to a
+    // blank set otherwise, which silently dropped every code on a charge stored with any other
+    // length - including the twelve a CMS-1500 carries.
+    diagnosisCodes: normalizeDx(charge.diagnosisCodes),
   });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   function setDx(i, val) {
@@ -7514,8 +7524,8 @@ function EditClaimForm({ charge, onSubmit }) {
         <Field label="Facility address"><input className={inputCls} value={f.facilityAddress} onChange={set("facilityAddress")} /></Field>
         <Field label="Tax ID"><input className={inputCls} value={f.taxId} onChange={set("taxId")} /></Field>
       </div>
-      <SectionTitle>Diagnosis codes (ICD-10, up to 4)</SectionTitle>
-      <div className="grid grid-cols-5 gap-2 mb-3">
+      <SectionTitle>Diagnosis codes (ICD-10, up to 12)</SectionTitle>
+      <div className="grid grid-cols-6 gap-2 mb-3">
         {f.diagnosisCodes.map((code, i) => (
           <input key={i} className={`${inputCls} text-center`} value={code} onChange={(e) => setDx(i, e.target.value)} placeholder={`Dx ${i + 1}`} />
         ))}
@@ -8089,10 +8099,36 @@ function AddChargeForm({ onSubmit }) {
 
 // ---------- Claims ----------
 
-function Claims({ claims, patientById, onSubmit }) {
+function Claims({ claims, patientById, onSubmit, charges, policies, perms, onSaveCharge, onSaveClaimFields }) {
+  // Which claim is open in the workspace. The list below is unchanged when nothing is open, so
+  // every action that worked before still works exactly where it did.
+  const [openClaimId, setOpenClaimId] = useState(null);
+  const openClaim = claims.find(c => c.id === openClaimId);
+
+  if (openClaim) {
+    const patient = patientById[openClaim.patientId];
+    return (
+      <ClaimWorkspace
+        claim={openClaim}
+        patient={patient}
+        policies={(policies || []).filter(p => p.patientId === openClaim.patientId)}
+        charges={charges}
+        practice={PRACTICE_INFO}
+        permissions={perms || []}
+        onClose={() => setOpenClaimId(null)}
+        onSaveCharge={onSaveCharge}
+        onSaveClaimFields={onSaveClaimFields}
+      />
+    );
+  }
+
   return (
     <div>
-      <h1 className="text-xl font-semibold text-slate-800 mb-6">Claims</h1>
+      <h1 className="text-xl font-semibold text-slate-800 mb-1">Claims</h1>
+      <p className="text-xs text-slate-400 mb-5">
+        Open a claim to review it section by section, validate it, print CMS-1500 paper or a claim
+        summary, and submit it electronically.
+      </p>
       <Card>
         <table className="w-full text-sm">
           <thead>
@@ -8116,13 +8152,21 @@ function Claims({ claims, patientById, onSubmit }) {
                 <td className="px-4 py-2.5 text-right">{money(c.amount)}</td>
                 <td className="px-4 py-2.5"><StatusPill status={c.status} /></td>
                 <td className="px-4 py-2.5">
-                  {c.status === "Draft" && (
-                    <button onClick={() => onSubmit(c.id)} className="flex items-center gap-1 text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 hover:bg-teal-100">
-                      <Send size={12} /> Submit
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button onClick={() => setOpenClaimId(c.id)} className="flex items-center gap-1 text-xs text-slate-700 border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50">
+                      <FileText size={12} /> Open claim
                     </button>
-                  )}
-                  {c.status === "Denied" && <span className="flex items-center gap-1 text-xs text-rose-600"><AlertCircle size={12} /> Needs appeal</span>}
-                  {c.status === "Paid" && <span className="flex items-center gap-1 text-xs text-emerald-600"><CheckCircle2 size={12} /> Closed</span>}
+                    {c.status === "Draft" && (
+                      <button onClick={() => onSubmit(c.id)} className="flex items-center gap-1 text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 hover:bg-teal-100">
+                        <Send size={12} /> Submit
+                      </button>
+                    )}
+                    {c.status === "Validation Error" && <span className="flex items-center gap-1 text-xs text-rose-600"><AlertCircle size={12} /> Fix and revalidate</span>}
+                    {c.status === "Ready" && <span className="flex items-center gap-1 text-xs text-emerald-700"><CheckCircle2 size={12} /> Ready</span>}
+                    {c.status === "Rejected" && <span className="flex items-center gap-1 text-xs text-rose-600"><AlertCircle size={12} /> Rejected</span>}
+                    {c.status === "Denied" && <span className="flex items-center gap-1 text-xs text-rose-600"><AlertCircle size={12} /> Needs appeal</span>}
+                    {c.status === "Paid" && <span className="flex items-center gap-1 text-xs text-emerald-600"><CheckCircle2 size={12} /> Closed</span>}
+                  </div>
                 </td>
               </tr>
             ))}

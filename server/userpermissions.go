@@ -82,6 +82,18 @@ const (
 	// None of these makes anyone a lawful prescriber. Section 19: the permission says the
 	// software will let you press the button; prescriber_profiles says whether the person
 	// behind it is someone a pharmacy would accept a prescription from. Both are checked.
+	// Claim / CMS-1500 workflow. Four grants, matching the four things the server can actually
+	// refuse: reading an assembled claim, recording a print, transmitting to a payer, and changing
+	// the printer calibration.
+	//
+	// Validation sits under CLAIM_HCFA_VIEW rather than getting a grant of its own, because the
+	// validation response necessarily describes the claim - who the patient is, what is missing -
+	// so anyone who can validate can already see the claim.
+	PermClaimHCFAView       = "CLAIM_HCFA_VIEW"
+	PermClaimHCFAPrint      = "CLAIM_HCFA_PRINT"
+	PermClaimElectronicSend = "CLAIM_ELECTRONIC_SUBMIT"
+	PermClaimPrintSettings  = "CLAIM_PRINT_SETTINGS"
+
 	PermRxView        = "RX_VIEW"
 	PermRxCreate      = "RX_CREATE"
 	PermRxSign        = "RX_SIGN"
@@ -159,6 +171,13 @@ var rxPermissionOrder = []string{
 	PermRxHistoryView,
 }
 
+var claimPermissionOrder = []string{
+	PermClaimHCFAView,
+	PermClaimHCFAPrint,
+	PermClaimElectronicSend,
+	PermClaimPrintSettings,
+}
+
 var permissionGroups = []permissionGroup{
 	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
 	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
@@ -166,6 +185,7 @@ var permissionGroups = []permissionGroup{
 	{Key: "doctor", Label: "Doctor Clinical Workspace", Permissions: doctorPermissionOrder},
 	{Key: "medicalRecords", Label: "Medical Records", Permissions: medicalRecordPermissionOrder},
 	{Key: "rx", Label: "Rx / Prescriptions", Permissions: rxPermissionOrder},
+	{Key: "claims", Label: "Claims / CMS-1500", Permissions: claimPermissionOrder},
 }
 
 // allUserPermissionOrder is every grant, in a stable order. Built from the groups so adding a
@@ -216,6 +236,11 @@ var highRiskUserPermissions = map[string]bool{
 	// pharmacy. Both deserve the confirmation the grant screen shows.
 	PermRxSign: true,
 	PermRxSend: true,
+
+	// Submitting an electronic claim is a billing representation to a payer, made in the
+	// practice's name. It deserves the same confirmation as the other grants that have effects
+	// outside the software.
+	PermClaimElectronicSend: true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }

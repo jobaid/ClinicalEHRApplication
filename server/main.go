@@ -376,6 +376,20 @@ func main() {
 	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions/{rxId}/send", s.requirePerm(PermRxSend, s.handleRxSend))
 	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions/{rxId}/cancel", s.requirePerm(PermRxCancel, s.handleRxCancel))
 
+	// Claim workflow. Every route is behind a grant rather than plain authentication, because each
+	// one either discloses a whole claim, writes to the claim's permanent history, or transmits in
+	// the practice's name - section 32. The print-profile routes are scoped to the caller's own
+	// user id inside the handler.
+	mux.HandleFunc("GET /api/claims/config", s.requireAuth(s.handleClaimConfig))
+	mux.HandleFunc("GET /api/claims/print-profiles", s.requirePerm(PermClaimHCFAView, s.handleClaimPrintProfiles))
+	mux.HandleFunc("POST /api/claims/print-profiles", s.requirePerm(PermClaimPrintSettings, s.handleClaimPrintProfileSave))
+	mux.HandleFunc("GET /api/claims/{id}/hcfa", s.requirePerm(PermClaimHCFAView, s.handleClaimHCFA))
+	mux.HandleFunc("GET /api/claims/{id}/history", s.requirePerm(PermClaimHCFAView, s.handleClaimHistory))
+	mux.HandleFunc("GET /api/claims/{id}/status", s.requirePerm(PermClaimHCFAView, s.handleClaimStatus))
+	mux.HandleFunc("POST /api/claims/{id}/validate", s.requirePerm(PermClaimHCFAView, s.handleClaimValidate))
+	mux.HandleFunc("POST /api/claims/{id}/print-event", s.requirePerm(PermClaimHCFAPrint, s.handleClaimPrintEvent))
+	mux.HandleFunc("POST /api/claims/{id}/submit", s.requirePerm(PermClaimElectronicSend, s.handleClaimSubmit))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -407,6 +421,12 @@ func main() {
 	// Prescriptions. Additive and idempotent, same as every other schema step.
 	if err := s.ensurePrescriptionSchema(context.Background()); err != nil {
 		log.Printf("prescriptions: %v - the Rx feature will not work until this is resolved", err)
+	}
+
+	// Claim submission history and printer alignment profiles. Additive and idempotent, same as
+	// every other schema step.
+	if err := s.ensureClaimSchema(context.Background()); err != nil {
+		log.Printf("claims: %v - claim validation and history will not work until this is resolved", err)
 	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account

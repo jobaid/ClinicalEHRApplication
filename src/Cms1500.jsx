@@ -105,9 +105,18 @@ const PRINT_CSS = `
 
 // ---------- the modal ----------
 
-export default function Cms1500Modal({ charges, patient, policy, practice, onClose, onAudit }) {
-  const [mode, setMode] = useState("preprinted");   // preprinted | withform
-  const [align, setAlign] = useState(loadAlignment);
+export default function Cms1500Modal({
+  charges, patient, policy, practice, onClose, onAudit,
+  // All optional, so the existing call site from the ledger keeps working unchanged.
+  //
+  // initialMode lets a caller open straight into the mode the biller picked from a Print menu.
+  // initialAlignment and onSaveAlignment let the offsets be kept on the server per printer
+  // profile; without them the modal falls back to this browser's local storage, which is what it
+  // did before and is still the right behaviour for a user with no settings permission.
+  initialMode, initialAlignment, onSaveAlignment,
+}) {
+  const [mode, setMode] = useState(initialMode === "withform" ? "withform" : "preprinted");
+  const [align, setAlign] = useState(() => initialAlignment || loadAlignment());
   const [showGuides, setShowGuides] = useState(false);
   const [testMode, setTestMode] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -184,7 +193,7 @@ export default function Cms1500Modal({ charges, patient, policy, practice, onClo
             <button onClick={() => nudge("y", -0.05)} className="text-xs border border-slate-200 rounded px-1.5 py-1">↑</button>
             <span className="text-xs w-12 text-center tabular-nums">{align.y.toFixed(2)}</span>
             <button onClick={() => nudge("y", 0.05)} className="text-xs border border-slate-200 rounded px-1.5 py-1">↓</button>
-            <button onClick={() => { saveAlignment(align); setSaved(true); }}
+            <button onClick={() => { saveAlignment(align); onSaveAlignment?.(align); setSaved(true); }}
               className="text-xs border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50 flex items-center gap-1">
               <Save size={12} /> {saved ? "Saved" : "Save"}
             </button>
