@@ -10,6 +10,8 @@ import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import DoctorWorkspace from "./DoctorWorkspace";
 import Cms1500Modal from "./Cms1500";
 import ClaimWorkspace from "./ClaimWorkspace";
+import Workforce from "./Workforce";
+import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
   BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, myBackupPermissions,
@@ -80,8 +82,12 @@ const ROLE_LABELS = {
 // SUPER_ADMIN is deliberately absent from the editable path everywhere: it always holds every
 // tab, so an admin cannot revoke their own access to the screen that grants access back.
 const DEFAULT_ROLE_TABS = {
-  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "record", "billing", "claims", "reports", "users"],
-  MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports"],
+  // "hr" must appear here as well as in migration 014, not only there. Super Admin's tabs are
+  // never read from role_permissions, so a tab added only to the migration is invisible to the one
+  // role that always has everything - which is exactly how the Medical Record tab shipped hidden
+  // from every user.
+  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "record", "billing", "claims", "reports", "hr", "users"],
+  MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "hr"],
   NURSE: ["dashboard", "schedule", "patients", "clinical"],
   RECEPTIONIST: ["dashboard", "schedule", "patients"],
   BILLER: ["dashboard", "patients", "billing", "claims", "reports"],
@@ -2493,6 +2499,10 @@ function ClinicApp({
   // the role alone cannot answer it. Used only to decide which controls to render - every call
   // is authorised again server-side.
   const [backupPerms, setBackupPerms] = useState({ permissions: [], superAdmin: false });
+  // Which workforce date the HR tab opens on. Section 17: the dashboard tile deep-links into
+  // Workforce with today already selected.
+  const [hrDate, setHrDate] = useState(null);
+  const [hrQuick, setHrQuick] = useState("");
   useEffect(() => {
     if (!session) return undefined;
     let live = true;
@@ -2544,6 +2554,7 @@ function ClinicApp({
     { id: "claims", label: "Claims", icon: FileStack },
     { id: "reports", label: "Reports", icon: BarChart3 },
     { id: "record", label: "Medical Record", icon: Stethoscope, needsPerm: "DOCTOR_MEDICAL_RECORD_VIEW" },
+    { id: "hr", label: "HR", icon: Users, needsPerm: "HR_WORKFORCE_VIEW" },
   ];
   // Live grants win; DEFAULT_ROLE_TABS covers the first render and any role without a row.
   // Super Admin is never read from the table - see DEFAULT_ROLE_TABS.
@@ -3367,6 +3378,8 @@ function ClinicApp({
           <Dashboard
             outstanding={outstanding} monthRevenue={monthRevenue} todaysAppts={todaysAppts}
             pendingClaims={pendingClaims} deniedClaims={deniedClaims} patientById={patientById}
+            canSeeWorkforce={backupPerms.permissions.includes("HR_WORKFORCE_VIEW")}
+            onOpenWorkforce={(quick) => { setHrDate(TODAY); setHrQuick(quick || ""); setTab("hr"); }}
             revenueByMonth={revenueByMonth} setTab={setTab}
           />
         )}
@@ -3509,6 +3522,10 @@ function ClinicApp({
             hasOpenBatch={!!myOpenBatch}
             onCreateTickler={(prefill) => { setTicklerPrefill(prefill); setShowTicklerPanel(true); }}
           />
+        )}
+
+        {tabAllowed && tab === "hr" && (
+          <Workforce permissions={backupPerms.permissions} initialDate={hrDate} initialQuick={hrQuick} />
         )}
 
         {tabAllowed && tab === "claims" && (
@@ -4936,7 +4953,7 @@ function TicklerList({ ticklers, onSetStatus, onSnooze }) {
 
 // ---------- Dashboard ----------
 
-function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deniedClaims, patientById, revenueByMonth, setTab }) {
+function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deniedClaims, patientById, revenueByMonth, setTab, canSeeWorkforce, onOpenWorkforce }) {
   const stats = [
     { label: "Collected this month", value: money(monthRevenue), icon: DollarSign, tone: "text-teal-600 bg-teal-50" },
     { label: "Outstanding balance", value: money(outstanding), icon: AlertCircle, tone: "text-rose-600 bg-rose-50" },
@@ -4956,6 +4973,8 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
           </button>
         )}
       </div>
+      {canSeeWorkforce && <WorkforceTodayCard onOpen={onOpenWorkforce} />}
+
       <div className="grid grid-cols-4 gap-4 mb-6">
         {stats.map((s, i) => {
           const Icon = s.icon;

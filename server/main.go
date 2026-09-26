@@ -390,6 +390,17 @@ func main() {
 	mux.HandleFunc("POST /api/claims/{id}/print-event", s.requirePerm(PermClaimHCFAPrint, s.handleClaimPrintEvent))
 	mux.HandleFunc("POST /api/claims/{id}/submit", s.requirePerm(PermClaimElectronicSend, s.handleClaimSubmit))
 
+	// HR workforce. Every route is behind a grant: the workforce list is the practice's staff
+	// directory with their attendance, and the export takes it outside the application.
+	mux.HandleFunc("GET /api/hr/options", s.requirePerm(PermHRWorkforceView, s.handleHROptions))
+	mux.HandleFunc("GET /api/hr/workforce", s.requirePerm(PermHRWorkforceView, s.handleWorkforceList))
+	mux.HandleFunc("GET /api/hr/workforce/counts", s.requirePerm(PermHRWorkforceView, s.handleWorkforceCounts))
+	mux.HandleFunc("GET /api/hr/workforce/export", s.requirePerm(PermHRReportExport, s.handleWorkforceExport))
+	mux.HandleFunc("GET /api/hr/employees/{id}", s.requirePerm(PermHRWorkforceView, s.handleHREmployeeProfile))
+	mux.HandleFunc("GET /api/hr/saved-views", s.requirePerm(PermHRWorkforceView, s.handleHRSavedViewList))
+	mux.HandleFunc("POST /api/hr/saved-views", s.requirePerm(PermHRWorkforceView, s.handleHRSavedViewSave))
+	mux.HandleFunc("DELETE /api/hr/saved-views/{id}", s.requirePerm(PermHRWorkforceView, s.handleHRSavedViewDelete))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -427,6 +438,11 @@ func main() {
 	// every other schema step.
 	if err := s.ensureClaimSchema(context.Background()); err != nil {
 		log.Printf("claims: %v - claim validation and history will not work until this is resolved", err)
+	}
+
+	// HR workforce tables. Additive and idempotent, same as every other schema step.
+	if err := s.ensureHRSchema(context.Background()); err != nil {
+		log.Printf("hr: %v - the Workforce screen will not work until this is resolved", err)
 	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account

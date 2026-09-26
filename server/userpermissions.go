@@ -94,6 +94,18 @@ const (
 	PermClaimElectronicSend = "CLAIM_ELECTRONIC_SUBMIT"
 	PermClaimPrintSettings  = "CLAIM_PRINT_SETTINGS"
 
+	// HR workforce. Four grants, matching the four things the server can refuse: seeing the
+	// workforce at all, seeing an employee's identifying and employment detail, seeing credential
+	// and training compliance, and exporting.
+	//
+	// HR_EMPLOYEE_VIEW is not cosmetic. Without it the workforce API does not SELECT an email, a
+	// work phone, a hire date or a clock-in time - section 22 is explicit that restricted fields
+	// must not be sent and then hidden in React, so they are never read from the database.
+	PermHRWorkforceView  = "HR_WORKFORCE_VIEW"
+	PermHREmployeeView   = "HR_EMPLOYEE_VIEW"
+	PermHRCredentialView = "HR_CREDENTIAL_VIEW"
+	PermHRReportExport   = "HR_REPORT_EXPORT"
+
 	PermRxView        = "RX_VIEW"
 	PermRxCreate      = "RX_CREATE"
 	PermRxSign        = "RX_SIGN"
@@ -178,6 +190,13 @@ var claimPermissionOrder = []string{
 	PermClaimPrintSettings,
 }
 
+var hrPermissionOrder = []string{
+	PermHRWorkforceView,
+	PermHREmployeeView,
+	PermHRCredentialView,
+	PermHRReportExport,
+}
+
 var permissionGroups = []permissionGroup{
 	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
 	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
@@ -186,6 +205,7 @@ var permissionGroups = []permissionGroup{
 	{Key: "medicalRecords", Label: "Medical Records", Permissions: medicalRecordPermissionOrder},
 	{Key: "rx", Label: "Rx / Prescriptions", Permissions: rxPermissionOrder},
 	{Key: "claims", Label: "Claims / CMS-1500", Permissions: claimPermissionOrder},
+	{Key: "hr", Label: "HR / Workforce", Permissions: hrPermissionOrder},
 }
 
 // allUserPermissionOrder is every grant, in a stable order. Built from the groups so adding a
@@ -241,6 +261,11 @@ var highRiskUserPermissions = map[string]bool{
 	// practice's name. It deserves the same confirmation as the other grants that have effects
 	// outside the software.
 	PermClaimElectronicSend: true,
+
+	// An export takes staff records out of the application, where the practice no longer controls
+	// them. That deserves the same confirmation as the other grants with effects outside the
+	// software.
+	PermHRReportExport: true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }
