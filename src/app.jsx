@@ -10,7 +10,7 @@ import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import DoctorWorkspace from "./DoctorWorkspace";
 import Cms1500Modal from "./Cms1500";
 import ClaimWorkspace from "./ClaimWorkspace";
-import Workforce from "./Workforce";
+import HrArea from "./HrArea";
 import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
@@ -3525,7 +3525,7 @@ function ClinicApp({
         )}
 
         {tabAllowed && tab === "hr" && (
-          <Workforce permissions={backupPerms.permissions} initialDate={hrDate} initialQuick={hrQuick} />
+          <HrArea permissions={backupPerms.permissions} initialDate={hrDate} initialQuick={hrQuick} />
         )}
 
         {tabAllowed && tab === "claims" && (

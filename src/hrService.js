@@ -33,6 +33,31 @@ export const getWorkforceCounts = (params) => {
 export const getEmployee = (userId, date) =>
   api(`/api/hr/employees/${encodeURIComponent(userId)}${date ? "?date=" + date : ""}`);
 
+// ---------- data entry ----------
+
+export const createEmployee = (body) =>
+  api("/api/hr/employees", { method: "POST", body });
+
+export const updateEmployee = (userId, body) =>
+  api(`/api/hr/employees/${encodeURIComponent(userId)}`, { method: "PUT", body });
+
+export const saveHrConfig = (kind, body) =>
+  api(`/api/hr/config/${encodeURIComponent(kind)}`, { method: "POST", body });
+
+export const saveSchedule = (body) =>
+  api("/api/hr/schedules", { method: "PUT", body });
+
+export const saveAttendance = (body) =>
+  api("/api/hr/attendance", { method: "PUT", body });
+
+export const listLeave = (status) =>
+  api(`/api/hr/leave${status ? "?status=" + encodeURIComponent(status) : ""}`);
+
+export const createLeave = (body) => api("/api/hr/leave", { method: "POST", body });
+
+export const decideLeave = (id, decision) =>
+  api(`/api/hr/leave/${encodeURIComponent(id)}/decision`, { method: "POST", body: { decision } });
+
 export const getSavedViews = () => api("/api/hr/saved-views");
 
 export const saveView = (name, filters, shared = false) =>

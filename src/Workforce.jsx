@@ -45,15 +45,16 @@ function Pill({ tone, children }) {
   );
 }
 
+// A <label>, not a <div>: wrapping the control is what gives it an accessible name.
 function Select({ label, value, onChange, options, allLabel = "All" }) {
   return (
-    <div>
+    <label className="block">
       <span className={lbl}>{label}</span>
       <select className={input} value={value} onChange={(e) => onChange(e.target.value)}>
         <option value="">{allLabel}</option>
         {(options || []).map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
       </select>
-    </div>
+    </label>
   );
 }
 

@@ -78,11 +78,11 @@ WITH wf AS (
     e.work_phone                            AS work_phone,
     e.photo_url                             AS photo_url,
     coalesce(d.name, '')                    AS department,
-    e.department_id                          AS department_id,
+    coalesce(e.department_id, '')                  AS department_id,
     coalesce(jt.name, '')                   AS job_title,
-    e.job_title_id                           AS job_title_id,
+    coalesce(e.job_title_id, '')                  AS job_title_id,
     coalesce(l.name, '')                    AS location,
-    e.location_id                            AS location_id,
+    coalesce(e.location_id, '')                  AS location_id,
     coalesce(m.name, '')                    AS manager,
     e.manager_user_id                        AS manager_user_id,
     coalesce(sh.name, '')                   AS shift_name,
@@ -477,8 +477,13 @@ func (s *Server) handleWorkforceList(w http.ResponseWriter, r *http.Request) {
 			&leaveType, &onLeave, &holidayName, &isHoliday, &todayStatus,
 			&credsExpired, &nextCredExpiry, &trainingOverdue, &nextTrainingDue, &pendingRequests,
 		); err != nil {
+			// Not a silent continue. A row that cannot be scanned is a row the count included and
+			// the list did not, which reads to a user as staff disappearing - the bug this
+			// replaced. Failing the request makes it a visible error instead of missing people.
 			log.Printf("hr: workforce scan failed: %v", err)
-			continue
+			writeErr(w, http.StatusInternalServerError,
+				"the workforce could not be read completely - the server log has the detail")
+			return
 		}
 
 		row := map[string]any{

@@ -59,9 +59,17 @@ export function onTokenChange(fn) {
 }
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  /**
+   * `body` is the decoded error response, when there was one.
+   *
+   * Some endpoints answer a failed validation with a LIST of what is wrong rather than a single
+   * sentence. Without the body a caller can only show the first problem, so somebody fixes one
+   * field, submits, and is told about the next - which is a worse form of the same error.
+   */
+  constructor(status, message, body = null) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -117,14 +125,16 @@ export async function api(path, { method = "GET", body, signal, authToken } = {}
 
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`;
+    let body = null;
     try {
       const data = await res.json();
+      body = data;
       if (data?.error) message = data.error;
     } catch {
       // Non-JSON error body; keep the status line.
     }
     if (res.status === 401) expireSession();
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, body);
   }
   if (res.status === 204) return null;
   return res.json();

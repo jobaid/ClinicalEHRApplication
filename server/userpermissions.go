@@ -106,6 +106,15 @@ const (
 	PermHRCredentialView = "HR_CREDENTIAL_VIEW"
 	PermHRReportExport   = "HR_REPORT_EXPORT"
 
+	// The write grants, kept separate from the read ones because maintaining the staff directory,
+	// publishing a rota, recording attendance and deciding leave are four different jobs. A
+	// scheduler should not be able to approve their own leave.
+	PermHREmployeeManage   = "HR_EMPLOYEE_MANAGE"
+	PermHRScheduleManage   = "HR_SCHEDULE_MANAGE"
+	PermHRAttendanceManage = "HR_ATTENDANCE_MANAGE"
+	PermHRLeaveManage      = "HR_LEAVE_MANAGE"
+	PermHRConfigManage     = "HR_CONFIG_MANAGE"
+
 	PermRxView        = "RX_VIEW"
 	PermRxCreate      = "RX_CREATE"
 	PermRxSign        = "RX_SIGN"
@@ -195,6 +204,11 @@ var hrPermissionOrder = []string{
 	PermHREmployeeView,
 	PermHRCredentialView,
 	PermHRReportExport,
+	PermHREmployeeManage,
+	PermHRScheduleManage,
+	PermHRAttendanceManage,
+	PermHRLeaveManage,
+	PermHRConfigManage,
 }
 
 var permissionGroups = []permissionGroup{
@@ -266,6 +280,11 @@ var highRiskUserPermissions = map[string]bool{
 	// them. That deserves the same confirmation as the other grants with effects outside the
 	// software.
 	PermHRReportExport: true,
+
+	// Creating an employee creates a user account, and deciding leave is a decision about somebody
+	// else's pay and time. Both deserve the confirmation the grant screen shows.
+	PermHREmployeeManage: true,
+	PermHRLeaveManage:    true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }
