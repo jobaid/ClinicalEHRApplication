@@ -284,7 +284,7 @@ func main() {
 	mux.HandleFunc("DELETE /api/auth/devices/{id}", s.requireAuth(s.handleRevokeDevice))
 	mux.HandleFunc("DELETE /api/auth/devices", s.requireAuth(s.handleRevokeAllDevices))
 
-	mux.HandleFunc("GET /api/collections/{name}", s.requireAuth(s.handleList))
+	mux.HandleFunc("GET /api/collections/{name}", s.requireCollectionRead(s.handleList))
 	mux.HandleFunc("POST /api/collections/{name}", s.requireAuth(s.handleCreate))
 	mux.HandleFunc("PUT /api/collections/{name}/{id}", s.requireAuth(s.handleWrite))
 	mux.HandleFunc("PATCH /api/collections/{name}/{id}", s.requireAuth(s.handleWrite))
@@ -446,6 +446,11 @@ func main() {
 	// every other schema step.
 	if err := s.ensureClaimSchema(context.Background()); err != nil {
 		log.Printf("claims: %v - claim validation and history will not work until this is resolved", err)
+	}
+
+	// Roles and the tab grants for HIM and Antimicrobial Review. Additive and idempotent.
+	if err := s.ensureRoleSchema(context.Background()); err != nil {
+		log.Printf("roles: %v - the HIM and Antimicrobial tabs may not appear until this is resolved", err)
 	}
 
 	// Session epoch, for Remember Me. Additive and idempotent, same as every other schema step.

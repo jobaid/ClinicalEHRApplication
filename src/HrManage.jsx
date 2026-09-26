@@ -226,7 +226,7 @@ export function EmployeeForm({ userId, options, staff, onClose, onSaved }) {
                 {!editing && (
                   <Field label="Application role" hint="Only applies if they are later given access">
                     <select className={input} value={form.role} onChange={set("role")}>
-                      {["RECEPTIONIST", "NURSE", "BILLER", "DOCTOR", "MANAGER"].map((r) =>
+                      {["RECEPTIONIST", "NURSE", "BILLER", "DOCTOR", "HIM", "HUMAN_RESOURCE", "MANAGER"].map((r) =>
                         <option key={r} value={r}>{r}</option>)}
                     </select>
                   </Field>

@@ -819,12 +819,19 @@ func (t tabSet) has(tab string) bool { return t[tab] }
 // defaultRoleTabs mirrors the seed in migrations/002_role_permissions.sql, and is what a role
 // falls back to if its row is missing or the table cannot be read. Falling back to the shipped
 // grants keeps a database hiccup from either locking everyone out or opening everything up.
+//
+// Kept in step with DEFAULT_ROLE_TABS in src/app.jsx. SUPER_ADMIN is answered from THIS map, never
+// from the table, so a tab missing here is missing for the one role that is meant to have
+// everything.
 var defaultRoleTabs = map[string][]string{
-	"SUPER_ADMIN":  {"dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "users"},
-	"MANAGER":      {"dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports"},
-	"NURSE":        {"dashboard", "schedule", "patients", "clinical"},
-	"RECEPTIONIST": {"dashboard", "schedule", "patients"},
-	"BILLER":       {"dashboard", "patients", "billing", "claims", "reports"},
+	"SUPER_ADMIN":    {"dashboard", "schedule", "patients", "clinical", "record", "billing", "claims", "reports", "him", "antimicrobial", "hr", "users"},
+	"MANAGER":        {"dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "him", "antimicrobial", "hr"},
+	"DOCTOR":         {"dashboard", "schedule", "patients", "clinical", "record", "reports", "antimicrobial"},
+	"NURSE":          {"dashboard", "schedule", "patients", "clinical", "antimicrobial"},
+	"RECEPTIONIST":   {"dashboard", "schedule", "patients"},
+	"BILLER":         {"dashboard", "patients", "billing", "claims", "reports"},
+	"HIM":            {"dashboard", "him"},
+	"HUMAN_RESOURCE": {"dashboard", "hr"},
 }
 
 func fallbackTabs(role string) tabSet {

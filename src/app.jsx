@@ -11,6 +11,8 @@ import DoctorWorkspace from "./DoctorWorkspace";
 import Cms1500Modal from "./Cms1500";
 import ClaimWorkspace from "./ClaimWorkspace";
 import HrArea from "./HrArea";
+import HimWorklist from "./HimWorklist";
+import AntimicrobialReview from "./AntimicrobialReview";
 import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
@@ -26,7 +28,7 @@ import {
   ScissorsLineDashed, CreditCard, Upload, FileCheck2, Landmark, Wand2,
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
-  Activity, Pill, ClipboardList, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
+  Activity, Pill, ClipboardList, Microscope, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
   KeyRound, ShieldCheck, Database
 } from "lucide-react";
 import {
@@ -71,8 +73,16 @@ const DEMO_LOGIN_HINTS = [
   { email: "reception@medbill.local", password: "Reception@12345", role: "RECEPTIONIST" },
   { email: "biller@medbill.local", password: "Biller@12345", role: "BILLER" },
 ];
+// DOCTOR is labelled "Physician" and there is no separate PHYSICIAN role.
+//
+// The application already had a DOCTOR role, a DOCTOR_* permission group and a clinical workspace
+// before "Physician" was asked for. A second role for the same clinical concept would mean every
+// future permission being granted twice, and any disagreement between the two becoming a security
+// question - which is exactly what section 15 warns against. The code stays DOCTOR; the label is
+// what changes. See migrations/016_roles.sql.
 const ROLE_LABELS = {
-  SUPER_ADMIN: "Super Admin", MANAGER: "Manager", NURSE: "Nurse", RECEPTIONIST: "Receptionist", BILLER: "Biller",
+  SUPER_ADMIN: "Super Admin", MANAGER: "Manager", DOCTOR: "Physician", NURSE: "Nurse",
+  RECEPTIONIST: "Receptionist", BILLER: "Biller", HIM: "HIM", HUMAN_RESOURCE: "Human Resource",
 };
 
 // Fallback tab grants, used only until the rolePermissions collection loads (and if a role has
@@ -86,12 +96,16 @@ const DEFAULT_ROLE_TABS = {
   // never read from role_permissions, so a tab added only to the migration is invisible to the one
   // role that always has everything - which is exactly how the Medical Record tab shipped hidden
   // from every user.
-  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "record", "billing", "claims", "reports", "hr", "users"],
-  MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "hr"],
-  NURSE: ["dashboard", "schedule", "patients", "clinical"],
+  SUPER_ADMIN: ["dashboard", "schedule", "patients", "clinical", "record", "billing", "claims", "reports", "him", "antimicrobial", "hr", "users"],
+  MANAGER: ["dashboard", "schedule", "patients", "clinical", "billing", "claims", "reports", "him", "antimicrobial", "hr"],
+  NURSE: ["dashboard", "schedule", "patients", "clinical", "antimicrobial"],
   RECEPTIONIST: ["dashboard", "schedule", "patients"],
   BILLER: ["dashboard", "patients", "billing", "claims", "reports"],
-  DOCTOR: ["dashboard", "schedule", "patients", "clinical", "record", "reports"],
+  DOCTOR: ["dashboard", "schedule", "patients", "clinical", "record", "reports", "antimicrobial"],
+  // Section 17 and section 50: HR does not get patient, clinical or billing access, and a HIM
+  // coder gets the coding worklist rather than the whole clinical application.
+  HIM: ["dashboard", "him"],
+  HUMAN_RESOURCE: ["dashboard", "hr"],
 };
 
 // CPT catalog now lives in Firestore's cptCatalog collection (loaded once in ClinicApp) and is
@@ -2563,6 +2577,8 @@ function ClinicApp({
     { id: "claims", label: "Claims", icon: FileStack },
     { id: "reports", label: "Reports", icon: BarChart3 },
     { id: "record", label: "Medical Record", icon: Stethoscope, needsPerm: "DOCTOR_MEDICAL_RECORD_VIEW" },
+    { id: "him", label: "HIM", icon: ClipboardList, needsPerm: "HIM_WORKLIST_VIEW" },
+    { id: "antimicrobial", label: "Antimicrobial", icon: Microscope, needsPerm: "ANTIMICROBIAL_VIEW" },
     { id: "hr", label: "HR", icon: Users, needsPerm: "HR_WORKFORCE_VIEW" },
   ];
   // Live grants win; DEFAULT_ROLE_TABS covers the first render and any role without a row.
@@ -3113,6 +3129,22 @@ function ClinicApp({
       createdBy: session.name, createdAt: nowIso(),
     });
     addAudit(null, "User account created", "user", uid, null, `${form.name} <${form.email}> as ${ROLE_LABELS[form.role] || form.role}`);
+
+    // Starting grants for the roles that need them (see ROLE_DEFAULT_GRANTS). Sent through the
+    // Access Management endpoint, so the server checks the caller may grant them, records them in
+    // the grant history, and they stay editable there. A failure leaves a valid account with no
+    // grants - reported, never fatal, because the account itself was created correctly.
+    const defaults = ROLE_DEFAULT_GRANTS[form.role];
+    if (defaults?.length) {
+      try {
+        await api(`/api/admin/backup-access/${encodeURIComponent(uid)}`, {
+          method: "PUT", body: { permissions: defaults },
+        });
+      } catch (err) {
+        alert(`The account was created, but its starting permissions could not be applied: ${err.message}. ` +
+          "Grant them from Access Management.");
+      }
+    }
   }
 
   function setUserDisabled(uid, disabled) {
@@ -3388,6 +3420,8 @@ function ClinicApp({
             outstanding={outstanding} monthRevenue={monthRevenue} todaysAppts={todaysAppts}
             pendingClaims={pendingClaims} deniedClaims={deniedClaims} patientById={patientById}
             canSeeWorkforce={backupPerms.permissions.includes("HR_WORKFORCE_VIEW")}
+            canSeeFinancials={["billing", "claims", "reports"].some(t => allowedTabs.includes(t))}
+            canSeeSchedule={["schedule", "patients", "clinical", "record", "billing"].some(t => allowedTabs.includes(t))}
             onOpenWorkforce={(quick) => { setHrDate(TODAY); setHrQuick(quick || ""); setTab("hr"); }}
             revenueByMonth={revenueByMonth} setTab={setTab}
           />
@@ -3531,6 +3565,14 @@ function ClinicApp({
             hasOpenBatch={!!myOpenBatch}
             onCreateTickler={(prefill) => { setTicklerPrefill(prefill); setShowTicklerPanel(true); }}
           />
+        )}
+
+        {tabAllowed && tab === "him" && (
+          <HimWorklist permissions={backupPerms.permissions} />
+        )}
+
+        {tabAllowed && tab === "antimicrobial" && (
+          <AntimicrobialReview permissions={backupPerms.permissions} />
         )}
 
         {tabAllowed && tab === "hr" && (
@@ -4962,13 +5004,17 @@ function TicklerList({ ticklers, onSetStatus, onSnooze }) {
 
 // ---------- Dashboard ----------
 
-function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deniedClaims, patientById, revenueByMonth, setTab, canSeeWorkforce, onOpenWorkforce }) {
+function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deniedClaims, patientById, revenueByMonth, setTab, canSeeWorkforce, onOpenWorkforce, canSeeFinancials, canSeeSchedule }) {
+  // Tiles are shown only for data this role may read. The server now refuses charges, claims and
+  // payments to roles without Billing, Claims or Reports, and appointments to roles without a
+  // scheduling or clinical tab - so an unreadable tile would otherwise show a confident $0.00,
+  // which is worse than showing nothing.
   const stats = [
-    { label: "Collected this month", value: money(monthRevenue), icon: DollarSign, tone: "text-teal-600 bg-teal-50" },
-    { label: "Outstanding balance", value: money(outstanding), icon: AlertCircle, tone: "text-rose-600 bg-rose-50" },
-    { label: "Appointments today", value: todaysAppts.length, icon: CalendarDays, tone: "text-sky-600 bg-sky-50" },
-    { label: "Claims pending", value: pendingClaims, icon: Clock, tone: "text-amber-600 bg-amber-50" },
-  ];
+    canSeeFinancials && { label: "Collected this month", value: money(monthRevenue), icon: DollarSign, tone: "text-teal-600 bg-teal-50" },
+    canSeeFinancials && { label: "Outstanding balance", value: money(outstanding), icon: AlertCircle, tone: "text-rose-600 bg-rose-50" },
+    canSeeSchedule && { label: "Appointments today", value: todaysAppts.length, icon: CalendarDays, tone: "text-sky-600 bg-sky-50" },
+    canSeeFinancials && { label: "Claims pending", value: pendingClaims, icon: Clock, tone: "text-amber-600 bg-amber-50" },
+  ].filter(Boolean);
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
@@ -4976,7 +5022,7 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
           <h1 className="text-xl font-semibold text-slate-800">Dashboard</h1>
           <p className="text-slate-500 text-sm">{weekdayOf(TODAY) + ", " + fmtDate(TODAY)}</p>
         </div>
-        {deniedClaims > 0 && (
+        {canSeeFinancials && deniedClaims > 0 && (
           <button onClick={() => setTab("claims")} className="flex items-center gap-2 text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5">
             <AlertCircle size={15} /> {deniedClaims} denied claim{deniedClaims > 1 ? "s" : ""} need review
           </button>
@@ -4984,7 +5030,7 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
       </div>
       {canSeeWorkforce && <WorkforceTodayCard onOpen={onOpenWorkforce} />}
 
-      <div className="grid grid-cols-4 gap-4 mb-6">
+      {stats.length > 0 && <div className="grid grid-cols-4 gap-4 mb-6">
         {stats.map((s, i) => {
           const Icon = s.icon;
           return (
@@ -4995,9 +5041,9 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
             </Card>
           );
         })}
-      </div>
+      </div>}
       <div className="grid grid-cols-3 gap-4">
-        <Card className="p-4 col-span-2">
+        {canSeeFinancials && <Card className="p-4 col-span-2">
           <h3 className="font-medium text-slate-700 mb-3">Revenue, last 6 months</h3>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={revenueByMonth}>
@@ -5008,8 +5054,8 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
               <Bar dataKey="revenue" fill="#0d9488" radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
-        </Card>
-        <Card className="p-4">
+        </Card>}
+        {canSeeSchedule && <Card className="p-4">
           <h3 className="font-medium text-slate-700 mb-3">Today's schedule</h3>
           <div className="space-y-2 max-h-56 overflow-y-auto">
             {todaysAppts.map(a => (
@@ -5023,7 +5069,7 @@ function Dashboard({ outstanding, monthRevenue, todaysAppts, pendingClaims, deni
             ))}
             {todaysAppts.length === 0 && <p className="text-slate-400 text-sm">No appointments today.</p>}
           </div>
-        </Card>
+        </Card>}
       </div>
     </div>
   );
@@ -9089,7 +9135,36 @@ function ManageRoles({ rolePermissions, users, navItems, onSave }) {
 
 // ---------- User account administration (SUPER_ADMIN only) ----------
 
-const userRoles = ["SUPER_ADMIN", "MANAGER", "NURSE", "RECEPTIONIST", "BILLER"];
+// The one list behind Add User, Change Role and Manage Roles. DOCTOR was missing from it, which is
+// why a Doctor could not be created even though the role, its tabs and its permissions all existed.
+const userRoles = ["SUPER_ADMIN", "MANAGER", "DOCTOR", "NURSE", "RECEPTIONIST", "BILLER", "HIM", "HUMAN_RESOURCE"];
+
+// Starting per-user grants for a newly created account in these roles.
+//
+// These are NOT a second permission system. They are written once, through the same Access
+// Management endpoint an administrator uses by hand, and are then edited there like any other
+// grant. Without them a new Physician would be created with the Medical Record tab hidden and
+// every clinical action refused - a working account that can do nothing - because the clinical
+// actions are per-user grants, deliberately kept apart from role tabs (server/userpermissions.go).
+//
+// Signing and sending a prescription are left out even for a Physician: those put a prescriber's
+// name on a legal instrument, and the server also requires a verified prescriber profile, so an
+// administrator grants them deliberately rather than by default.
+const ROLE_DEFAULT_GRANTS = {
+  DOCTOR: [
+    "DOCTOR_PATIENT_VIEW", "DOCTOR_MEDICAL_RECORD_VIEW", "DOCTOR_CLINICAL_NOTE_CREATE",
+    "DOCTOR_CLINICAL_NOTE_EDIT", "DOCTOR_LAB_VIEW", "DOCTOR_DOCUMENT_VIEW",
+    "DOCTOR_MEDICATION_VIEW", "DOCTOR_ANTIMICROBIAL_VIEW",
+    "MEDICAL_RECORD_DOCUMENT_VIEW", "MEDICAL_RECORD_DOWNLOAD",
+    "RX_VIEW", "RX_CREATE", "RX_HISTORY_VIEW",
+    "ANTIMICROBIAL_VIEW",
+  ],
+  HIM: ["HIM_WORKLIST_VIEW", "HIM_CODING_EDIT", "HIM_QUERY_CREATE", "HIM_REPORT"],
+  HUMAN_RESOURCE: [
+    "HR_WORKFORCE_VIEW", "HR_EMPLOYEE_VIEW", "HR_CREDENTIAL_VIEW",
+    "HR_SCHEDULE_MANAGE", "HR_ATTENDANCE_MANAGE",
+  ],
+};
 
 function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, onChangeRole, onResetPassword }) {
   const [showAdd, setShowAdd] = useState(false);

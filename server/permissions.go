@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -149,4 +151,14 @@ func sanitizePermissions(raw any) ([]string, bool) {
 		}
 	}
 	return out, dropped
+}
+
+//go:embed migrations/016_roles.sql
+var roleSchemaSQL string
+
+func (s *Server) ensureRoleSchema(ctx context.Context) error {
+	if _, err := s.db.Exec(ctx, roleSchemaSQL); err != nil {
+		return fmt.Errorf("role schema: %w", err)
+	}
+	return nil
 }

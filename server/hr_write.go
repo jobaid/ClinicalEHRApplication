@@ -39,6 +39,7 @@ import (
 // unknown one.
 var assignableEmployeeRoles = map[string]bool{
 	"BILLER": true, "MANAGER": true, "NURSE": true, "RECEPTIONIST": true, "DOCTOR": true,
+	"HIM": true, "HUMAN_RESOURCE": true,
 }
 
 var errNotAnEmployee = errors.New("employee not found")

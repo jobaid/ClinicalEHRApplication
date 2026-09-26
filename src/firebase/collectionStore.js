@@ -45,7 +45,12 @@ export function refetch(name) {
       // A failed read leaves the previous data in place rather than blanking the UI; the app
       // treats "loaded but empty" as real data, so blanking would look like deletion.
       e.loading = false;
-      if (err?.status !== 401) console.error(`[medbill] failed to load ${name}:`, err.message);
+      // 403 is expected, not a fault: the server now refuses collections the caller's role does
+      // not use, and the app still asks for every collection at start-up. Logging it would fill
+      // the console with errors for working accounts.
+      if (err?.status !== 401 && err?.status !== 403) {
+        console.error(`[medbill] failed to load ${name}:`, err.message);
+      }
       emit(e);
     })
     .finally(() => {
