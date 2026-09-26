@@ -448,6 +448,11 @@ func main() {
 		log.Printf("claims: %v - claim validation and history will not work until this is resolved", err)
 	}
 
+	// Session epoch, for Remember Me. Additive and idempotent, same as every other schema step.
+	if err := s.ensureSessionSchema(context.Background()); err != nil {
+		log.Printf("sessions: %v - Remember Me will not survive a password change until resolved", err)
+	}
+
 	// HR workforce tables. Additive and idempotent, same as every other schema step.
 	if err := s.ensureHRSchema(context.Background()); err != nil {
 		log.Printf("hr: %v - the Workforce screen will not work until this is resolved", err)

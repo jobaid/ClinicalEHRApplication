@@ -28,12 +28,28 @@ export const API_BASE =
 // object with the user's name and role; the two are cleared together on sign-out.
 const TOKEN_KEY = "medbill_token";
 
-let token = null;
-try {
-  token = localStorage.getItem(TOKEN_KEY);
-} catch {
-  token = null; // private mode / storage disabled
+/**
+ * Where the session token lives depends on Remember Me.
+ *
+ * localStorage survives closing the browser; sessionStorage does not, and is scoped to the one
+ * tab. That difference IS Remember Me on the client side - without it the checkbox is decorative,
+ * which is what it was: the value was read into state and never used for anything.
+ *
+ * The server half matters more: a remembered sign-in gets a long-lived token and an unremembered
+ * one gets a short one, so clearing browser storage is not the only thing standing between a
+ * shared machine and somebody else's session.
+ */
+function readStoredToken() {
+  try {
+    // sessionStorage first: if both somehow hold a token, the tab-scoped one is the more recent
+    // and the more restrictive.
+    return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null; // private mode / storage disabled
+  }
 }
+
+let token = readStoredToken();
 
 const tokenListeners = new Set();
 
@@ -41,11 +57,16 @@ export function getToken() {
   return token;
 }
 
-export function setToken(next) {
+export function setToken(next, { persist = true } = {}) {
   token = next;
   try {
-    if (next) localStorage.setItem(TOKEN_KEY, next);
-    else localStorage.removeItem(TOKEN_KEY);
+    // Always clear BOTH, then write to the one chosen. Leaving a stale copy in the other store is
+    // how a "do not remember me" sign-in comes back to life after the browser restarts.
+    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    if (next) {
+      (persist ? localStorage : sessionStorage).setItem(TOKEN_KEY, next);
+    }
   } catch {
     // Non-persistent session is still usable for this tab.
   }

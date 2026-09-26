@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,17 @@ type Claims struct {
 	// would be a fully valid session and the second factor would be optional in practice.
 	Purpose string `json:"purpose,omitempty"`
 
+	// The account's session epoch at the moment this token was issued. requireAuth compares it
+	// with the row on every request, so bumping the column signs every existing token out at once.
+	// Omitted from old tokens, which therefore read as 0 and match an account that has never had
+	// its sessions revoked - so this change does not sign anybody out on deploy.
+	Epoch int `json:"epoch,omitempty"`
+
+	// Whether the person ticked Remember Me. Carried through the MFA round trip in the SIGNED
+	// challenge token rather than re-sent with the verification request, so a client cannot
+	// lengthen its own session by editing a body between the two steps.
+	Remember bool `json:"rem,omitempty"`
+
 	jwt.RegisteredClaims
 }
 
@@ -49,16 +61,31 @@ type authedUser struct {
 	// to come from the row itself - a value carried in a session token would survive the account
 	// being un-flagged.
 	IsDemo bool
+
+	// Read from users.session_epoch, never from a token.
+	SessionEpoch int
 }
 
-const sessionTTL = 12 * time.Hour
+// How long a session lasts.
+//
+// The short one is a working day plus a margin, which is the right default for a shared clinic
+// machine. The long one applies only when the person ticked Remember Me, and is deliberately
+// finite: "remember me" should mean weeks, not forever.
+const (
+	sessionTTL           = 12 * time.Hour
+	rememberedSessionTTL = 30 * 24 * time.Hour
+)
 
-func (s *Server) issueToken(u authedUser) (string, error) {
+func (s *Server) issueToken(u authedUser, remember bool) (string, error) {
+	ttl := sessionTTL
+	if remember {
+		ttl = rememberedSessionTTL
+	}
 	claims := Claims{
-		UID: u.UID, Email: u.Email, Role: u.Role,
+		UID: u.UID, Email: u.Email, Role: u.Role, Epoch: u.SessionEpoch,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   u.UID,
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(sessionTTL)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}
@@ -84,9 +111,9 @@ func (s *Server) parseToken(tokenStr string) (*Claims, error) {
 
 // issueChallengeToken mints the short-lived token that carries a half-finished login from the
 // password step to the second-factor step. It is not a session and requireAuth will not accept it.
-func (s *Server) issueChallengeToken(u authedUser) (string, error) {
+func (s *Server) issueChallengeToken(u authedUser, remember bool) (string, error) {
 	claims := Claims{
-		UID: u.UID, Email: u.Email, Role: u.Role, Purpose: mfaChallengeKind,
+		UID: u.UID, Email: u.Email, Role: u.Role, Purpose: mfaChallengeKind, Remember: remember,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   u.UID,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(mfaChallengeTTL)),
@@ -109,6 +136,16 @@ func (s *Server) parseChallengeToken(raw string) (*Claims, error) {
 	return claims, nil
 }
 
+//go:embed migrations/015_sessions.sql
+var sessionSchemaSQL string
+
+func (s *Server) ensureSessionSchema(ctx context.Context) error {
+	if _, err := s.db.Exec(ctx, sessionSchemaSQL); err != nil {
+		return fmt.Errorf("session schema: %w", err)
+	}
+	return nil
+}
+
 var errBadCredentials = errors.New("invalid email or password")
 
 // authenticate verifies an email/password pair against the stored credential.
@@ -119,11 +156,13 @@ func (s *Server) authenticate(ctx context.Context, email, password string) (auth
 		hash, salt      *string
 		disabled        bool
 		isDemo          bool
+		epoch           int
 	)
 	err := s.db.QueryRow(ctx,
-		`SELECT id, role, name, disabled, password_algo, password_hash, password_salt, is_demo
+		`SELECT id, role, name, disabled, password_algo, password_hash, password_salt, is_demo,
+		        session_epoch
 		   FROM users WHERE lower(email) = lower($1)`, email).
-		Scan(&uid, &role, &name, &disabled, &algo, &hash, &salt, &isDemo)
+		Scan(&uid, &role, &name, &disabled, &algo, &hash, &salt, &isDemo, &epoch)
 	if err != nil {
 		return authedUser{}, errBadCredentials
 	}
@@ -154,13 +193,16 @@ func (s *Server) authenticate(ctx context.Context, email, password string) (auth
 	if !ok {
 		return authedUser{}, errBadCredentials
 	}
-	return authedUser{UID: uid, Email: email, Role: role, Name: name, IsDemo: isDemo}, nil
+	return authedUser{UID: uid, Email: email, Role: role, Name: name, IsDemo: isDemo, SessionEpoch: epoch}, nil
 }
 
 // ---------- HTTP handlers ----------
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	var body struct{ Email, Password string }
+	var body struct {
+		Email, Password string
+		Remember        bool `json:"remember"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
@@ -193,7 +235,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// enrolment still signs in without one, rather than stranding a published account behind
 		// an authenticator nobody has.
 		s.recordLoginAudit(r.Context(), u, "Demo sign-in (MFA not required)")
-		s.completeLogin(w, u, "demo account")
+		s.completeLogin(w, u, "demo account", body.Remember)
 
 	case state.Enabled && mfaEnforced():
 		// Enrolled AND the requirement is on.
@@ -207,10 +249,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		//
 		// This browser may already have proved the second factor within the last 30 days.
 		if s.trustedDeviceValid(r.Context(), r, u.UID) {
-			s.completeLogin(w, u, "trusted device")
+			s.completeLogin(w, u, "trusted device", body.Remember)
 			return
 		}
-		challenge, err := s.issueChallengeToken(u)
+		challenge, err := s.issueChallengeToken(u, body.Remember)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "could not start verification")
 			return
@@ -224,7 +266,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	case mfaEnforced():
 		// Required but not set up. Enrolment is offered here rather than refused, so turning the
 		// requirement on does not lock out accounts that predate it - they enrol on next sign-in.
-		challenge, err := s.issueChallengeToken(u)
+		challenge, err := s.issueChallengeToken(u, body.Remember)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "could not start enrolment")
 			return
@@ -241,17 +283,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// no second factor configured.
 		if state.Enabled {
 			s.recordLoginAudit(r.Context(), u, "Sign-in without MFA (MFA_ENFORCEMENT=none overrides enrolment)")
-			s.completeLogin(w, u, "password only - enforcement disabled")
+			s.completeLogin(w, u, "password only - enforcement disabled", body.Remember)
 			return
 		}
-		s.completeLogin(w, u, "password only")
+		s.completeLogin(w, u, "password only", body.Remember)
 	}
 }
 
 // completeLogin issues the real session token. Every successful sign-in ends here, whatever route
 // it took, so there is exactly one place a session can be minted.
-func (s *Server) completeLogin(w http.ResponseWriter, u authedUser, _ string) {
-	token, err := s.issueToken(u)
+func (s *Server) completeLogin(w http.ResponseWriter, u authedUser, _ string, remember bool) {
+	token, err := s.issueToken(u, remember)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not issue session")
 		return
@@ -289,7 +331,7 @@ func (s *Server) userFromChallenge(r *http.Request) (authedUser, *Claims, error)
 
 // handleMFAVerify is the second step of signing in: a 6-digit code, or a backup code.
 func (s *Server) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
-	u, _, err := s.userFromChallenge(r)
+	u, challengeClaims, err := s.userFromChallenge(r)
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, "your verification window expired - please sign in again")
 		return
@@ -325,7 +367,8 @@ func (s *Server) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
 		// simply gets asked again next time.
 	}
 	s.recordLoginAudit(r.Context(), u, "MFA verified")
-	s.completeLogin(w, u, "mfa")
+	// Remember Me came from the signed challenge token, not from this request's body.
+	s.completeLogin(w, u, "mfa", challengeClaims.Remember)
 }
 
 // handleMFAEnrollStart returns a fresh secret and the otpauth:// URI for the QR code.
@@ -389,8 +432,8 @@ func (s *Server) handleMFAEnrollConfirm(w http.ResponseWriter, r *http.Request) 
 	// Enrolling mid-login finishes the login; enrolling from Settings leaves the existing session
 	// alone, so no second token is issued there.
 	resp := map[string]any{"backupCodes": codes}
-	if _, _, err := s.userFromChallenge(r); err == nil {
-		if token, err := s.issueToken(u); err == nil {
+	if _, enrolClaims, err := s.userFromChallenge(r); err == nil {
+		if token, err := s.issueToken(u, enrolClaims.Remember); err == nil {
 			resp["token"] = token
 			resp["user"] = map[string]any{"uid": u.UID, "email": u.Email}
 		}
@@ -648,7 +691,8 @@ func (s *Server) setPassword(ctx context.Context, uid, password string) error {
 		return err
 	}
 	if _, err = s.db.Exec(ctx,
-		`UPDATE users SET password_algo = 'bcrypt', password_hash = $2, password_salt = NULL WHERE id = $1`,
+		`UPDATE users SET password_algo = 'bcrypt', password_hash = $2, password_salt = NULL,
+		        session_epoch = session_epoch + 1 WHERE id = $1`,
 		uid, string(hash)); err != nil {
 		return err
 	}
@@ -727,9 +771,10 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		var role, name, email string
 		var disabled, isDemo bool
+		var epoch int
 		if err := s.db.QueryRow(r.Context(),
-			`SELECT role, name, email, disabled, is_demo FROM users WHERE id = $1`, claims.UID).
-			Scan(&role, &name, &email, &disabled, &isDemo); err != nil {
+			`SELECT role, name, email, disabled, is_demo, session_epoch FROM users WHERE id = $1`, claims.UID).
+			Scan(&role, &name, &email, &disabled, &isDemo, &epoch); err != nil {
 			writeErr(w, http.StatusUnauthorized, "unknown account")
 			return
 		}
@@ -737,8 +782,16 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusForbidden, "this account has been disabled")
 			return
 		}
+		// The token was issued before this account's sessions were revoked - by a password change,
+		// most often. A remembered session has to end at that point or "remember me" would outlive
+		// the credential it was granted against.
+		if claims.Epoch != epoch {
+			writeErr(w, http.StatusUnauthorized, "your password changed - please sign in again")
+			return
+		}
 
-		u := authedUser{UID: claims.UID, Email: email, Role: role, Name: name, IsDemo: isDemo}
+		u := authedUser{UID: claims.UID, Email: email, Role: role, Name: name,
+			IsDemo: isDemo, SessionEpoch: epoch}
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
 	}
 }

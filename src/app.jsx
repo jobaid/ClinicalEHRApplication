@@ -1768,7 +1768,7 @@ function TrustDeviceCheckbox({ checked, onChange, disabled }) {
 }
 
 /** Step 2 of signing in: enter the 6-digit code. */
-function MfaVerifyScreen({ challenge, onVerified, onCancel }) {
+function MfaVerifyScreen({ challenge, onVerified, onCancel, remember }) {
   const [code, setCode] = useState("");
   const [trust, setTrust] = useState(false);
   const [error, setError] = useState("");
@@ -1782,7 +1782,7 @@ function MfaVerifyScreen({ challenge, onVerified, onCancel }) {
     setBusy(true);
     setError("");
     try {
-      const credential = await verifyMfa(challenge, entered, trust);
+      const credential = await verifyMfa(challenge, entered, trust, remember);
       onVerified(credential);
     } catch (err) {
       // Stays on this screen, as required - a rejected code is not a reason to send someone back
@@ -1837,7 +1837,7 @@ function MfaVerifyScreen({ challenge, onVerified, onCancel }) {
 }
 
 /** First-time enrolment: scan the QR, confirm a code, save the backup codes. */
-function MfaEnrollScreen({ challenge, email, onEnrolled, onCancel }) {
+function MfaEnrollScreen({ challenge, email, onEnrolled, onCancel, remember }) {
   const [setup, setSetup] = useState(null);
   const [qr, setQr] = useState("");
   const [code, setCode] = useState("");
@@ -1867,7 +1867,7 @@ function MfaEnrollScreen({ challenge, email, onEnrolled, onCancel }) {
     setBusy(true);
     setError("");
     try {
-      const res = await confirmMfaEnrollment(challenge, code.trim(), trust);
+      const res = await confirmMfaEnrollment(challenge, code.trim(), trust, remember);
       setCodes(res.backupCodes || []);
       setPending(res.token ? { uid: res.user?.uid, email: res.user?.email } : null);
       setBusy(false);
@@ -2044,9 +2044,9 @@ function LoginPage({ onLogin }) {
   if (mfa) {
     const back = () => { setMfa(null); setPassword(""); setError(""); };
     return mfa.enroll
-      ? <MfaEnrollScreen challenge={mfa.challenge} email={mfa.email} onCancel={back}
+      ? <MfaEnrollScreen challenge={mfa.challenge} email={mfa.email} onCancel={back} remember={remember}
           onEnrolled={(user) => user ? finishLogin({ user }) : back()} />
-      : <MfaVerifyScreen challenge={mfa.challenge} onCancel={back} onVerified={finishLogin} />;
+      : <MfaVerifyScreen challenge={mfa.challenge} onCancel={back} remember={remember} onVerified={finishLogin} />;
   }
 
   // One sign-in path, used by both the form and the demo button.
@@ -2058,7 +2058,7 @@ function LoginPage({ onLogin }) {
     setLoading(true);
     setError("");
     try {
-      const credential = await signIn(emailValue, passwordValue);
+      const credential = await signIn(emailValue, passwordValue, remember);
       // No session token was stored: a code (or first-time setup) is still outstanding.
       if (credential.mfa) {
         setMfa(credential.mfa);
@@ -2093,11 +2093,19 @@ function LoginPage({ onLogin }) {
 
           <form onSubmit={submit}>
             <Field label="Email">
-              <input type="email" required className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@medbill.local" autoFocus />
+              <input type="email" required className={inputCls} value={email}
+                onChange={(e) => setEmail(e.target.value)} placeholder="you@medbill.local"
+                name="username" autoComplete="username" autoFocus />
             </Field>
             <Field label="Password">
               <div className="relative">
-                <input type={showPassword ? "text" : "password"} required className={`${inputCls} pr-16`} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+                <input type={showPassword ? "text" : "password"} required className={`${inputCls} pr-16`}
+                  value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••"
+                  name="password" autoComplete="current-password"
+                  // The accessible name a screen reader announces. The surrounding <label> wraps
+                  // both this input and the Show button, so implicit association does not apply
+                  // and without this the field is announced as an unlabelled text box.
+                  aria-label="Password" />
                 <button type="button" onClick={() => setShowPassword(s => !s)} className="absolute right-2 top-1.5 text-xs text-slate-400 hover:text-slate-600 px-2 py-1">
                   {showPassword ? "Hide" : "Show"}
                 </button>
@@ -2105,7 +2113,8 @@ function LoginPage({ onLogin }) {
             </Field>
             <div className="flex items-center justify-between mb-4">
               <label className="flex items-center gap-2 text-xs text-slate-500">
-                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember me
+                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)}
+                  name="remember" /> Remember me
               </label>
               <button type="button" className="text-xs text-teal-700 hover:underline">Forgot password?</button>
             </div>

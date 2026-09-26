@@ -18,7 +18,15 @@ import { getCache, refetch, clearAll } from "./collectionStore";
 // When a second factor is outstanding it resolves to { mfa: {...} } instead and NO session token
 // is stored - the caller must finish through verifyMfa() or confirmEnrollment(). Keeping the
 // success shape unchanged means every existing caller still works.
-export async function signIn(email, password) {
+/**
+ * Signs in.
+ *
+ * `remember` does two things, and both are needed. It tells the SERVER to issue a long-lived token
+ * instead of a short one, and it decides whether the token is kept in localStorage (survives
+ * closing the browser) or sessionStorage (does not). Doing only the second would leave an
+ * unremembered session valid for as long as a remembered one to anybody who copied the token.
+ */
+export async function signIn(email, password, remember = false) {
   // Firebase path: Google verifies the password and issues an ID token; the Go API verifies that
   // token and answers with the account's role. Sign-in fails here if the account is unknown to
   // this practice, so a Firebase account by itself grants no access.
@@ -33,7 +41,7 @@ export async function signIn(email, password) {
 
   const res = await api("/api/auth/login", {
     method: "POST",
-    body: { email, password },
+    body: { email, password, remember: !!remember },
   });
   if (res.mfaRequired || res.mfaEnrollRequired) {
     return {
@@ -45,7 +53,7 @@ export async function signIn(email, password) {
       },
     };
   }
-  setToken(res.token); // also opens the change feed
+  setToken(res.token, { persist: !!remember }); // also opens the change feed
   return { user: { uid: res.user.uid, email: res.user.email, isDemo: !!res.user.isDemo } };
 }
 
@@ -72,13 +80,13 @@ export async function demoInfo() {
 // Each of these carries the challenge token explicitly rather than through the stored session,
 // because during sign-in there is no session yet - that is the whole point of the challenge.
 
-export async function verifyMfa(challenge, code, trustDevice) {
+export async function verifyMfa(challenge, code, trustDevice, remember = false) {
   const res = await api("/api/auth/mfa/verify", {
     method: "POST",
     authToken: challenge,
     body: { code, trustDevice: !!trustDevice },
   });
-  setToken(res.token);
+  setToken(res.token, { persist: !!remember });
   return { user: { uid: res.user.uid, email: res.user.email } };
 }
 
@@ -86,7 +94,7 @@ export async function startMfaEnrollment(challenge) {
   return api("/api/auth/mfa/enroll/start", { method: "POST", authToken: challenge });
 }
 
-export async function confirmMfaEnrollment(challenge, code, trustDevice) {
+export async function confirmMfaEnrollment(challenge, code, trustDevice, remember = false) {
   const res = await api("/api/auth/mfa/enroll/confirm", {
     method: "POST",
     authToken: challenge,
@@ -94,7 +102,7 @@ export async function confirmMfaEnrollment(challenge, code, trustDevice) {
   });
   // Enrolling during sign-in completes it; enrolling from Settings returns no token and leaves
   // the existing session alone.
-  if (res.token) setToken(res.token);
+  if (res.token) setToken(res.token, { persist: !!remember });
   return res;
 }
 

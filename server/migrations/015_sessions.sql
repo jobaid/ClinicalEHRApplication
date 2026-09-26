@@ -1,0 +1,13 @@
+-- Session invalidation, for Remember Me.
+--
+-- Additive and idempotent: one column with a default, so every existing row is valid immediately
+-- and no session in flight is disturbed by the migration itself.
+--
+-- A JWT cannot be withdrawn once issued - that is the trade for not hitting the database on every
+-- request to look a session up. The usual answer is an epoch: the number is copied into each token
+-- and compared against the row on every request, so incrementing it invalidates every token issued
+-- before that moment, at the cost of one integer in a SELECT the request was already making.
+--
+-- It is incremented when a password changes, which is what makes "Remember Me ends when the
+-- password changes" true rather than aspirational.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS session_epoch INTEGER NOT NULL DEFAULT 0;
