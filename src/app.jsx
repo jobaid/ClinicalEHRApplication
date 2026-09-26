@@ -8,6 +8,7 @@ import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPass
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
 import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
 import DoctorWorkspace from "./DoctorWorkspace";
+import Cms1500Modal from "./Cms1500";
 import {
   BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, myBackupPermissions,
   listBackups, createBackup, downloadBackup, uploadBackup, restoreBackup, deleteBackup,
@@ -6838,6 +6839,8 @@ function ClaimLedgerTab({
           dialog={dialog}
           charge={charges.find(c => c.id === dialog.chargeId)}
           policies={policies}
+          patient={patientById[patientId]}
+          allCharges={allCharges || charges}
           onClose={() => setDialog(null)}
           onPostCheck={onPostCheck} onPostCard={onPostCard} onPostInsuranceCredit={onPostInsuranceCredit} onPostPatientCredit={onPostPatientCredit}
           onWriteOffDOS={onWriteOffDOS} onCreditDOS={onCreditDOS}
@@ -6902,6 +6905,9 @@ function DOSContextMenu({ x, y, onClose, onAction, hasOpenBatch, onCreateTickler
       <button onClick={() => onAction("self")} className={itemCls}><Users size={13} /> Self</button>
       <div className="border-t border-slate-100 my-1" />
       <button onClick={() => onAction("editclaim")} className={itemCls}><Pencil size={13} /> Edit Claim</button>
+      {/* CMS-1500 printing. Added next to Edit Claim rather than replacing it - the existing
+          claim actions all stay exactly as they were. */}
+      <button onClick={() => onAction("hcfa")} className={itemCls}><FileStack size={13} /> HCFA / CMS-1500</button>
       <button onClick={() => onAction("followup")} className={itemCls}><MessageSquarePlus size={13} /> Add Follow-Up</button>
       <button onClick={onCreateTickler} className={itemCls}><Bell size={13} /> Create Tickler</button>
     </div>
@@ -7124,7 +7130,7 @@ function DebitPostingForm({ posting, max, onSubmit }) {
 
 // ---------- Charge action dialogs (opened from the DOS context menu) ----------
 
-function ChargeActionDialog({ dialog, charge, policies, onClose, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit, onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp }) {
+function ChargeActionDialog({ dialog, charge, policies, patient, allCharges, onClose, onPostCheck, onPostCard, onPostInsuranceCredit, onPostPatientCredit, onWriteOffDOS, onCreditDOS, onSelectChargeInsurance, onSetSelfPay, onEditClaimFields, onAddFollowUp }) {
   if (!charge) return null;
   const bal = balanceOf(charge);
 
@@ -7133,6 +7139,23 @@ function ChargeActionDialog({ dialog, charge, policies, onClose, onPostCheck, on
     patient: "Post payment — Patient credit", writeoff: "Write off", creditdos: "Credit date of service",
     selectinsurance: "Select insurance", self: "Change payer to Self / Patient", editclaim: "Edit claim", followup: "Add follow-up",
   };
+
+  // The CMS-1500 is a full sheet at a fixed size, so it brings its own container rather than
+  // being squeezed into the shared Modal. Every other dialog type below is unchanged.
+  if (dialog.type === "hcfa") {
+    // All service lines for this patient on the same date of service - one claim form carries up
+    // to six, which is what a real CMS-1500 holds.
+    const sameDos = (allCharges || [charge]).filter(c => c.patientId === charge.patientId && c.dos === charge.dos);
+    return (
+      <Cms1500Modal
+        charges={sameDos.length ? sameDos : [charge]}
+        patient={patient}
+        policy={(policies || []).find(p => p.id === charge.chargeInsuranceId) || (policies || [])[0]}
+        practice={PRACTICE_INFO}
+        onClose={onClose}
+      />
+    );
+  }
 
   return (
     <Modal title={`${titles[dialog.type]} · ${fmtDate(charge.dos)}`} onClose={onClose} wide={dialog.type === "editclaim"}>
