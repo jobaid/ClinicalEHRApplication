@@ -359,6 +359,23 @@ func main() {
 	mux.HandleFunc("DELETE /api/patients/{id}/records/{recordId}", s.requirePerm(PermMedRecDelete, s.handleMedRecDelete))
 	mux.HandleFunc("GET /api/email/status", s.requireAuth(s.handleEmailStatus))
 
+	// Prescriptions. Signing and sending are separate grants from viewing, and BOTH additionally
+	// require a verified prescriber profile - a permission is not a licence to prescribe.
+	mux.HandleFunc("GET /api/rx/prescriber/me", s.requireAuth(s.handleRxPrescriberMe))
+	mux.HandleFunc("GET /api/rx/pharmacies", s.requirePerm(PermRxView, s.handleRxPharmacySearch))
+	mux.HandleFunc("POST /api/rx/pharmacies", s.requirePerm(PermRxCreate, s.handleRxPharmacyCreate))
+	mux.HandleFunc("GET /api/rx/patients/{id}/pharmacy", s.requirePerm(PermRxView, s.handleRxPreferredPharmacy))
+	mux.HandleFunc("PUT /api/rx/patients/{id}/pharmacy", s.requirePerm(PermRxCreate, s.handleRxPreferredPharmacy))
+
+	mux.HandleFunc("GET /api/rx/patients/{id}/prescriptions", s.requirePerm(PermRxView, s.handleRxList))
+	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions", s.requirePerm(PermRxCreate, s.handleRxCreate))
+	mux.HandleFunc("GET /api/rx/patients/{id}/prescriptions/{rxId}", s.requirePerm(PermRxView, s.handleRxDetail))
+	mux.HandleFunc("PUT /api/rx/patients/{id}/prescriptions/{rxId}", s.requirePerm(PermRxCreate, s.handleRxUpdate))
+	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions/{rxId}/validate", s.requirePerm(PermRxView, s.handleRxValidate))
+	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions/{rxId}/sign", s.requirePerm(PermRxSign, s.handleRxSign))
+	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions/{rxId}/send", s.requirePerm(PermRxSend, s.handleRxSend))
+	mux.HandleFunc("POST /api/rx/patients/{id}/prescriptions/{rxId}/cancel", s.requirePerm(PermRxCancel, s.handleRxCancel))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -385,6 +402,11 @@ func main() {
 	// Uploaded medical records. Additive and idempotent, same as every other schema step here.
 	if err := s.ensureMedicalRecordSchema(context.Background()); err != nil {
 		log.Printf("medical records: %v - uploads will not work until this is resolved", err)
+	}
+
+	// Prescriptions. Additive and idempotent, same as every other schema step.
+	if err := s.ensurePrescriptionSchema(context.Background()); err != nil {
+		log.Printf("prescriptions: %v - the Rx feature will not work until this is resolved", err)
 	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account

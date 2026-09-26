@@ -74,6 +74,20 @@ const (
 	PermMedRecDownload = "MEDICAL_RECORD_DOWNLOAD"
 	PermMedRecEmail    = "MEDICAL_RECORD_EMAIL"
 	PermMedRecDelete   = "MEDICAL_RECORD_DELETE"
+
+	// Prescriptions. Split so that writing a prescription, signing it and transmitting it are
+	// three separate grants - they are three different acts, and only one of them puts a
+	// prescriber's name on a legal instrument.
+	//
+	// None of these makes anyone a lawful prescriber. Section 19: the permission says the
+	// software will let you press the button; prescriber_profiles says whether the person
+	// behind it is someone a pharmacy would accept a prescription from. Both are checked.
+	PermRxView        = "RX_VIEW"
+	PermRxCreate      = "RX_CREATE"
+	PermRxSign        = "RX_SIGN"
+	PermRxSend        = "RX_SEND"
+	PermRxCancel      = "RX_CANCEL"
+	PermRxHistoryView = "RX_HISTORY_VIEW"
 )
 
 // permissionGroup is one block of related grants on the Access Management screen. Grouping is
@@ -136,12 +150,22 @@ var medicalRecordPermissionOrder = []string{
 	PermMedRecDelete,
 }
 
+var rxPermissionOrder = []string{
+	PermRxView,
+	PermRxCreate,
+	PermRxSign,
+	PermRxSend,
+	PermRxCancel,
+	PermRxHistoryView,
+}
+
 var permissionGroups = []permissionGroup{
 	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
 	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
 	{Key: "him", Label: "HIM Coding", Permissions: himPermissionOrder},
 	{Key: "doctor", Label: "Doctor Clinical Workspace", Permissions: doctorPermissionOrder},
 	{Key: "medicalRecords", Label: "Medical Records", Permissions: medicalRecordPermissionOrder},
+	{Key: "rx", Label: "Rx / Prescriptions", Permissions: rxPermissionOrder},
 }
 
 // allUserPermissionOrder is every grant, in a stable order. Built from the groups so adding a
@@ -187,6 +211,11 @@ var highRiskUserPermissions = map[string]bool{
 	// confirmation the grant screen shows for high-risk permissions.
 	PermMedRecDelete: true,
 	PermMedRecEmail:  true,
+
+	// Signing puts a prescriber's name on a prescription and sending puts it in front of a
+	// pharmacy. Both deserve the confirmation the grant screen shows.
+	PermRxSign: true,
+	PermRxSend: true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }
