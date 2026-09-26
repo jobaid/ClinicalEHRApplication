@@ -12,7 +12,7 @@ import { getWorkforceCounts, today } from "./hrService";
 const TILES = [
   { key: "scheduled", label: "Scheduled", tone: "text-slate-700 bg-slate-50" },
   { key: "present", label: "Present", tone: "text-emerald-700 bg-emerald-50" },
-  { key: "pto", label: "PTO", tone: "text-violet-700 bg-violet-50" },
+  { key: "pto", label: "On leave", tone: "text-violet-700 bg-violet-50" },
   { key: "absent", label: "Absent", tone: "text-rose-700 bg-rose-50" },
   { key: "late", label: "Late", tone: "text-amber-700 bg-amber-50" },
 ];

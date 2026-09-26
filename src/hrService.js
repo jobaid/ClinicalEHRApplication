@@ -83,7 +83,9 @@ export const QUICK_FILTERS = [
   { key: "present", label: "Present", countKey: "present" },
   { key: "late", label: "Late", countKey: "late" },
   { key: "absent", label: "Absent", countKey: "absent" },
-  { key: "pto", label: "PTO", countKey: "pto" },
+  // "On leave", not "PTO": the predicate is any approved leave, so sick leave is counted too.
+  // Labelling it PTO would show 3 beside a workforce where only one person is actually on PTO.
+  { key: "pto", label: "On leave", countKey: "pto" },
   { key: "called_off", label: "Called off", countKey: "called_off" },
   { key: "remote", label: "Remote", countKey: "remote" },
   { key: "day_off", label: "Day off", countKey: "day_off" },
@@ -97,7 +99,7 @@ export const TODAY_FILTERS = [
   { key: "present", label: "Present today" },
   { key: "late", label: "Late today" },
   { key: "absent", label: "Absent today" },
-  { key: "pto", label: "PTO today" },
+  { key: "pto", label: "On leave today" },
   { key: "sick", label: "Sick today" },
   { key: "called_off", label: "Called off today" },
   { key: "remote", label: "Remote today" },
