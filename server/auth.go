@@ -195,7 +195,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.recordLoginAudit(r.Context(), u, "Demo sign-in (MFA not required)")
 		s.completeLogin(w, u, "demo account")
 
-	case state.Enabled:
+	case state.Enabled && mfaEnforced():
+		// Enrolled AND the requirement is on.
+		//
+		// The mfaEnforced() half matters: without it, MFA_ENFORCEMENT=none suppressed new
+		// enrolments but still challenged everybody who was already enrolled, which is every
+		// established account - so the switch had no visible effect on a running system and
+		// contradicted what mfaEnforced() documents itself as doing. Enrolments are kept either
+		// way, so setting the variable back to "all" restores the second factor for everyone
+		// without anybody re-scanning a QR code.
+		//
 		// This browser may already have proved the second factor within the last 30 days.
 		if s.trustedDeviceValid(r.Context(), r, u.UID) {
 			s.completeLogin(w, u, "trusted device")
@@ -227,6 +236,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		})
 
 	default:
+		// Password only. Recorded distinctly when the account HAS an enrolment that the operator
+		// switch is overriding, so the login audit never reads as though this account simply had
+		// no second factor configured.
+		if state.Enabled {
+			s.recordLoginAudit(r.Context(), u, "Sign-in without MFA (MFA_ENFORCEMENT=none overrides enrolment)")
+			s.completeLogin(w, u, "password only - enforcement disabled")
+			return
+		}
 		s.completeLogin(w, u, "password only")
 	}
 }
