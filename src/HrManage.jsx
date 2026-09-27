@@ -16,6 +16,7 @@ import {
   saveSchedule, saveAttendance, listLeave, decideLeave, createLeave, saveHrConfig,
   today, prettyDate, statusMeta, TONE_CLASS,
 } from "./hrService";
+import { EmployeeDocuments } from "./ProfileSettings";
 
 const card = "bg-white border border-slate-200 rounded-xl";
 const input = "w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-sm";
@@ -238,6 +239,12 @@ export function EmployeeForm({ userId, options, staff, onClose, onSaved }) {
                 status of Resigned, Terminated or Retired, which keeps their attendance and leave
                 history intact.
               </p>
+
+              {editing && (
+                <div className="mt-5 pt-4 border-t border-slate-200">
+                  <EmployeeDocuments userId={userId} canManage />
+                </div>
+              )}
             </>
           )}
         </div>

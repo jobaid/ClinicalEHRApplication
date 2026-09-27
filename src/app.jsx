@@ -11,6 +11,7 @@ import DoctorWorkspace from "./DoctorWorkspace";
 import Cms1500Modal from "./Cms1500";
 import ClaimWorkspace from "./ClaimWorkspace";
 import HrArea from "./HrArea";
+import ProfileSettings from "./ProfileSettings";
 import HimWorklist from "./HimWorklist";
 import AntimicrobialReview from "./AntimicrobialReview";
 import WorkforceTodayCard from "./WorkforceTodayCard";
@@ -29,7 +30,7 @@ import {
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
   Activity, Pill, ClipboardList, Microscope, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
-  KeyRound, ShieldCheck, Database
+  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -2538,6 +2539,7 @@ function ClinicApp({
 
   const [showSupportPanel, setShowSupportPanel] = useState(false);
   const [showTicklerPanel, setShowTicklerPanel] = useState(false);
+  const [showProfileSettings, setShowProfileSettings] = useState(false);
   const [ticklerPrefill, setTicklerPrefill] = useState(null); // set to open the Tickler panel pre-filled from a charge
 
   const patientById = useMemo(() => Object.fromEntries(patients.map(p => [p.id, p])), [patients]);
@@ -2590,10 +2592,17 @@ function ClinicApp({
     return DEFAULT_ROLE_TABS[session.role] || ["dashboard"];
   }, [rolePermissions, session.role]);
   const isAccountAdmin = session.role === "SUPER_ADMIN";
-  const nav = allNav.filter(item =>
-    allowedTabs.includes(item.id) &&
-    (!item.needsPerm || backupPerms.permissions.includes(item.needsPerm)));
-  const tabAllowed = allowedTabs.includes(tab);
+  // A nav item is available in two ways: the ROLE has the tab (dashboard, schedule, billing, ...
+  // gated by role only), OR the account holds the per-user grant that gates the tab. Individually
+  // granted permissions (Medical Records, HIM, Antimicrobial, HR / Workforce) are enforced again
+  // by the server on every route, so showing the tab is safe when the grant is held even if the
+  // role's tab list would not include it - which is the fix for "assigned permission, module did
+  // not appear after sign-in".
+  const nav = allNav.filter(item => {
+    if (item.needsPerm) return backupPerms.permissions.includes(item.needsPerm);
+    return allowedTabs.includes(item.id);
+  });
+  const tabAllowed = nav.some(item => item.id === tab);
 
   // "users" was a nav tab until User accounts moved into the Settings menu, and the last
   // position is restored from storage on refresh - so an admin who was on that screen would come
@@ -3153,10 +3162,31 @@ function ClinicApp({
     addAudit(null, disabled ? "User account deactivated" : "User account reactivated", "user", uid, null, target ? `${target.name} <${target.email}>` : uid);
   }
 
-  function changeUserRole(uid, role) {
+  async function changeUserRole(uid, role) {
     const target = userAccounts.find(u => u.id === uid);
     updateDocument("users", uid, { role });
     addAudit(null, "User role changed", "user", uid, target?.role || null, role);
+
+    // Same starting grants as addUserAccount: without them, changing an existing account to
+    // Physician / HIM / Human Resource would leave a working sign-in with no way to reach the
+    // module the role is meant to open. The union of existing + defaults is sent so a grant
+    // an administrator already tuned by hand is not undone by a role change.
+    const defaults = ROLE_DEFAULT_GRANTS[role];
+    if (!defaults?.length) return;
+    try {
+      const current = await api(`/api/admin/backup-access`);
+      const row = (current?.users || []).find(u => u.id === uid);
+      const held = Array.isArray(row?.permissions) ? row.permissions : [];
+      const merged = Array.from(new Set([...held, ...defaults]));
+      if (merged.length !== held.length) {
+        await api(`/api/admin/backup-access/${encodeURIComponent(uid)}`, {
+          method: "PUT", body: { permissions: merged },
+        });
+      }
+    } catch (err) {
+      alert(`The role was changed, but the starting permissions for ${ROLE_LABELS[role] || role} ` +
+        `could not be applied: ${err.message}. Grant them from Access Management.`);
+    }
   }
 
   // Setting a password never goes through the collections API - credentials live in columns the
@@ -3373,23 +3403,11 @@ function ClinicApp({
               onOpenInsuranceAdmin={() => setShowInsuranceAdmin(true)}
               canManageInsurance={insurancePerms.any}
             />
-            <div className="flex items-center gap-2 border-l border-slate-800 pl-4">
-              <div className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-white text-xs font-medium">
-                {session.name.split(" ").map(n => n[0]).join("")}
-              </div>
-              <div className="text-xs">
-                <div className="text-white leading-tight">{session.name}</div>
-                <div className="text-slate-500 leading-tight">{ROLE_LABELS[session.role]}</div>
-              </div>
-              {/* So nobody mistakes the shared demonstration account for a colleague's login,
-                  and so a screenshot taken from the demo is self-evidently not real data. */}
-              {session.isDemo && (
-                <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-200 bg-amber-900/60 border border-amber-700 rounded px-1.5 py-0.5">
-                  Demo Account
-                </span>
-              )}
-              <button onClick={onLogout} className="text-xs text-slate-400 hover:text-white ml-2">Log out</button>
-            </div>
+            <UserMenu
+              session={session}
+              onLogout={onLogout}
+              onOpenProfile={() => setShowProfileSettings(true)}
+            />
           </div>
         </div>
         <nav className="flex items-center gap-1 px-3 overflow-x-auto">
@@ -3646,6 +3664,10 @@ function ClinicApp({
         </Modal>
       )}
 
+      {showProfileSettings && (
+        <ProfileSettings onClose={() => setShowProfileSettings(false)} />
+      )}
+
       {showBackup && (
         <Modal title="Backup & Restore" onClose={() => setShowBackup(false)} size="max-w-5xl">
           <BackupRestore
@@ -3805,6 +3827,49 @@ function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
               <button onClick={() => setShowDatePicker(true)} className="w-full border border-slate-200 text-slate-600 text-xs py-1.5 rounded-lg hover:bg-slate-50">Open a different date…</button>
             </>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The header avatar acts as the user's own menu. Clicking the name opens Profile Settings, which
+// is section 7 of the specification: the user's own profile controls belong under their name,
+// not under the administrative gear menu.
+function UserMenu({ session, onLogout, onOpenProfile }) {
+  const [open, setOpen] = useState(false);
+  const initials = (session.name || session.email || "?").split(" ").map((n) => n[0]).slice(0, 2).join("");
+  const itemCls = "w-full text-left px-3 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2 text-slate-700";
+  return (
+    <div className="relative flex items-center gap-2 border-l border-slate-800 pl-4">
+      <button onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-2 hover:opacity-90"
+        aria-haspopup="menu" aria-expanded={open}>
+        <div className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-white text-xs font-medium">
+          {initials}
+        </div>
+        <div className="text-xs text-left">
+          <div className="text-white leading-tight">{session.name}</div>
+          <div className="text-slate-500 leading-tight">{ROLE_LABELS[session.role]}</div>
+        </div>
+      </button>
+      {session.isDemo && (
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-200 bg-amber-900/60 border border-amber-700 rounded px-1.5 py-0.5">
+          Demo Account
+        </span>
+      )}
+      <button onClick={onLogout} className="text-xs text-slate-400 hover:text-white ml-2">Log out</button>
+      {open && (
+        <div onMouseLeave={() => setOpen(false)}
+          className="absolute right-0 top-full mt-2 w-56 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50">
+          <div className="px-3 py-1.5 text-[11px] text-slate-400 truncate">{session.email}</div>
+          <button onClick={() => { onOpenProfile(); setOpen(false); }} className={itemCls}>
+            <UserRoundCog size={13} /> Profile Settings
+          </button>
+          <div className="border-t border-slate-100 my-1" />
+          <button onClick={() => { onLogout(); setOpen(false); }} className={itemCls}>
+            <LogOut size={13} /> Log out
+          </button>
         </div>
       )}
     </div>

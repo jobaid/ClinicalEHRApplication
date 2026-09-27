@@ -414,6 +414,26 @@ func main() {
 	mux.HandleFunc("POST /api/clinical/medications/{id}/change", s.requirePerm(PermDoctorMedicationManage, s.handleMedicationChange))
 	mux.HandleFunc("GET /api/clinical/medications/{id}/history", s.requirePerm(PermDoctorMedicationView, s.handleMedicationHistory))
 
+	// User's own profile settings, skills, and personal certificates. Every route acts on the
+	// signed-in caller only - the server picks the user id from the session, never from the URL,
+	// so a browser that changes the id in the request cannot edit someone else's profile.
+	mux.HandleFunc("GET /api/me/profile", s.requireAuth(s.handleMyProfile))
+	mux.HandleFunc("PATCH /api/me/profile", s.requireAuth(s.handleMyProfilePatch))
+	mux.HandleFunc("PUT /api/me/skills", s.requireAuth(s.handleMySkillsPut))
+	mux.HandleFunc("GET /api/me/certificates", s.requireAuth(s.handleMyCertificatesList))
+	mux.HandleFunc("POST /api/me/certificates", s.requireAuth(s.handleMyCertificateCreate))
+	mux.HandleFunc("PUT /api/me/certificates/{id}", s.requireAuth(s.handleMyCertificateUpdate))
+	mux.HandleFunc("DELETE /api/me/certificates/{id}", s.requireAuth(s.handleMyCertificateDelete))
+	mux.HandleFunc("POST /api/me/certificates/{id}/file", s.requireAuth(s.handleMyCertificateUpload))
+	mux.HandleFunc("GET /api/me/certificates/{id}/file", s.requireAuth(s.handleMyCertificateDownload))
+
+	// HR employee documents. Reading takes HR_EMPLOYEE_VIEW; uploading and archiving take
+	// HR_EMPLOYEE_MANAGE - the same grants that gate the rest of the employee profile.
+	mux.HandleFunc("GET /api/hr/employees/{userId}/documents", s.requirePerm(PermHREmployeeView, s.handleEmployeeDocumentsList))
+	mux.HandleFunc("POST /api/hr/employees/{userId}/documents", s.requirePerm(PermHREmployeeManage, s.handleEmployeeDocumentUpload))
+	mux.HandleFunc("GET /api/hr/employees/{userId}/documents/{docId}/download", s.requirePerm(PermHREmployeeView, s.handleEmployeeDocumentDownload))
+	mux.HandleFunc("DELETE /api/hr/employees/{userId}/documents/{docId}", s.requirePerm(PermHREmployeeManage, s.handleEmployeeDocumentDelete))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -471,6 +491,11 @@ func main() {
 	// HR workforce tables. Additive and idempotent, same as every other schema step.
 	if err := s.ensureHRSchema(context.Background()); err != nil {
 		log.Printf("hr: %v - the Workforce screen will not work until this is resolved", err)
+	}
+
+	// User certificates and employee documents. Additive and idempotent.
+	if err := s.ensureProfileSchema(context.Background()); err != nil {
+		log.Printf("profile: %v - Profile Settings and Employee Documents will not work until this is resolved", err)
 	}
 
 	// Demo account. The schema step is additive and idempotent; the seeder creates the account
