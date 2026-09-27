@@ -604,7 +604,7 @@ export default function DoctorWorkspace({ patientId, perms, onBack }) {
       <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,7fr)_minmax(0,3fr)] gap-4 items-start">
         <div>
           <MedicalRecord patientId={patientId} perms={perms} />
-          <UploadedRecords patientId={patientId} header={header} perms={perms} />
+          <UploadedRecords patient={header} patientId={patientId} header={header} perms={perms} />
         </div>
 
         {canSeeLabs && (

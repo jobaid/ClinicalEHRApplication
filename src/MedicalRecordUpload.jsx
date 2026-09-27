@@ -6,9 +6,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
-  X, Upload, FileText, Printer, Download, Mail, Trash2, ZoomIn, ZoomOut, Maximize2, Search,
+  X, Upload, FileText, Printer, Download, Mail, Trash2, ZoomIn, ZoomOut, Maximize2, Search, Calendar,
 } from "lucide-react";
 import { api, apiUpload, API_BASE, getToken } from "./firebase/apiClient";
+import PrintByDos from "./PrintByDos";
 
 const card = "bg-white border border-slate-200 rounded-xl";
 const input = "w-full border border-slate-200 rounded-lg px-3 py-2 text-sm";
@@ -462,8 +463,10 @@ function EmailModal({ patientId, record, patientName, onClose }) {
 
 // ---------- the section that goes on the Medical Record tab ----------
 
-export default function UploadedRecords({ patientId, header, perms }) {
+export default function UploadedRecords({ patient, patientId, header, perms }) {
   const can = useCallback((p) => perms.includes(p), [perms]);
+  const [printDialog, setPrintDialog] = useState(false);
+  const mayDownload = perms.includes("MEDICAL_RECORD_DOWNLOAD");
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
@@ -505,6 +508,12 @@ export default function UploadedRecords({ patientId, header, perms }) {
               {(data?.recordTypes || []).map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           </>
+        )}
+        {mayDownload && (
+          <button onClick={() => setPrintDialog(true)}
+            className="text-xs border border-slate-200 text-slate-700 rounded-lg px-3 py-1.5 hover:bg-slate-50 flex items-center gap-1">
+            <Calendar size={13} /> Print by DOS
+          </button>
         )}
         {can("MEDICAL_RECORD_UPLOAD") && (
           <button onClick={() => setUploadOpen(true)}
@@ -551,6 +560,9 @@ export default function UploadedRecords({ patientId, header, perms }) {
       {uploadOpen && (
         <UploadRecordModal patientId={patientId} onClose={() => setUploadOpen(false)}
           onUploaded={() => setNonce((n) => n + 1)} />
+      )}
+      {printDialog && (
+        <PrintByDos patient={patient || { id: patientId }} perms={perms} onClose={() => setPrintDialog(false)} />
       )}
       {viewing && (
         <Viewer patientId={patientId} header={header} recordId={viewing} perms={perms}
