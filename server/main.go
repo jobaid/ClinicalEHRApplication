@@ -349,6 +349,10 @@ func main() {
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/trend", s.requirePerm(PermDoctorLabView, s.handleLabTrend))
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/{orderId}", s.requirePerm(PermDoctorLabView, s.handleLabReport))
 
+	// Narrow patient lookup for HIM and Antimicrobial creation forms - returns only id, name,
+	// MRN, DOB and gates on either a role tab or a worklist grant. See patientlookup.go.
+	mux.HandleFunc("GET /api/patients/lookup", s.requireAuth(s.handlePatientLookup))
+
 	// Uploaded medical records. Patient id is part of every query, so editing a record id in the
 	// URL cannot reach a document belonging to someone else.
 	mux.HandleFunc("GET /api/patients/{id}/records", s.requirePerm(PermMedRecView, s.handleMedRecList))

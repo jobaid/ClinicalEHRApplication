@@ -14,12 +14,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Microscope, Search, X, Loader2, AlertCircle, UserCheck, RefreshCw,
-  ChevronLeft, ChevronRight, ShieldAlert, History,
+  ChevronLeft, ChevronRight, ShieldAlert, History, Plus,
 } from "lucide-react";
 import {
   getStatuses, getAmWorklist, getAmSummary, getAmDetail, addAmReview, assignAm,
   statusIndex, labelFor, toneClass, priorityClass, stamp, shortDate, dueLabel, hoursOverdue,
 } from "./clinicalService";
+import { NewAmReview } from "./NewClinicalEntry";
 
 const card = "bg-white border border-slate-200 rounded-xl";
 const input = "w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-sm";
@@ -69,6 +70,7 @@ export default function AntimicrobialReview({ permissions }) {
   const [error, setError] = useState("");
   const [openId, setOpenId] = useState(null);
   const [reload, setReload] = useState(0);
+  const [showNew, setShowNew] = useState(false);
 
   useEffect(() => {
     getStatuses()
@@ -125,10 +127,20 @@ export default function AntimicrobialReview({ permissions }) {
             reviewer concluded; it makes no clinical recommendation of its own.
           </p>
         </div>
-        <button onClick={refresh} className={`${btn} border border-slate-200 text-slate-700 hover:bg-slate-50`}>
-          <RefreshCw size={13} /> Refresh
-        </button>
+        <div className="flex items-center gap-1.5">
+          {may("ANTIMICROBIAL_REVIEW") && (
+            <button onClick={() => setShowNew(true)} className={`${btn} bg-teal-600 text-white hover:bg-teal-700`}>
+              <Plus size={13} /> New review
+            </button>
+          )}
+          <button onClick={refresh} className={`${btn} border border-slate-200 text-slate-700 hover:bg-slate-50`}>
+            <RefreshCw size={13} /> Refresh
+          </button>
+        </div>
       </div>
+      {showNew && (
+        <NewAmReview onClose={() => setShowNew(false)} onCreated={refresh} />
+      )}
 
       <div className="grid grid-cols-3 md:grid-cols-5 gap-2 mb-3">
         {CARDS.map((c) => (

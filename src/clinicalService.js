@@ -24,6 +24,12 @@ export const getStatuses = () => api("/api/clinical/statuses");
 
 // ---------- HIM ----------
 
+export const lookupPatients = (q) => api(`/api/patients/lookup${qs({ q })}`);
+
+export const createHimEncounter = (body) => api(`/api/him/worklist`, { method: "POST", body });
+
+export const createAmReview = (body) => api(`/api/clinical/antimicrobial`, { method: "POST", body });
+
 export const getHimWorklist = (params) => api(`/api/him/worklist${qs(params)}`);
 export const getHimSummary = (params) => api(`/api/him/summary${qs(params)}`);
 export const getHimDetail = (id) => api(`/api/him/worklist/${encodeURIComponent(id)}`);

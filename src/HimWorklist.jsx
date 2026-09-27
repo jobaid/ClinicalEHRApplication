@@ -8,13 +8,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ClipboardList, Search, X, Loader2, AlertCircle, UserCheck, MessageSquarePlus,
-  ChevronLeft, ChevronRight, RefreshCw, Stethoscope,
+  ChevronLeft, ChevronRight, RefreshCw, Stethoscope, Plus,
 } from "lucide-react";
 import {
   getStatuses, getHimWorklist, getHimSummary, getHimDetail, assignHim, setHimStatus,
   createHimQuery, updateHimQuery,
   statusIndex, labelFor, toneClass, priorityClass, stamp, shortDate,
 } from "./clinicalService";
+import { NewHimEncounter } from "./NewClinicalEntry";
 
 const card = "bg-white border border-slate-200 rounded-xl";
 const input = "w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-sm";
@@ -62,6 +63,7 @@ export default function HimWorklist({ permissions }) {
   const [error, setError] = useState("");
   const [openId, setOpenId] = useState(null);
   const [reload, setReload] = useState(0);
+  const [showNew, setShowNew] = useState(false);
 
   useEffect(() => {
     getStatuses()
@@ -124,10 +126,20 @@ export default function HimWorklist({ permissions }) {
             server.
           </p>
         </div>
-        <button onClick={refresh} className={`${btn} border border-slate-200 text-slate-700 hover:bg-slate-50`}>
-          <RefreshCw size={13} /> Refresh
-        </button>
+        <div className="flex items-center gap-1.5">
+          {may("HIM_CODING_EDIT") && (
+            <button onClick={() => setShowNew(true)} className={`${btn} bg-teal-600 text-white hover:bg-teal-700`}>
+              <Plus size={13} /> New encounter
+            </button>
+          )}
+          <button onClick={refresh} className={`${btn} border border-slate-200 text-slate-700 hover:bg-slate-50`}>
+            <RefreshCw size={13} /> Refresh
+          </button>
+        </div>
       </div>
+      {showNew && (
+        <NewHimEncounter onClose={() => setShowNew(false)} onCreated={refresh} />
+      )}
 
       <div className="grid grid-cols-3 md:grid-cols-6 gap-2 mb-3">
         {CARDS.map((c) => (
