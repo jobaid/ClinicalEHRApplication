@@ -200,6 +200,7 @@ func init() {
 		t("route", "route"), t("frequency", "frequency"), t("quantity", "quantity"),
 		t("refills", "refills"), t("startDate", "start_date"), t("endDate", "end_date"),
 		t("status", "status"), t("prescriber", "prescriber"), t("instructions", "instructions"),
+		n("durationDays", "duration_days"),
 	}})
 
 	register(&Collection{Name: "problems", Table: "problems", Fields: []Field{

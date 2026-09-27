@@ -929,6 +929,28 @@ func writeAllowed(collection, role, uid string, tabs tabSet, perms permSet, doc 
 		return false, tabDenial[tab]
 	}
 	switch collection {
+	case "medications":
+		// Section 43, enforced on the server: the form checks it too, but a direct API call must
+		// not be able to store 0, -5 or "abc" as a number of days.
+		if v, present := doc["durationDays"]; present && v != nil {
+			if _, why := validDurationDays(v); why != "" {
+				return false, why
+			}
+		}
+		// The dose of an existing medication is changed through the change endpoint, which keeps
+		// the old value. A plain update here would overwrite it silently (section 46).
+		if existing != nil {
+			if nd, ok := doc["dose"].(string); ok {
+				if od, _ := existing["dose"].(string); nd != od {
+					return false, "change a dose with Change Dose, so the previous dose is kept in the history"
+				}
+			}
+			if v, present := doc["durationDays"]; present {
+				if !sameNumber(v, existing["durationDays"]) {
+					return false, "change the duration with Change Dose, so the previous duration is kept in the history"
+				}
+			}
+		}
 	case "cptCatalog":
 		if !catalogRoles[role] {
 			return false, "only a manager or admin may change the CPT catalog"
@@ -1052,4 +1074,14 @@ func deleteAllowed(collection, role string, tabs tabSet, perms permSet) (bool, s
 		return false, tabDenial[tab]
 	}
 	return true, ""
+}
+
+// sameNumber compares two decoded JSON numbers, treating nil and a missing value alike.
+func sameNumber(a, b any) bool {
+	af, aok := a.(float64)
+	bf, bok := b.(float64)
+	if !aok && !bok {
+		return true
+	}
+	return aok && bok && af == bf
 }

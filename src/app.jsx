@@ -3454,6 +3454,7 @@ function ClinicApp({
 
         {tabAllowed && tab === "clinical" && clinicalPatientId && patientById[clinicalPatientId] && (
           <ClinicalChart
+            permissions={backupPerms.permissions}
             patient={patientById[clinicalPatientId]}
             vitals={vitals.filter(v => v.patientId === clinicalPatientId)}
             allergies={allergies.filter(a => a.patientId === clinicalPatientId)}
@@ -9154,7 +9155,7 @@ const ROLE_DEFAULT_GRANTS = {
   DOCTOR: [
     "DOCTOR_PATIENT_VIEW", "DOCTOR_MEDICAL_RECORD_VIEW", "DOCTOR_CLINICAL_NOTE_CREATE",
     "DOCTOR_CLINICAL_NOTE_EDIT", "DOCTOR_LAB_VIEW", "DOCTOR_DOCUMENT_VIEW",
-    "DOCTOR_MEDICATION_VIEW", "DOCTOR_ANTIMICROBIAL_VIEW",
+    "DOCTOR_MEDICATION_VIEW", "DOCTOR_MEDICATION_MANAGE", "DOCTOR_ANTIMICROBIAL_VIEW",
     "MEDICAL_RECORD_DOCUMENT_VIEW", "MEDICAL_RECORD_DOWNLOAD",
     "RX_VIEW", "RX_CREATE", "RX_HISTORY_VIEW",
     "ANTIMICROBIAL_VIEW",
@@ -11007,7 +11008,7 @@ function ClinicalSearch({ patients, allergiesByPatient, onSelect }) {
 
 // ---------- Clinical: patient chart ----------
 
-function ClinicalChart({ patient, vitals, allergies, medications, problems, notes, onBack, onAddVital, onAddAllergy, onUpdateAllergyStatus, onAddMedication, onUpdateMedicationStatus, onAddProblem, onUpdateProblemStatus, onAddNote, onSignNote, onAmendNote }) {
+function ClinicalChart({ permissions, patient, vitals, allergies, medications, problems, notes, onBack, onAddVital, onAddAllergy, onUpdateAllergyStatus, onAddMedication, onUpdateMedicationStatus, onAddProblem, onUpdateProblemStatus, onAddNote, onSignNote, onAmendNote }) {
   const [tab, setTab] = useState("vitals");
   const activeAllergies = allergies.filter(a => a.status === "Active");
 
@@ -11054,7 +11055,7 @@ function ClinicalChart({ patient, vitals, allergies, medications, problems, note
 
       {tab === "vitals" && <VitalsTab vitals={vitals} onAdd={onAddVital} />}
       {tab === "allergies" && <AllergiesTab allergies={allergies} onAdd={onAddAllergy} onUpdateStatus={onUpdateAllergyStatus} />}
-      {tab === "medications" && <MedicationsTab medications={medications} onAdd={onAddMedication} onUpdateStatus={onUpdateMedicationStatus} />}
+      {tab === "medications" && <MedicationsTab permissions={permissions} medications={medications} onAdd={onAddMedication} onUpdateStatus={onUpdateMedicationStatus} />}
       {tab === "problems" && <ProblemsTab problems={problems} onAdd={onAddProblem} onUpdateStatus={onUpdateProblemStatus} />}
       {tab === "notes" && <NotesTab notes={notes} onAdd={onAddNote} onSign={onSignNote} onAmend={onAmendNote} />}
     </div>
@@ -11210,8 +11211,13 @@ function AllergyForm({ onSubmit }) {
   );
 }
 
-function MedicationsTab({ medications, onAdd, onUpdateStatus }) {
+function MedicationsTab({ permissions, medications, onAdd, onUpdateStatus }) {
   const [showAdd, setShowAdd] = useState(false);
+  const [changing, setChanging] = useState(null);   // the medication whose dose is being changed
+  const [historyOf, setHistoryOf] = useState(null);
+  // Both checked again on the server; this only decides whether to offer the button.
+  const mayChange = (permissions || []).includes("DOCTOR_MEDICATION_MANAGE");
+  const mayViewHistory = (permissions || []).includes("DOCTOR_MEDICATION_VIEW") || mayChange;
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
@@ -11225,6 +11231,7 @@ function MedicationsTab({ medications, onAdd, onUpdateStatus }) {
               <th className="px-4 py-2.5 font-medium">Medication</th>
               <th className="px-4 py-2.5 font-medium">Dose / route</th>
               <th className="px-4 py-2.5 font-medium">Frequency</th>
+              <th className="px-4 py-2.5 font-medium">Duration</th>
               <th className="px-4 py-2.5 font-medium">Prescriber</th>
               <th className="px-4 py-2.5 font-medium">Status</th>
               <th className="px-4 py-2.5 font-medium">Actions</th>
@@ -11236,16 +11243,27 @@ function MedicationsTab({ medications, onAdd, onUpdateStatus }) {
                 <td className="px-4 py-2.5 font-medium text-slate-800">{m.name}<div className="text-xs text-slate-400 font-normal">{m.instructions}</div></td>
                 <td className="px-4 py-2.5 text-slate-600">{m.dose} · {m.route}</td>
                 <td className="px-4 py-2.5 text-slate-600">{m.frequency}</td>
+                <td className="px-4 py-2.5 text-slate-600">
+                  {m.durationDays ? `${m.durationDays} day${m.durationDays === 1 ? "" : "s"}` : <span className="text-slate-300">—</span>}
+                </td>
                 <td className="px-4 py-2.5 text-slate-600">{m.prescriber}</td>
                 <td className="px-4 py-2.5"><StatusPill status={m.status} /></td>
                 <td className="px-4 py-2.5">
-                  {m.status === "Active" && (
-                    <button onClick={() => onUpdateStatus(m.id, "Discontinued")} className="text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2 py-1 hover:bg-rose-100">Discontinue</button>
-                  )}
+                  <div className="flex flex-wrap gap-1">
+                    {m.status === "Active" && mayChange && (
+                      <button onClick={() => setChanging(m)} className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 hover:bg-teal-100">Change dose</button>
+                    )}
+                    {mayViewHistory && (
+                      <button onClick={() => setHistoryOf(m)} className="text-xs text-slate-600 border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50">History</button>
+                    )}
+                    {m.status === "Active" && (
+                      <button onClick={() => onUpdateStatus(m.id, "Discontinued")} className="text-xs text-rose-600 border border-rose-200 bg-rose-50 rounded-lg px-2 py-1 hover:bg-rose-100">Discontinue</button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
-            {medications.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No medications on file.</td></tr>}
+            {medications.length === 0 && <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-400">No medications on file.</td></tr>}
           </tbody>
         </table>
       </Card>
@@ -11254,17 +11272,140 @@ function MedicationsTab({ medications, onAdd, onUpdateStatus }) {
           <MedicationForm onSubmit={(entry) => { onAdd(entry); setShowAdd(false); }} />
         </Modal>
       )}
+      {changing && (
+        <Modal title={`Change dose — ${changing.name}`} onClose={() => setChanging(null)}>
+          <ChangeDoseForm medication={changing} onDone={() => setChanging(null)} />
+        </Modal>
+      )}
+      {historyOf && (
+        <Modal title={`Medication history — ${historyOf.name}`} onClose={() => setHistoryOf(null)}>
+          <MedicationHistory medicationId={historyOf.id} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// Changing a dose or duration after submission (sections 44-47). Goes to its own endpoint, not the
+// collections API, because that endpoint writes the history row and the new value together - a
+// plain update would overwrite the old dose, which section 46 forbids.
+function ChangeDoseForm({ medication, onDone }) {
+  const [form, setForm] = useState({
+    newDose: medication.dose || "",
+    newDurationDays: medication.durationDays ? String(medication.durationDays) : "",
+    effectiveDate: TODAY, reason: "",
+  });
+  const [problems, setProblems] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  async function submit() {
+    setBusy(true); setProblems([]);
+    try {
+      await api(`/api/clinical/medications/${encodeURIComponent(medication.id)}/change`, {
+        method: "POST",
+        body: {
+          newDose: form.newDose.trim(),
+          // Sent as a number only when one was entered; the server decides whether it is valid.
+          newDurationDays: form.newDurationDays.trim() === "" ? null : Number(form.newDurationDays),
+          effectiveDate: form.effectiveDate,
+          reason: form.reason,
+        },
+      });
+      onDone();
+    } catch (err) {
+      setProblems(err.body?.problems || [err.message || "The change was not saved."]);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-3 mb-3 text-sm">
+        <div><span className="block text-xs text-slate-500">Current dose</span><span className="font-medium">{medication.dose || "—"}</span></div>
+        <div><span className="block text-xs text-slate-500">Current duration</span><span className="font-medium">{medication.durationDays ? `${medication.durationDays} days` : "Not recorded"}</span></div>
+        <div><span className="block text-xs text-slate-500">Frequency</span>{medication.frequency || "—"}</div>
+        <div><span className="block text-xs text-slate-500">Route</span>{medication.route || "—"}</div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="New dose"><input className={inputCls} value={form.newDose} onChange={set("newDose")} /></Field>
+        <Field label="Number of days" hint="Leave unchanged to keep the duration">
+          <input type="number" min="1" step="1" className={inputCls} value={form.newDurationDays} onChange={set("newDurationDays")} />
+        </Field>
+        <Field label="Effective date"><input type="date" className={inputCls} value={form.effectiveDate} onChange={set("effectiveDate")} /></Field>
+      </div>
+      <Field label="Reason for the change">
+        <textarea className={`${inputCls} h-16 resize-none`} value={form.reason} onChange={set("reason")}
+          placeholder="Required - recorded permanently in the medication history" />
+      </Field>
+      {problems.length > 0 && (
+        <ul className="text-rose-600 text-xs mb-2 list-disc pl-4">{problems.map((p, i) => <li key={i}>{p}</li>)}</ul>
+      )}
+      <p className="text-xs text-slate-400 mb-3">
+        The previous dose and duration are kept in the medication history with your name, the
+        effective date and the reason. The application does not check whether a dose is
+        appropriate - it has no drug database.
+      </p>
+      <button onClick={submit} disabled={busy} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">
+        {busy ? "Saving..." : "Confirm change"}
+      </button>
+    </div>
+  );
+}
+
+function MedicationHistory({ medicationId }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let alive = true;
+    api(`/api/clinical/medications/${encodeURIComponent(medicationId)}/history`)
+      .then((d) => { if (alive) setData(d); })
+      .catch((e) => { if (alive) setError(e.message || "The history could not be loaded."); });
+    return () => { alive = false; };
+  }, [medicationId]);
+
+  if (error) return <p className="text-rose-600 text-sm">{error}</p>;
+  if (!data) return <p className="text-slate-400 text-sm">Loading...</p>;
+  const days = (n) => (n === undefined || n === null ? "not recorded" : `${n} day${n === 1 ? "" : "s"}`);
+  return (
+    <div className="space-y-3 text-sm">
+      <div className="border border-slate-200 rounded-lg p-3">
+        <div className="text-xs text-slate-400 mb-1">{fmtDate(data.original.startDate)} · ORIGINAL</div>
+        <div>Dose: <span className="font-medium">{data.original.dose || "—"}</span></div>
+        <div>Duration: <span className="font-medium">{days(data.original.durationDays)}</span></div>
+      </div>
+      {data.changes.map((c, i) => (
+        <div key={i} className="border border-amber-200 bg-amber-50/40 rounded-lg p-3">
+          <div className="text-xs text-slate-500 mb-1">
+            {new Date(c.changedAt).toLocaleString()} · {c.changeType.replace(/_/g, " ")} CHANGED
+          </div>
+          {c.oldDose !== c.newDose && <div>Dose: {c.oldDose} → <span className="font-medium">{c.newDose}</span></div>}
+          {c.oldDurationDays !== c.newDurationDays && (
+            <div>Duration: {days(c.oldDurationDays)} → <span className="font-medium">{days(c.newDurationDays)}</span></div>
+          )}
+          <div className="text-xs text-slate-600 mt-1">Effective {fmtDate(c.effectiveDate)} · by {c.changedBy}</div>
+          <div className="text-xs text-slate-600">Reason: {c.reason}</div>
+        </div>
+      ))}
+      {data.changes.length === 0 && <p className="text-xs text-slate-400">No changes since the medication was submitted.</p>}
     </div>
   );
 }
 
 function MedicationForm({ onSubmit }) {
-  const [form, setForm] = useState({ name: "", dose: "", route: "Oral", frequency: "", quantity: "", refills: "0", startDate: TODAY, endDate: "", prescriber: "", instructions: "" });
+  const [form, setForm] = useState({ name: "", dose: "", route: "Oral", frequency: "", durationDays: "", quantity: "", refills: "0", startDate: TODAY, endDate: "", prescriber: "", instructions: "" });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const [error, setError] = useState("");
   function submit() {
     if (!form.name.trim() || !form.dose.trim()) { setError("Medication name and dose are required."); return; }
-    setError(""); onSubmit(form);
+    // Section 43. Optional, but when given it must be a positive whole number. The server enforces
+    // the same rule, so this is for a quick message, not the guarantee.
+    const raw = form.durationDays.trim();
+    if (raw !== "" && !/^[0-9]+$/.test(raw)) { setError("Number of days must be a whole number."); return; }
+    if (raw !== "" && Number(raw) < 1) { setError("Number of days must be at least 1."); return; }
+    setError("");
+    const { durationDays, ...rest } = form;
+    onSubmit(raw === "" ? rest : { ...rest, durationDays: Number(durationDays) });
   }
   return (
     <div>
@@ -11275,6 +11416,7 @@ function MedicationForm({ onSubmit }) {
           <select className={inputCls} value={form.route} onChange={set("route")}><option>Oral</option><option>Topical</option><option>Injection</option><option>Inhaled</option><option>Other</option></select>
         </Field>
         <Field label="Frequency"><input className={inputCls} value={form.frequency} onChange={set("frequency")} placeholder="Once daily" /></Field>
+        <Field label="Number of days"><input type="number" min="1" step="1" className={inputCls} value={form.durationDays} onChange={set("durationDays")} placeholder="e.g. 7" /></Field>
         <Field label="Quantity"><input className={inputCls} value={form.quantity} onChange={set("quantity")} /></Field>
         <Field label="Refills"><input className={inputCls} value={form.refills} onChange={set("refills")} /></Field>
         <Field label="Start date"><input type="date" className={inputCls} value={form.startDate} onChange={set("startDate")} /></Field>

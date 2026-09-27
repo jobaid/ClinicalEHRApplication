@@ -51,15 +51,18 @@ const (
 	// Doctor Clinical Workspace. Split finely on purpose: reading a chart, writing a note and
 	// SIGNING one are three different responsibilities, and a signature is an attestation that
 	// should never be inherited from the ability to type.
-	PermDoctorPatientView       = "DOCTOR_PATIENT_VIEW"
-	PermDoctorRecordView        = "DOCTOR_MEDICAL_RECORD_VIEW"
-	PermDoctorNoteCreate        = "DOCTOR_CLINICAL_NOTE_CREATE"
-	PermDoctorNoteEdit          = "DOCTOR_CLINICAL_NOTE_EDIT"
-	PermDoctorNoteSign          = "DOCTOR_CLINICAL_NOTE_SIGN"
-	PermDoctorLabView           = "DOCTOR_LAB_VIEW"
-	PermDoctorDocumentView      = "DOCTOR_DOCUMENT_VIEW"
-	PermDoctorDiagnosisManage   = "DOCTOR_DIAGNOSIS_MANAGE"
-	PermDoctorMedicationView    = "DOCTOR_MEDICATION_VIEW"
+	PermDoctorPatientView     = "DOCTOR_PATIENT_VIEW"
+	PermDoctorRecordView      = "DOCTOR_MEDICAL_RECORD_VIEW"
+	PermDoctorNoteCreate      = "DOCTOR_CLINICAL_NOTE_CREATE"
+	PermDoctorNoteEdit        = "DOCTOR_CLINICAL_NOTE_EDIT"
+	PermDoctorNoteSign        = "DOCTOR_CLINICAL_NOTE_SIGN"
+	PermDoctorLabView         = "DOCTOR_LAB_VIEW"
+	PermDoctorDocumentView    = "DOCTOR_DOCUMENT_VIEW"
+	PermDoctorDiagnosisManage = "DOCTOR_DIAGNOSIS_MANAGE"
+	PermDoctorMedicationView  = "DOCTOR_MEDICATION_VIEW"
+	// Changing a dose or a duration after a medication was submitted. Separate from viewing, and
+	// high-risk: it is a prescribing decision, recorded permanently with who made it.
+	PermDoctorMedicationManage  = "DOCTOR_MEDICATION_MANAGE"
 	PermDoctorAntimicrobialView = "DOCTOR_ANTIMICROBIAL_VIEW"
 
 	// Uploaded medical records. Each grant maps to something the SERVER can actually refuse.
@@ -172,6 +175,7 @@ var doctorPermissionOrder = []string{
 	PermDoctorDocumentView,
 	PermDoctorDiagnosisManage,
 	PermDoctorMedicationView,
+	PermDoctorMedicationManage,
 	PermDoctorAntimicrobialView,
 }
 
@@ -258,8 +262,9 @@ var highRiskUserPermissions = map[string]bool{
 	// Signing a note is a clinical attestation and, once signed, the record is protected from
 	// silent edit - so granting the ability to sign deserves the same confirmation as granting
 	// the ability to change what gets billed.
-	PermDoctorNoteSign:        true,
-	PermDoctorDiagnosisManage: true,
+	PermDoctorNoteSign:         true,
+	PermDoctorMedicationManage: true,
+	PermDoctorDiagnosisManage:  true,
 
 	// Deleting a filed record and sending one outside the application both deserve the
 	// confirmation the grant screen shows for high-risk permissions.

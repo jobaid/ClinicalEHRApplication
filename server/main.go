@@ -409,6 +409,11 @@ func main() {
 	mux.HandleFunc("POST /api/hr/saved-views", s.requirePerm(PermHRWorkforceView, s.handleHRSavedViewSave))
 	mux.HandleFunc("DELETE /api/hr/saved-views/{id}", s.requirePerm(PermHRWorkforceView, s.handleHRSavedViewDelete))
 
+	// Medication changes. Adding a medication still goes through the collections API; CHANGING
+	// one does not, because a plain update would overwrite the old dose (section 46).
+	mux.HandleFunc("POST /api/clinical/medications/{id}/change", s.requirePerm(PermDoctorMedicationManage, s.handleMedicationChange))
+	mux.HandleFunc("GET /api/clinical/medications/{id}/history", s.requirePerm(PermDoctorMedicationView, s.handleMedicationHistory))
+
 	mux.HandleFunc("POST /api/batch", s.requireAuth(s.handleBatch))
 	mux.HandleFunc("GET /api/stream", s.requireAuth(s.handleStream))
 
@@ -446,6 +451,11 @@ func main() {
 	// every other schema step.
 	if err := s.ensureClaimSchema(context.Background()); err != nil {
 		log.Printf("claims: %v - claim validation and history will not work until this is resolved", err)
+	}
+
+	// Medication duration and change history. Additive and idempotent.
+	if err := s.ensureMedicationSchema(context.Background()); err != nil {
+		log.Printf("medications: %v - dose changes will not work until this is resolved", err)
 	}
 
 	// Roles and the tab grants for HIM and Antimicrobial Review. Additive and idempotent.
