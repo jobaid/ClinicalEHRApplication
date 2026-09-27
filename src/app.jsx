@@ -17,7 +17,7 @@ import AntimicrobialReview from "./AntimicrobialReview";
 import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
-  BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, myBackupPermissions,
+  BACKUP_PERMISSIONS, HIGH_RISK_PERMISSIONS, permissionLabel, permissionHelp, myBackupPermissions,
   listBackups, createBackup, downloadBackup, uploadBackup, restoreBackup, deleteBackup,
   getBackupSettings, saveBackupSettings, listBackupAccess, saveBackupAccess, backupAccessHistory,
   formatBytes, saveBlob,
@@ -4528,16 +4528,21 @@ function BackupSchedule({ can }) {
 
 function BackupAccessManagement({ superAdmin }) {
   const [users, setUsers] = useState(null);
+  const [groups, setGroups] = useState([]);
+  const [allPerms, setAllPerms] = useState([]);
   const [history, setHistory] = useState([]);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(null);   // { user, next: Set }
   const [confirmRisk, setConfirmRisk] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [search, setSearch] = useState("");
 
   const load = useCallback(async () => {
     try {
       const [a, h] = await Promise.all([listBackupAccess(), backupAccessHistory()]);
       setUsers(a.users);
+      setGroups(a.groups || []);
+      setAllPerms(a.permissions || []);
       setHistory(h);
       setError("");
     } catch (e) {
@@ -4546,12 +4551,10 @@ function BackupAccessManagement({ superAdmin }) {
     }
   }, []);
 
-  // Guarded the same way the other panels load, so a modal closed mid-flight cannot write into
-  // an unmounted component. load() above is for refreshing after a save.
   useEffect(() => {
     let live = true;
     Promise.all([listBackupAccess(), backupAccessHistory()])
-      .then(([a, h]) => { if (live) { setUsers(a.users); setHistory(h); } })
+      .then(([a, h]) => { if (live) { setUsers(a.users); setGroups(a.groups || []); setAllPerms(a.permissions || []); setHistory(h); } })
       .catch((e) => { if (live) { setError(e?.message || "Could not load backup access."); setUsers([]); } });
     return () => { live = false; };
   }, []);
@@ -4590,7 +4593,9 @@ function BackupAccessManagement({ superAdmin }) {
   function attemptSave() {
     const before = new Set(editing.user.permissions);
     const newlyHighRisk = [...editing.next].filter((p) => !before.has(p) && HIGH_RISK_PERMISSIONS.has(p));
-    const permissions = BACKUP_PERMISSIONS.map((p) => p.key).filter((k) => editing.next.has(k));
+    // Send permissions in the server's stable order so the saved list and any audit diff read as
+    // a real change.
+    const permissions = allPerms.filter((k) => editing.next.has(k));
     if (newlyHighRisk.length) setConfirmRisk({ permissions, newlyHighRisk });
     else commit(permissions);
   }
@@ -4599,49 +4604,78 @@ function BackupAccessManagement({ superAdmin }) {
     <div className="space-y-4">
       {error && <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{error}</div>}
 
+      <div className="flex items-center gap-2 mb-2">
+        <input
+          className={`${inputCls} max-w-xs`}
+          placeholder="Filter by name, email or role"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <p className="text-xs text-slate-400">
+          {groups.length} permission group{groups.length === 1 ? "" : "s"} · {allPerms.length} total grants
+        </p>
+      </div>
+
       <Card className="p-0 overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-xs text-slate-500">
             <tr>
               <th className="text-left px-3 py-2 font-medium">User</th>
               <th className="text-left px-3 py-2 font-medium">Role</th>
-              {BACKUP_PERMISSIONS.map((p) => (
-                <th key={p.key} className="px-2 py-2 font-medium text-center" title={p.help}>
-                  {p.label.replace("Backup", "").replace("History", "").trim() || "View"}
+              {groups.map((g) => (
+                <th key={g.key} className="px-2 py-2 font-medium text-center" title={g.label}>
+                  {g.label}
                 </th>
               ))}
               <th className="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
-            {users.map((u) => (
-              <tr key={u.id} className="border-t border-slate-100">
-                <td className="px-3 py-2">
-                  <div className="text-slate-800">{u.name || u.email}</div>
-                  <div className="text-xs text-slate-400">{u.email}{u.disabled ? " · disabled" : ""}</div>
-                </td>
-                <td className="px-3 py-2 text-xs text-slate-500">{u.role}</td>
-                {BACKUP_PERMISSIONS.map((p) => (
-                  <td key={p.key} className="px-2 py-2 text-center">
-                    {u.permissions.includes(p.key)
-                      ? <CheckCircle2 size={14} className={u.locked ? "text-slate-400 inline" : "text-emerald-600 inline"} />
-                      : <span className="text-slate-300">·</span>}
+            {users
+              .filter((u) => {
+                if (!search.trim()) return true;
+                const q = search.toLowerCase();
+                return (u.name || "").toLowerCase().includes(q)
+                  || (u.email || "").toLowerCase().includes(q)
+                  || (u.role || "").toLowerCase().includes(q);
+              })
+              .map((u) => (
+                <tr key={u.id} className="border-t border-slate-100">
+                  <td className="px-3 py-2">
+                    <div className="text-slate-800">{u.name || u.email}</div>
+                    <div className="text-xs text-slate-400">{u.email}{u.disabled ? " · disabled" : ""}</div>
                   </td>
-                ))}
-                <td className="px-3 py-2 text-right">
-                  {u.locked ? (
-                    <span className="text-[11px] text-slate-400" title="A Super Admin always holds full backup access">Always full</span>
-                  ) : (
-                    <button
-                      onClick={() => openEditor(u)}
-                      className="text-xs border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50"
-                    >
-                      Manage
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
+                  <td className="px-3 py-2 text-xs text-slate-500">{u.role}</td>
+                  {groups.map((g) => {
+                    const held = g.permissions.filter((k) => u.permissions.includes(k)).length;
+                    return (
+                      <td key={g.key} className="px-2 py-2 text-center text-xs">
+                        {u.locked ? (
+                          <span className="text-slate-500">all</span>
+                        ) : held === 0 ? (
+                          <span className="text-slate-300">·</span>
+                        ) : (
+                          <span className={held === g.permissions.length ? "text-emerald-700 font-medium" : "text-slate-700"}>
+                            {held}/{g.permissions.length}
+                          </span>
+                        )}
+                      </td>
+                    );
+                  })}
+                  <td className="px-3 py-2 text-right">
+                    {u.locked ? (
+                      <span className="text-[11px] text-slate-400" title="A Super Admin always holds every grant">Always full</span>
+                    ) : (
+                      <button
+                        onClick={() => openEditor(u)}
+                        className="text-xs border border-slate-200 rounded-lg px-2 py-1 hover:bg-slate-50"
+                      >
+                        Manage
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
           </tbody>
         </table>
       </Card>
@@ -4666,39 +4700,66 @@ function BackupAccessManagement({ superAdmin }) {
       </Card>
 
       {editing && (
-        <Modal title={`Manage backup access — ${editing.user.name || editing.user.email}`} onClose={() => setEditing(null)}>
-          <div className="space-y-2 mb-4">
-            {BACKUP_PERMISSIONS.map((p) => {
-              const blocked = p.key === "BACKUP_ACCESS_MANAGEMENT" && !superAdmin;
+        <Modal title={`Manage access — ${editing.user.name || editing.user.email}`} onClose={() => setEditing(null)} size="max-w-3xl">
+          <p className="text-xs text-slate-500 mb-3">
+            Grants are enforced server-side. Ticking a box hands the account the ability to call
+            those endpoints; unticking one refuses them at the next request.
+          </p>
+          <div className="space-y-4 mb-4">
+            {groups.map((g) => {
+              const allInGroup = g.permissions.every((k) => editing.next.has(k));
               return (
-                <label key={p.key} className={`flex items-start gap-2 text-sm ${blocked ? "opacity-50" : ""}`}>
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={editing.next.has(p.key)}
-                    disabled={blocked}
-                    onChange={() => toggle(p.key)}
-                  />
-                  <span>
-                    <span className="text-slate-800">{p.label}</span>
-                    {HIGH_RISK_PERMISSIONS.has(p.key) && (
-                      <span className="ml-1.5 text-[10px] uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 py-0.5">High risk</span>
-                    )}
-                    <span className="block text-xs text-slate-400">{p.help}</span>
-                    {blocked && <span className="block text-xs text-slate-400">Only a Super Admin can change this.</span>}
-                  </span>
-                </label>
+                <div key={g.key} className="border border-slate-200 rounded-lg">
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-slate-100 bg-slate-50 rounded-t-lg">
+                    <h4 className="text-sm font-semibold text-slate-800">{g.label}</h4>
+                    <button
+                      type="button"
+                      onClick={() => setEditing((e) => {
+                        const next = new Set(e.next);
+                        g.permissions.forEach((k) => allInGroup ? next.delete(k) : next.add(k));
+                        return { ...e, next };
+                      })}
+                      className="text-[11px] text-slate-500 hover:text-slate-700 underline"
+                    >
+                      {allInGroup ? "Uncheck all" : "Select all"}
+                    </button>
+                  </div>
+                  <div className="p-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {g.permissions.map((k) => {
+                      const blocked = k === "BACKUP_ACCESS_MANAGEMENT" && !superAdmin;
+                      return (
+                        <label key={k} className={`flex items-start gap-2 text-sm ${blocked ? "opacity-50" : ""}`}>
+                          <input
+                            type="checkbox"
+                            className="mt-0.5"
+                            checked={editing.next.has(k)}
+                            disabled={blocked}
+                            onChange={() => toggle(k)}
+                          />
+                          <span className="min-w-0">
+                            <span className="text-slate-800">{permissionLabel(k)}</span>
+                            {HIGH_RISK_PERMISSIONS.has(k) && (
+                              <span className="ml-1.5 text-[10px] uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 py-0.5">High risk</span>
+                            )}
+                            <span className="block text-[11px] text-slate-400">{permissionHelp(k) || k}</span>
+                            {blocked && <span className="block text-[11px] text-slate-400">Only a Super Admin can change this.</span>}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
               );
             })}
           </div>
-          <div className="flex justify-end gap-2">
+          <div className="flex justify-end gap-2 sticky bottom-0 bg-white pt-2 border-t border-slate-100">
             <button onClick={() => setEditing(null)} className="text-sm px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg">Cancel</button>
             <button
               onClick={attemptSave}
               disabled={busy}
               className="text-sm px-3 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50"
             >
-              {busy ? "Saving…" : "Save Permissions"}
+              {busy ? "Saving…" : "Save permissions"}
             </button>
           </div>
         </Modal>
