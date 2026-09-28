@@ -16,12 +16,13 @@ const plain = `${btn} border border-slate-200 text-slate-700 hover:bg-slate-50`;
 const danger = `${btn} border border-rose-200 text-rose-600 hover:bg-rose-50`;
 
 const TABS = [
+  { key: "users", label: "Users" },
   { key: "rules", label: "IP rules" },
   { key: "events", label: "Access events" },
 ];
 
 export default function IpDeviceAccess() {
-  const [tab, setTab] = useState("rules");
+  const [tab, setTab] = useState("users");
   return (
     <div>
       <div className="mb-3">
@@ -42,8 +43,102 @@ export default function IpDeviceAccess() {
           </button>
         ))}
       </div>
+      {tab === "users" && <UsersTab />}
       {tab === "rules" && <IpRulesTab />}
       {tab === "events" && <AccessEventsTab />}
+    </div>
+  );
+}
+
+function UsersTab() {
+  const [users, setUsers] = useState(null);
+  const [error, setError] = useState("");
+  const [reloadKey, setReloadKey] = useState(0);
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    api("/api/admin/ip-access/users")
+      .then((r) => { if (alive) { setUsers(r.users || []); setError(""); } })
+      .catch((e) => { if (alive) { setError(e.message); setUsers([]); } });
+    return () => { alive = false; };
+  }, [reloadKey]);
+
+  const filtered = (users || []).filter((u) => {
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (u.email || "").toLowerCase().includes(q)
+      || (u.name || "").toLowerCase().includes(q)
+      || (u.role || "").toLowerCase().includes(q)
+      || (u.lastIP || "").toLowerCase().includes(q);
+  });
+
+  return (
+    <div>
+      {error && <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3 text-xs text-rose-800">{error}</div>}
+      <p className="text-[11px] text-slate-500 mb-2">
+        Most recent sign-in per user. A user with no login row has not signed in since IP tracking
+        was deployed - their history begins on their next login.
+      </p>
+      <div className="flex items-center gap-2 mb-2">
+        <input className={`${input} max-w-xs`} placeholder="Filter by name, email, role or IP"
+          value={search} onChange={(e) => setSearch(e.target.value)} />
+        <button onClick={() => setReloadKey((n) => n + 1)} className={plain}>
+          <RefreshCw size={12} /> Refresh
+        </button>
+      </div>
+      {!users && <p className="text-xs text-slate-400"><Loader2 size={12} className="inline animate-spin mr-1" />Loading…</p>}
+      {users && (
+        <div className="bg-white border border-slate-200 rounded-xl overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">User</th>
+                <th className="text-left px-3 py-2 font-medium">Role</th>
+                <th className="text-left px-3 py-2 font-medium">Last IP</th>
+                <th className="text-left px-3 py-2 font-medium">VPN</th>
+                <th className="text-left px-3 py-2 font-medium">Last login</th>
+                <th className="text-left px-3 py-2 font-medium">Browser</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 && (
+                <tr><td colSpan={6} className="text-center text-slate-400 py-6">No users match.</td></tr>
+              )}
+              {filtered.map((u) => (
+                <tr key={u.userId} className="border-t border-slate-100">
+                  <td className="px-3 py-1.5">
+                    <div className="text-slate-800">{u.name || u.email}</div>
+                    <div className="text-[11px] text-slate-400">{u.email}{u.disabled ? " · disabled" : ""}</div>
+                  </td>
+                  <td className="px-3 py-1.5 text-slate-500">{u.role}</td>
+                  <td className="px-3 py-1.5 font-mono text-[11px] text-slate-800">
+                    {u.lastIP || <span className="text-slate-300">—</span>}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    {u.vpnStatus && u.vpnStatus !== "unchecked" ? (
+                      <span className={`text-[10px] uppercase border rounded px-1.5 py-0.5 ${
+                        ["vpn", "proxy", "tor", "datacenter"].includes(u.vpnStatus)
+                          ? "bg-amber-50 text-amber-800 border-amber-200"
+                          : "bg-emerald-50 text-emerald-700 border-emerald-200"}`}>
+                        {u.vpnStatus}
+                      </span>
+                    ) : (
+                      <span className="text-slate-300 text-[11px]">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 text-slate-500">
+                    {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : <span className="text-slate-300">never</span>}
+                  </td>
+                  <td className="px-3 py-1.5 text-[11px] text-slate-500 max-w-[24rem] truncate" title={u.userAgent}>
+                    {u.userAgent || <span className="text-slate-300">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

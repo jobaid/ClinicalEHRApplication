@@ -235,7 +235,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// enrolment still signs in without one, rather than stranding a published account behind
 		// an authenticator nobody has.
 		s.recordLoginAudit(r.Context(), u, "Demo sign-in (MFA not required)")
-		s.completeLogin(w, u, "demo account", body.Remember)
+		s.completeLogin(w, r, u, "demo account", body.Remember)
 
 	case state.Enabled && mfaEnforced():
 		// Enrolled AND the requirement is on.
@@ -249,7 +249,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		//
 		// This browser may already have proved the second factor within the last 30 days.
 		if s.trustedDeviceValid(r.Context(), r, u.UID) {
-			s.completeLogin(w, u, "trusted device", body.Remember)
+			s.completeLogin(w, r, u, "trusted device", body.Remember)
 			return
 		}
 		challenge, err := s.issueChallengeToken(u, body.Remember)
@@ -283,21 +283,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// no second factor configured.
 		if state.Enabled {
 			s.recordLoginAudit(r.Context(), u, "Sign-in without MFA (MFA_ENFORCEMENT=none overrides enrolment)")
-			s.completeLogin(w, u, "password only - enforcement disabled", body.Remember)
+			s.completeLogin(w, r, u, "password only - enforcement disabled", body.Remember)
 			return
 		}
-		s.completeLogin(w, u, "password only", body.Remember)
+		s.completeLogin(w, r, u, "password only", body.Remember)
 	}
 }
 
 // completeLogin issues the real session token. Every successful sign-in ends here, whatever route
 // it took, so there is exactly one place a session can be minted.
-func (s *Server) completeLogin(w http.ResponseWriter, u authedUser, _ string, remember bool) {
+func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, u authedUser, via string, remember bool) {
 	token, err := s.issueToken(u, remember)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not issue session")
 		return
 	}
+	// One access_events row per successful login. This is what the IP & Device Access screen
+	// reads to show which IP each user signed in from. Best-effort; failure never blocks a login.
+	ip := clientIP(r)
+	vpn := s.vpnLookup(r.Context(), ip)
+	s.recordAccessEvent(r.Context(), u, ip, r.UserAgent(), "/api/auth/login",
+		"login", "allow", vpn.Status, vpn.Source, via)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token": token,
 		// isDemo is reported so the interface can label the session visibly. It is a display
@@ -368,7 +374,7 @@ func (s *Server) handleMFAVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordLoginAudit(r.Context(), u, "MFA verified")
 	// Remember Me came from the signed challenge token, not from this request's body.
-	s.completeLogin(w, u, "mfa", challengeClaims.Remember)
+	s.completeLogin(w, r, u, "mfa", challengeClaims.Remember)
 }
 
 // handleMFAEnrollStart returns a fresh secret and the otpauth:// URI for the QR code.

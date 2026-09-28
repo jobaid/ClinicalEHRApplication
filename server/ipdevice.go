@@ -572,6 +572,49 @@ func (s *Server) handleIPCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /api/admin/ip-access/users - one row per user with their most recent login event.
+//
+// Grouped in SQL rather than in Go so the response is small and the whole users table stays out
+// of the API. A user who has never signed in since the feature was deployed simply does not
+// appear here; their history begins when they next log in.
+func (s *Server) handleAccessUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+		SELECT DISTINCT ON (u.id)
+		       u.id, u.email, u.name, u.role, u.disabled,
+		       COALESCE(e.ip, ''),
+		       COALESCE(e.ua_short, ''),
+		       COALESCE(e.vpn_status, ''),
+		       COALESCE(e.vpn_source, ''),
+		       e.at
+		  FROM users u
+		  LEFT JOIN access_events e ON e.user_id = u.id AND e.action = 'login'
+		 ORDER BY u.id, e.at DESC NULLS LAST`)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read the user summary")
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var uid, email, name, role, ip, ua, vpn, vpnSrc string
+		var disabled bool
+		var at *time.Time
+		if err := rows.Scan(&uid, &email, &name, &role, &disabled, &ip, &ua, &vpn, &vpnSrc, &at); err != nil {
+			continue
+		}
+		lastAt := ""
+		if at != nil {
+			lastAt = at.UTC().Format(time.RFC3339)
+		}
+		out = append(out, map[string]any{
+			"userId": uid, "email": email, "name": name, "role": role, "disabled": disabled,
+			"lastIP": ip, "userAgent": ua, "vpnStatus": vpn, "vpnSource": vpnSrc,
+			"lastLoginAt": lastAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": out})
+}
+
 func validCIDROrIP(s string) bool {
 	if s == "" {
 		return false

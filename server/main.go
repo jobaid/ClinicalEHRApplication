@@ -441,6 +441,7 @@ func main() {
 	mux.HandleFunc("POST /api/admin/ip-access/rules", s.requirePerm(PermIPAccessManage, s.handleIPRuleCreate))
 	mux.HandleFunc("DELETE /api/admin/ip-access/rules/{id}", s.requirePerm(PermIPAccessManage, s.handleIPRuleRevoke))
 	mux.HandleFunc("GET /api/admin/ip-access/events", s.requirePerm(PermIPAccessManage, s.handleAccessEventList))
+	mux.HandleFunc("GET /api/admin/ip-access/users", s.requirePerm(PermIPAccessManage, s.handleAccessUsers))
 	mux.HandleFunc("POST /api/admin/ip-access/check", s.requirePerm(PermIPAccessManage, s.handleIPCheck))
 
 	// HR employee documents. Reading takes HR_EMPLOYEE_VIEW; uploading and archiving take
