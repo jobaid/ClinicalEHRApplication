@@ -186,11 +186,14 @@ func cidrContains(cidr string, ip net.IP) bool {
 	return n.Contains(ip)
 }
 
-// ipAccessEnforce returns true when the middleware should refuse a blocked IP. Kept OFF unless
-// the operator sets IP_ACCESS_ENFORCE=true; a fresh deployment must not risk locking out its own
-// administrator just because a rule was tested.
+// ipAccessEnforce returns true when the middleware should refuse a blocked IP.
+//
+// Enforcement is ON by default and only turned off when IP_ACCESS_ENFORCE is explicitly set to
+// "false". That matches the natural expectation - "I added a block rule, so it should block" -
+// and the lockout risk stays covered by the SUPER_ADMIN bypass, which never blocks the account
+// that can create and revoke rules.
 func ipAccessEnforce() bool {
-	return strings.EqualFold(os.Getenv("IP_ACCESS_ENFORCE"), "true")
+	return !strings.EqualFold(os.Getenv("IP_ACCESS_ENFORCE"), "false")
 }
 
 // vpnPolicyMode returns "monitor" or "block". "monitor" is the safe default and never denies.
