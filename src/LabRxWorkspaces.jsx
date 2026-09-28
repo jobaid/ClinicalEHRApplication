@@ -9,8 +9,8 @@
 // engine of its own.
 
 import { useEffect, useState } from "react";
-import { FlaskConical, Pill, Search, Plus, X, Loader2, RefreshCw, Save, ExternalLink, ChevronDown, ChevronRight } from "lucide-react";
-import { api } from "./firebase/apiClient";
+import { FlaskConical, Pill, Search, Plus, X, Loader2, RefreshCw, Save, ChevronDown, ChevronRight, Upload, Sparkles, Trash2 } from "lucide-react";
+import { api, API_BASE, getToken } from "./firebase/apiClient";
 import { PatientPicker } from "./NewClinicalEntry";
 
 const card = "bg-white border border-slate-200 rounded-xl";
@@ -44,7 +44,9 @@ export function LabWorkspace({ permissions }) {
   const [reloadKey, setReloadKey] = useState(0);
   const [search, setSearch] = useState("");
   const [openId, setOpenId] = useState(null);
+  const [showUpload, setShowUpload] = useState(false);
   const may = (p) => (permissions || []).includes(p);
+  const mayManage = may("DOCTOR_LAB_MANAGE");
 
   useEffect(() => {
     if (!patient) return undefined;
@@ -85,11 +87,23 @@ export function LabWorkspace({ permissions }) {
         <h1 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
           <FlaskConical size={19} /> Laboratory
         </h1>
-        <button onClick={() => setReloadKey((n) => n + 1)} className={plain}>
-          <RefreshCw size={13} /> Refresh
-        </button>
+        <div className="flex items-center gap-1.5">
+          {mayManage && (
+            <button onClick={() => setShowUpload(true)} className={primary}>
+              <Upload size={13} /> Upload lab report
+            </button>
+          )}
+          <button onClick={() => setReloadKey((n) => n + 1)} className={plain}>
+            <RefreshCw size={13} /> Refresh
+          </button>
+        </div>
       </div>
       <PatientHeader patient={patient} onClear={() => { setPatient(null); setData(null); }} />
+
+      {showUpload && (
+        <LabUploadDialog patient={patient} onClose={() => setShowUpload(false)}
+          onSaved={() => { setShowUpload(false); setReloadKey((n) => n + 1); }} />
+      )}
 
       <div className={`${card} p-3 mb-3`}>
         <div className="relative">
@@ -247,6 +261,241 @@ export function RxWorkspace({ permissions }) {
         <NewRxDialog patient={patient} onClose={() => setShowNew(false)}
           onCreated={() => { setShowNew(false); setReloadKey((n) => n + 1); }} />
       )}
+    </div>
+  );
+}
+
+// ---------- Lab upload + extract + review ----------
+//
+// Two round trips. First the PDF is sent to /labs/extract which forwards its text to the
+// language model and returns a structured proposal. The user reviews and edits the rows and only
+// then sends them to /labs, which writes the lab_orders + lab_results rows and stores the PDF.
+// Nothing lands in the database until the user confirms.
+
+const LAB_STATUSES = ["", "final", "preliminary", "corrected", "cancelled"];
+const LAB_FLAGS = ["", "H", "L", "A", "AA", "CRIT"];
+
+const BLANK_RESULT = {
+  testName: "", valueText: "", valueNum: null, unit: "",
+  referenceLow: null, referenceHigh: null, referenceText: "", flag: "",
+};
+
+function LabUploadDialog({ patient, onClose, onSaved }) {
+  const [file, setFile] = useState(null);
+  const [phase, setPhase] = useState("pick");   // pick | extracting | review
+  const [error, setError] = useState("");
+  const [extracted, setExtracted] = useState(null); // { order, results, pdfBase64, pdfName }
+
+  async function extract() {
+    if (!file) { setError("Choose a PDF first."); return; }
+    setError(""); setPhase("extracting");
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      const res = await fetch(
+        `${API_BASE}/api/doctor/patients/${encodeURIComponent(patient.id)}/labs/extract`,
+        { method: "POST", headers: { Authorization: `Bearer ${getToken() || ""}` }, body: fd });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error(b.error || `Extraction failed (${res.status})`);
+      }
+      const data = await res.json();
+      setExtracted({
+        order: data.order || {},
+        results: Array.isArray(data.results) ? data.results : [],
+        pdfBase64: data.pdfBase64 || "",
+        pdfName: data.pdfName || file.name,
+      });
+      setPhase("review");
+    } catch (e) {
+      setError(e.message || "The report could not be extracted.");
+      setPhase("pick");
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/50 z-50 flex items-start justify-center p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-5xl my-4">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200">
+          <h3 className="font-semibold text-slate-800">
+            Upload lab report — {patient?.name}
+          </h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+
+        {phase === "pick" && (
+          <div className="p-5">
+            {error && <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3 text-xs text-rose-800">{error}</div>}
+            <p className="text-xs text-slate-500 mb-3">
+              The PDF is sent to the language model, which reads the text and proposes rows for a
+              lab order plus its analytes. You review and edit the proposal before it is saved.
+              Nothing about the value's normality is derived by this application - flags are shown
+              exactly as the model finds them printed on the report.
+            </p>
+            <label className="block mb-3">
+              <span className={lbl}>Lab report PDF (max 20 MB)</span>
+              <input type="file" accept="application/pdf"
+                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                className="text-xs block w-full" />
+            </label>
+            {file && (
+              <p className="text-[11px] text-slate-500 mb-3">
+                {file.name} · {(file.size / 1024).toFixed(0)} KB
+              </p>
+            )}
+            <p className="text-[11px] text-slate-400">
+              Scanned images without OCR have no text layer and cannot be extracted. Re-scan with
+              OCR enabled or enter the values by hand for those.
+            </p>
+            <div className="flex justify-end gap-2 mt-4">
+              <button onClick={onClose} className={plain}>Cancel</button>
+              <button onClick={extract} disabled={!file} className={primary}>
+                <Sparkles size={13} /> Extract with AI
+              </button>
+            </div>
+          </div>
+        )}
+
+        {phase === "extracting" && (
+          <div className="p-8 text-center">
+            <Loader2 size={20} className="animate-spin inline text-teal-600" />
+            <p className="text-sm text-slate-600 mt-3">Reading the PDF and asking the model to extract…</p>
+            <p className="text-[11px] text-slate-400 mt-1">This can take up to a minute for a large report.</p>
+          </div>
+        )}
+
+        {phase === "review" && extracted && (
+          <LabReviewForm
+            patientId={patient.id}
+            initial={extracted}
+            onCancel={() => onClose()}
+            onSaved={onSaved}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LabReviewForm({ patientId, initial, onCancel, onSaved }) {
+  const [order, setOrder] = useState(() => ({
+    panelName: "", category: "", orderingProvider: "", labName: "", accession: "",
+    orderedAt: "", collectedAt: "", resultedAt: "", status: "", comments: "",
+    ...(initial.order || {}),
+  }));
+  const [results, setResults] = useState(() => (initial.results?.length ? initial.results : [BLANK_RESULT]));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const setOrderField = (k) => (e) => setOrder((o) => ({ ...o, [k]: e.target.value }));
+  const setRow = (i, k) => (e) => setResults((rs) => {
+    const next = rs.slice();
+    const v = e.target.value;
+    // Numeric fields are strings in the input; store null when empty.
+    const numeric = k === "valueNum" || k === "referenceLow" || k === "referenceHigh";
+    next[i] = { ...next[i], [k]: numeric ? (v === "" ? null : Number(v)) : v };
+    return next;
+  });
+  const addRow = () => setResults((rs) => [...rs, { ...BLANK_RESULT }]);
+  const removeRow = (i) => setResults((rs) => rs.filter((_, idx) => idx !== i));
+
+  async function save() {
+    setSaving(true); setError("");
+    try {
+      const body = {
+        order,
+        results: results.filter((r) => (r.testName || "").trim() !== ""),
+        pdfBase64: initial.pdfBase64,
+        pdfName: initial.pdfName,
+      };
+      await api(`/api/doctor/patients/${encodeURIComponent(patientId)}/labs`, {
+        method: "POST", body,
+      });
+      onSaved();
+    } catch (e) {
+      setError(e.message || "The lab report could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="p-5">
+      {error && <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3 text-xs text-rose-800">{error}</div>}
+      <p className="text-[11px] text-slate-500 mb-3">
+        Review the extracted rows below. Values, ranges and flags come from the PDF via the model -
+        correct anything wrong before saving. Reference ranges and flags are stored as shown; the
+        application does not compute them.
+      </p>
+
+      <h4 className="text-xs uppercase tracking-wide text-slate-400 mb-2">Order</h4>
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        <label className="block"><span className={lbl}>Panel</span><input className={input} value={order.panelName} onChange={setOrderField("panelName")} /></label>
+        <label className="block"><span className={lbl}>Category</span><input className={input} value={order.category} onChange={setOrderField("category")} /></label>
+        <label className="block"><span className={lbl}>Status</span>
+          <select className={input} value={order.status} onChange={setOrderField("status")}>
+            {LAB_STATUSES.map((s) => <option key={s || "empty"} value={s}>{s || "—"}</option>)}
+          </select>
+        </label>
+        <label className="block"><span className={lbl}>Ordering provider</span><input className={input} value={order.orderingProvider} onChange={setOrderField("orderingProvider")} /></label>
+        <label className="block"><span className={lbl}>Lab</span><input className={input} value={order.labName} onChange={setOrderField("labName")} /></label>
+        <label className="block"><span className={lbl}>Accession</span><input className={input} value={order.accession} onChange={setOrderField("accession")} /></label>
+        <label className="block"><span className={lbl}>Ordered</span><input type="date" className={input} value={order.orderedAt} onChange={setOrderField("orderedAt")} /></label>
+        <label className="block"><span className={lbl}>Collected</span><input type="date" className={input} value={order.collectedAt} onChange={setOrderField("collectedAt")} /></label>
+        <label className="block"><span className={lbl}>Resulted</span><input type="date" className={input} value={order.resultedAt} onChange={setOrderField("resultedAt")} /></label>
+        <label className="block col-span-3"><span className={lbl}>Comments</span><textarea className={`${input} h-16 resize-none`} value={order.comments} onChange={setOrderField("comments")} /></label>
+      </div>
+
+      <div className="flex items-center justify-between mb-2">
+        <h4 className="text-xs uppercase tracking-wide text-slate-400">Results ({results.length})</h4>
+        <button onClick={addRow} className={plain}><Plus size={12} /> Add row</button>
+      </div>
+      <div className="overflow-x-auto border border-slate-200 rounded-lg">
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-slate-500">
+            <tr>
+              <th className="text-left px-2 py-1.5 font-medium min-w-[10rem]">Test</th>
+              <th className="text-left px-2 py-1.5 font-medium">Value</th>
+              <th className="text-left px-2 py-1.5 font-medium">Numeric</th>
+              <th className="text-left px-2 py-1.5 font-medium">Unit</th>
+              <th className="text-left px-2 py-1.5 font-medium">Low</th>
+              <th className="text-left px-2 py-1.5 font-medium">High</th>
+              <th className="text-left px-2 py-1.5 font-medium">Range text</th>
+              <th className="text-left px-2 py-1.5 font-medium">Flag</th>
+              <th className="px-2 py-1.5"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {results.map((r, i) => (
+              <tr key={i} className="border-t border-slate-100">
+                <td className="px-1 py-1"><input className={input} value={r.testName || ""} onChange={setRow(i, "testName")} /></td>
+                <td className="px-1 py-1"><input className={input} value={r.valueText || ""} onChange={setRow(i, "valueText")} /></td>
+                <td className="px-1 py-1"><input className={input} type="number" step="any" value={r.valueNum ?? ""} onChange={setRow(i, "valueNum")} /></td>
+                <td className="px-1 py-1"><input className={input} value={r.unit || ""} onChange={setRow(i, "unit")} /></td>
+                <td className="px-1 py-1"><input className={input} type="number" step="any" value={r.referenceLow ?? ""} onChange={setRow(i, "referenceLow")} /></td>
+                <td className="px-1 py-1"><input className={input} type="number" step="any" value={r.referenceHigh ?? ""} onChange={setRow(i, "referenceHigh")} /></td>
+                <td className="px-1 py-1"><input className={input} value={r.referenceText || ""} onChange={setRow(i, "referenceText")} /></td>
+                <td className="px-1 py-1">
+                  <select className={input} value={r.flag || ""} onChange={setRow(i, "flag")}>
+                    {LAB_FLAGS.map((f) => <option key={f || "empty"} value={f}>{f || "—"}</option>)}
+                  </select>
+                </td>
+                <td className="px-1 py-1 text-right">
+                  <button onClick={() => removeRow(i)} className="text-slate-400 hover:text-rose-600"><Trash2 size={12} /></button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex justify-end gap-2 mt-4">
+        <button onClick={onCancel} className={plain}>Cancel</button>
+        <button onClick={save} disabled={saving} className={primary}>
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+          {saving ? "Saving…" : "Save lab report"}
+        </button>
+      </div>
     </div>
   );
 }

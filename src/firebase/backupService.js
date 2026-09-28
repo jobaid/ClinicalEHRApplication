@@ -58,6 +58,7 @@ export const PERMISSION_META = {
   DOCTOR_CLINICAL_NOTE_EDIT:   { label: "Edit note", help: "Edit an unsigned note." },
   DOCTOR_CLINICAL_NOTE_SIGN:   { label: "Sign note", help: "Sign a note - clinical attestation." },
   DOCTOR_LAB_VIEW:             { label: "Labs", help: "See lab results." },
+  DOCTOR_LAB_MANAGE:           { label: "Upload / save labs", help: "Upload a lab report PDF and save extracted results." },
   DOCTOR_DOCUMENT_VIEW:        { label: "Documents", help: "See uploaded clinical documents." },
   DOCTOR_DIAGNOSIS_MANAGE:     { label: "Manage diagnoses", help: "Add or remove diagnoses on a chart." },
   DOCTOR_MEDICATION_VIEW:      { label: "View medications", help: "See a patient's medications." },

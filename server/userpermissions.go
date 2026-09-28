@@ -57,6 +57,10 @@ const (
 	PermDoctorNoteEdit        = "DOCTOR_CLINICAL_NOTE_EDIT"
 	PermDoctorNoteSign        = "DOCTOR_CLINICAL_NOTE_SIGN"
 	PermDoctorLabView         = "DOCTOR_LAB_VIEW"
+	// Uploading and saving lab reports. Kept separate from LAB_VIEW because seeing a report is a
+	// clinical action and adding one is a records-management action - a stewardship reviewer or
+	// coder may need to see a lab without being able to file one.
+	PermDoctorLabManage       = "DOCTOR_LAB_MANAGE"
 	PermDoctorDocumentView    = "DOCTOR_DOCUMENT_VIEW"
 	PermDoctorDiagnosisManage = "DOCTOR_DIAGNOSIS_MANAGE"
 	PermDoctorMedicationView  = "DOCTOR_MEDICATION_VIEW"
@@ -172,6 +176,7 @@ var doctorPermissionOrder = []string{
 	PermDoctorNoteEdit,
 	PermDoctorNoteSign,
 	PermDoctorLabView,
+	PermDoctorLabManage,
 	PermDoctorDocumentView,
 	PermDoctorDiagnosisManage,
 	PermDoctorMedicationView,

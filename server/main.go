@@ -348,6 +348,10 @@ func main() {
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs", s.requirePerm(PermDoctorLabView, s.handleLabList))
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/trend", s.requirePerm(PermDoctorLabView, s.handleLabTrend))
 	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/{orderId}", s.requirePerm(PermDoctorLabView, s.handleLabReport))
+	// Upload a lab report PDF: extract writes nothing to the database, save writes the reviewed
+	// rows plus the PDF. Both gated on DOCTOR_LAB_MANAGE, kept separate from LAB_VIEW.
+	mux.HandleFunc("POST /api/doctor/patients/{id}/labs/extract", s.requirePerm(PermDoctorLabManage, s.handleLabExtract))
+	mux.HandleFunc("POST /api/doctor/patients/{id}/labs", s.requirePerm(PermDoctorLabManage, s.handleLabCreate))
 
 	// Narrow patient lookup for HIM and Antimicrobial creation forms - returns only id, name,
 	// MRN, DOB and gates on either a role tab or a worklist grant. See patientlookup.go.
@@ -459,6 +463,11 @@ func main() {
 	// Doctor role and the laboratory tables. Additive and idempotent, same as the others.
 	if err := s.ensureDoctorSchema(context.Background()); err != nil {
 		log.Printf("doctor: %v - the clinical workspace will not work until this is resolved", err)
+	}
+
+	// Report PDF column on lab_orders. Additive and idempotent, same pattern as every other step.
+	if err := s.ensureLabUploadSchema(context.Background()); err != nil {
+		log.Printf("labs: %v - the lab report upload feature will not work until this is resolved", err)
 	}
 
 	// Uploaded medical records. Additive and idempotent, same as every other schema step here.
