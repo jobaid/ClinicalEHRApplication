@@ -556,6 +556,28 @@ func (s *Server) handleAccessEventList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
+// DELETE /api/admin/ip-access/events - Super Admin clears the access-events audit log.
+//
+// Restricted to SUPER_ADMIN even though the route is behind IP_ACCESS_MANAGE, because clearing
+// the security audit is a stricter act than editing rules - the trail should not disappear on
+// anyone but the account that owns the practice.
+func (s *Server) handleAccessEventsClear(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	if u.Role != "SUPER_ADMIN" {
+		writeErr(w, http.StatusForbidden, "only a Super Admin may clear the access events")
+		return
+	}
+	// TRUNCATE resets the whole table cheaply; the current admin's own action is then re-recorded
+	// so the audit is never truly empty of the moment it was cleared.
+	if _, err := s.db.Exec(r.Context(), `TRUNCATE TABLE access_events`); err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not clear the access events")
+		return
+	}
+	s.recordAccessEvent(r.Context(), u, clientIP(r), r.UserAgent(), r.URL.Path,
+		"events_cleared", "allow", "unchecked", "", "audit log cleared by Super Admin")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // POST /api/admin/ip-access/check - manual VPN lookup for one IP.
 func (s *Server) handleIPCheck(w http.ResponseWriter, r *http.Request) {
 	var body struct{ IP string `json:"ip"` }

@@ -54,13 +54,15 @@ function UsersTab() {
   const [users, setUsers] = useState(null);
   const [error, setError] = useState("");
   const [reloadKey, setReloadKey] = useState(0);
+  const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState("");
 
   useEffect(() => {
     let alive = true;
+    setBusy(true);
     api("/api/admin/ip-access/users")
-      .then((r) => { if (alive) { setUsers(r.users || []); setError(""); } })
-      .catch((e) => { if (alive) { setError(e.message); setUsers([]); } });
+      .then((r) => { if (alive) { setUsers(r.users || []); setError(""); setBusy(false); } })
+      .catch((e) => { if (alive) { setError(e.message); setUsers([]); setBusy(false); } });
     return () => { alive = false; };
   }, [reloadKey]);
 
@@ -83,8 +85,8 @@ function UsersTab() {
       <div className="flex items-center gap-2 mb-2">
         <input className={`${input} max-w-xs`} placeholder="Filter by name, email, role or IP"
           value={search} onChange={(e) => setSearch(e.target.value)} />
-        <button onClick={() => setReloadKey((n) => n + 1)} className={plain}>
-          <RefreshCw size={12} /> Refresh
+        <button onClick={() => setReloadKey((n) => n + 1)} disabled={busy} className={plain}>
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Refresh
         </button>
       </div>
       {!users && <p className="text-xs text-slate-400"><Loader2 size={12} className="inline animate-spin mr-1" />Loading…</p>}
@@ -147,14 +149,16 @@ function IpRulesTab() {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [reloadKey, setReloadKey] = useState(0);
+  const [busy, setBusy] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [check, setCheck] = useState({ ip: "", result: null, busy: false });
 
   useEffect(() => {
     let alive = true;
+    setBusy(true);
     api("/api/admin/ip-access/rules")
-      .then((r) => { if (alive) { setData(r); setError(""); } })
-      .catch((e) => { if (alive) { setError(e.message || "Could not load rules."); setData({ rules: [] }); } });
+      .then((r) => { if (alive) { setData(r); setError(""); setBusy(false); } })
+      .catch((e) => { if (alive) { setError(e.message || "Could not load rules."); setData({ rules: [] }); setBusy(false); } });
     return () => { alive = false; };
   }, [reloadKey]);
 
@@ -213,7 +217,9 @@ function IpRulesTab() {
           <span className="ml-1">{data.rules.filter((r) => r.active).length} active</span>
         </p>
         <div className="flex items-center gap-1.5">
-          <button onClick={() => setReloadKey((n) => n + 1)} className={plain}><RefreshCw size={12} /> Refresh</button>
+          <button onClick={() => setReloadKey((n) => n + 1)} disabled={busy} className={plain}>
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Refresh
+          </button>
           <button onClick={() => setShowAdd(true)} className={primary}><Plus size={13} /> Add rule</button>
         </div>
       </div>
@@ -367,18 +373,34 @@ function AccessEventsTab() {
   const [events, setEvents] = useState(null);
   const [error, setError] = useState("");
   const [reloadKey, setReloadKey] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [filter, setFilter] = useState({ user: "", ip: "", action: "" });
   const [applied, setApplied] = useState({ user: "", ip: "", action: "" });
 
   useEffect(() => {
     let alive = true;
+    setBusy(true);
     const q = new URLSearchParams();
     Object.entries(applied).forEach(([k, v]) => { if (v) q.set(k, v); });
     api(`/api/admin/ip-access/events?${q.toString()}`)
-      .then((r) => { if (alive) { setEvents(r.events || []); setError(""); } })
-      .catch((e) => { if (alive) { setError(e.message); setEvents([]); } });
+      .then((r) => { if (alive) { setEvents(r.events || []); setError(""); setBusy(false); } })
+      .catch((e) => { if (alive) { setError(e.message); setEvents([]); setBusy(false); } });
     return () => { alive = false; };
   }, [reloadKey, applied]);
+
+  async function clearAll() {
+    if (!window.confirm("Delete every access event? This cannot be undone. The Super Admin who cleared the log is recorded as the first event afterwards.")) return;
+    setClearing(true);
+    try {
+      await api("/api/admin/ip-access/events", { method: "DELETE" });
+      setReloadKey((n) => n + 1);
+    } catch (e) {
+      alert(e.message || "Could not clear the events.");
+    } finally {
+      setClearing(false);
+    }
+  }
 
   return (
     <div>
@@ -396,15 +418,22 @@ function AccessEventsTab() {
           <span className={lbl}>Action</span>
           <select className={input} value={filter.action} onChange={(e) => setFilter({ ...filter, action: e.target.value })}>
             <option value="">Any</option>
+            <option value="login">login</option>
             <option value="blocked_ip">blocked_ip</option>
             <option value="rule_create">rule_create</option>
             <option value="rule_revoke">rule_revoke</option>
+            <option value="events_cleared">events_cleared</option>
           </select>
         </label>
         <button onClick={() => { setApplied({ ...filter }); setReloadKey((n) => n + 1); }} className={primary}>
           <Search size={12} /> Apply
         </button>
-        <button onClick={() => setReloadKey((n) => n + 1)} className={plain}><RefreshCw size={12} /> Refresh</button>
+        <button onClick={() => setReloadKey((n) => n + 1)} disabled={busy} className={plain}>
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Refresh
+        </button>
+        <button onClick={clearAll} disabled={clearing || (events && events.length === 0)} className={danger}>
+          {clearing ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />} Clear all
+        </button>
       </div>
 
       {!events && <p className="text-xs text-slate-400"><Loader2 size={12} className="inline animate-spin mr-1" />Loading…</p>}
