@@ -9468,7 +9468,28 @@ const ROLE_DEFAULT_GRANTS = {
 function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, onChangeRole, onResetPassword }) {
   const [showAdd, setShowAdd] = useState(false);
   const [resetting, setResetting] = useState(null);
+  // Active-first, terminated-second; each tab has its own search and role filter so a busy
+  // admin can find one archived account without scrolling past the whole live directory.
+  const [tab, setTab] = useState("active");
+  const [search, setSearch] = useState("");
+  const [roleFilter, setRoleFilter] = useState("");
+
   const sorted = [...users].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const activeCount = sorted.filter((u) => !u.disabled).length;
+  const terminatedCount = sorted.length - activeCount;
+
+  const wantsTerminated = tab === "terminated";
+  const filtered = sorted.filter((u) => {
+    if (wantsTerminated !== !!u.disabled) return false;
+    if (roleFilter && u.role !== roleFilter) return false;
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      if (!(u.name || "").toLowerCase().includes(q)
+        && !(u.email || "").toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
   const recentActions = auditLogs.filter(a => a.entityType === "user").slice(0, 8);
 
   return (
@@ -9478,6 +9499,35 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
         <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 bg-teal-600 text-white text-sm px-3 py-2 rounded-lg hover:bg-teal-700"><Plus size={15} /> Add user</button>
       </div>
       <p className="text-slate-500 text-sm mb-4">Only Super Admins can see this page. Deactivating an account blocks that person from signing in, it doesn't delete their history, the same way nothing else in this app is ever hard-deleted.</p>
+
+      <div className="flex flex-wrap items-center gap-1.5 mb-3">
+        <button onClick={() => setTab("active")}
+          className={`text-xs rounded-lg px-3 py-1.5 border ${
+            tab === "active" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-700 hover:bg-slate-50"}`}>
+          Active <span className="opacity-60 ml-1">({activeCount})</span>
+        </button>
+        <button onClick={() => setTab("terminated")}
+          className={`text-xs rounded-lg px-3 py-1.5 border ${
+            tab === "terminated" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-700 hover:bg-slate-50"}`}>
+          Terminated <span className="opacity-60 ml-1">({terminatedCount})</span>
+        </button>
+        <div className="flex items-center gap-1.5 ml-auto">
+          <input className="border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs w-56"
+            placeholder="Search name or email"
+            value={search} onChange={(e) => setSearch(e.target.value)} />
+          <select className="border border-slate-300 rounded-lg px-2 py-1.5 text-xs"
+            value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+            <option value="">Any role</option>
+            {userRoles.map((r) => <option key={r} value={r}>{ROLE_LABELS[r] || r}</option>)}
+          </select>
+          {(search || roleFilter) && (
+            <button onClick={() => { setSearch(""); setRoleFilter(""); }}
+              className="text-xs text-slate-500 hover:text-slate-700 underline">
+              Clear
+            </button>
+          )}
+        </div>
+      </div>
 
       <Card className="mb-6">
         <table className="w-full text-sm">
@@ -9491,7 +9541,7 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
             </tr>
           </thead>
           <tbody>
-            {sorted.map(u => {
+            {filtered.map(u => {
               const isSelf = u.email === session.email;
               return (
                 <tr key={u.id} className="border-b border-slate-100 last:border-0">
@@ -9521,7 +9571,11 @@ function UserManagement({ users, auditLogs, session, onAddUser, onSetDisabled, o
                 </tr>
               );
             })}
-            {sorted.length === 0 && <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-400">No user accounts yet.</td></tr>}
+            {filtered.length === 0 && (
+              <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-400">
+                {tab === "active" ? "No active accounts match." : "No terminated accounts match."}
+              </td></tr>
+            )}
           </tbody>
         </table>
       </Card>
