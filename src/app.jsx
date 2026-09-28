@@ -2602,13 +2602,16 @@ function ClinicApp({
     if (item.needsPerm) return backupPerms.permissions.includes(item.needsPerm);
     return allowedTabs.includes(item.id);
   });
-  const tabAllowed = nav.some(item => item.id === tab);
+  // The Settings workspace is not a nav item, but it is a full page reachable from the gear icon;
+  // every signed-in user can open it, and each section inside is gated on its own permission.
+  const tabAllowed = tab === "settings" || nav.some(item => item.id === tab);
 
   // "users" was a nav tab until User accounts moved into the Settings menu, and the last
   // position is restored from storage on refresh - so an admin who was on that screen would come
   // back to a tab that no longer renders anything. The same guard covers a role whose access to
   // the saved tab was revoked in Manage roles while they were away.
   useEffect(() => {
+    if (tab === "settings") return;
     if (!nav.some(item => item.id === tab)) setTab("dashboard");
   }, [nav, tab, setTab]);
 
@@ -3390,19 +3393,13 @@ function ClinicApp({
           </div>
           <div className="flex items-center gap-4">
             <BatchStatusWidget myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
-            <SettingsMenu
-              isAccountAdmin={isAccountAdmin}
-              onOpenBatchManagement={() => setShowBatchManagement(true)}
-              onOpenChangePassword={() => setShowChangePassword(true)}
-              onOpenSecurity={() => setShowSecurity(true)}
-              onOpenBackup={() => setShowBackup(true)}
-              canSeeBackup={backupPerms.permissions.length > 0}
-              onOpenUserAdmin={() => setShowUserAdmin(true)}
-              onOpenManageRoles={() => setShowManageRoles(true)}
-              onOpenPracticeCatalog={() => setShowPracticeCatalog(true)}
-              onOpenInsuranceAdmin={() => setShowInsuranceAdmin(true)}
-              canManageInsurance={insurancePerms.any}
-            />
+            <button
+              title="Settings"
+              onClick={() => setTab("settings")}
+              className={`hidden md:flex items-center gap-2 text-xs p-1.5 rounded-lg ${
+                tab === "settings" ? "text-teal-400" : "text-slate-500 hover:text-white"}`}>
+              <Settings size={14} />
+            </button>
             <UserMenu
               session={session}
               onLogout={onLogout}
@@ -3612,6 +3609,25 @@ function ClinicApp({
             revenueByMonth={revenueByMonth} claimStatusData={claimStatusData} charges={charges} patientById={patientById}
             transactions={transactions} patients={patients} policies={policies}
             batches={batches} userAccounts={userAccounts} session={session} isOversight={isBillingOversightRole}
+          />
+        )}
+
+        {tab === "settings" && (
+          <SettingsWorkspace
+            isAccountAdmin={isAccountAdmin}
+            backupPerms={backupPerms}
+            insurancePerms={insurancePerms}
+            batches={batches} session={session} isBillingOversightRole={isBillingOversightRole}
+            myOpenBatch={myOpenBatch} openBatch={openBatch} closeBatch={closeBatch}
+            changeMyPassword={changeMyPassword}
+            userAccounts={userAccounts} auditLogs={auditLogs}
+            addUserAccount={addUserAccount} setUserDisabled={setUserDisabled}
+            changeUserRole={changeUserRole} resetUserPassword={resetUserPassword}
+            rolePermissions={rolePermissions} saveRolePermissions={saveRolePermissions} allNav={allNav}
+            insurances={insurances} policies={policies}
+            saveInsurance={saveInsurance} setInsuranceStatus={setInsuranceStatus} deleteInsurance={deleteInsurance}
+            physicians={physicians} cptCatalog={cptCatalog} charges={charges} appointments={appointments}
+            savePhysician={savePhysician} saveCptCode={saveCptCode} setCatalogEntryActive={setCatalogEntryActive}
           />
         )}
 
@@ -3833,6 +3849,113 @@ function BatchStatusWidget({ myOpenBatch, onOpenBatch, onCloseBatch }) {
   );
 }
 
+// The Settings workspace. Opened from the gear icon and rendered as a full page, side-by-side
+// nav and content pane, so administrative screens are reachable from ONE place rather than five
+// modals hidden behind a dropdown. Each section is rendered inline; the existing per-section
+// components are reused without wrapping them in Modal.
+function SettingsWorkspace(props) {
+  const {
+    isAccountAdmin, backupPerms, insurancePerms,
+    batches, session, isBillingOversightRole, myOpenBatch, openBatch, closeBatch,
+    changeMyPassword,
+    userAccounts, auditLogs, addUserAccount, setUserDisabled, changeUserRole, resetUserPassword,
+    rolePermissions, saveRolePermissions, allNav,
+    insurances, policies, saveInsurance, setInsuranceStatus, deleteInsurance,
+    physicians, cptCatalog, charges, appointments, savePhysician, saveCptCode, setCatalogEntryActive,
+  } = props;
+
+  const canSeeBackup = backupPerms.permissions.length > 0 || backupPerms.superAdmin;
+  const canManageAccess = backupPerms.superAdmin || backupPerms.permissions.includes("BACKUP_ACCESS_MANAGEMENT");
+  const canSeeHim = canManageAccess;
+
+  const sections = [
+    { key: "users", label: "User accounts", icon: UserCog, show: isAccountAdmin },
+    { key: "roles", label: "Manage roles", icon: ShieldCheck, show: isAccountAdmin },
+    { key: "him", label: "HIM", icon: ClipboardList, show: canSeeHim },
+    { key: "access", label: "Access Management", icon: Shield, show: canManageAccess },
+    { key: "backup", label: "Backup & Restore", icon: Database, show: canSeeBackup },
+    { key: "insurance", label: "Insurance Management", icon: Shield, show: insurancePerms?.any },
+    { key: "practice", label: "Practice catalog", icon: Stethoscope, show: isAccountAdmin },
+    { key: "batch", label: "Batch management", icon: Landmark, show: true },
+    { key: "password", label: "Change password", icon: KeyRound, show: true },
+    { key: "security", label: "Security & devices", icon: ShieldCheck, show: true },
+  ].filter((s) => s.show);
+
+  const [section, setSection] = useState(sections[0]?.key || "");
+  const active = sections.some((s) => s.key === section) ? section : sections[0]?.key;
+
+  if (sections.length === 0) {
+    return (
+      <div className="bg-white border border-slate-200 rounded-xl p-6 text-sm text-slate-500">
+        You do not have any settings you can change.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-4">
+        <h1 className="text-xl font-semibold text-slate-800">Settings</h1>
+        <p className="text-xs text-slate-500">Administration, permissions and personal preferences.</p>
+      </div>
+      <div className="flex flex-col md:flex-row gap-4">
+        <nav className="md:w-60 shrink-0 bg-white border border-slate-200 rounded-xl p-2 h-fit">
+          {sections.map((s) => {
+            const Icon = s.icon;
+            const on = active === s.key;
+            return (
+              <button key={s.key} onClick={() => setSection(s.key)}
+                className={`w-full text-left text-sm px-2.5 py-2 rounded-lg flex items-center gap-2 ${
+                  on ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50"}`}>
+                <Icon size={14} /> {s.label}
+              </button>
+            );
+          })}
+        </nav>
+        <div className="flex-1 min-w-0 bg-white border border-slate-200 rounded-xl p-5">
+          {active === "users" && (
+            <UserManagement users={userAccounts} auditLogs={auditLogs} session={session}
+              onAddUser={addUserAccount} onSetDisabled={setUserDisabled} onChangeRole={changeUserRole}
+              onResetPassword={resetUserPassword} />
+          )}
+          {active === "roles" && (
+            <ManageRoles rolePermissions={rolePermissions} users={userAccounts} navItems={allNav}
+              onSave={saveRolePermissions} />
+          )}
+          {active === "him" && (
+            <BackupAccessManagement superAdmin={backupPerms.superAdmin} restrictToGroups={["him"]} />
+          )}
+          {active === "access" && (
+            <BackupAccessManagement superAdmin={backupPerms.superAdmin} />
+          )}
+          {active === "backup" && (
+            <BackupRestore perms={backupPerms.permissions} superAdmin={backupPerms.superAdmin} hideAccessTab />
+          )}
+          {active === "insurance" && (
+            <InsuranceManagement insurances={insurances} policies={policies} perms={insurancePerms}
+              onSave={saveInsurance} onSetStatus={setInsuranceStatus} onDelete={deleteInsurance} />
+          )}
+          {active === "practice" && (
+            <PracticeCatalog physicians={physicians} cptCatalog={cptCatalog}
+              charges={charges} appointments={appointments}
+              onSavePhysician={savePhysician} onSaveCpt={saveCptCode} onSetActive={setCatalogEntryActive} />
+          )}
+          {active === "batch" && (
+            <BatchManagement batches={batches} session={session} isOversight={isBillingOversightRole}
+              myOpenBatch={myOpenBatch} onOpenBatch={openBatch} onCloseBatch={closeBatch} />
+          )}
+          {active === "password" && (
+            <ChangePasswordForm onSubmit={changeMyPassword} onDone={() => {}} />
+          )}
+          {active === "security" && (
+            <SecuritySettings />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // The header avatar acts as the user's own menu. Clicking the name opens Profile Settings, which
 // is section 7 of the specification: the user's own profile controls belong under their name,
 // not under the administrative gear menu.
@@ -3858,7 +3981,6 @@ function UserMenu({ session, onLogout, onOpenProfile }) {
           Demo Account
         </span>
       )}
-      <button onClick={onLogout} className="text-xs text-slate-400 hover:text-white ml-2">Log out</button>
       {open && (
         <div onMouseLeave={() => setOpen(false)}
           className="absolute right-0 top-full mt-2 w-56 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50">
@@ -4088,14 +4210,17 @@ function SecuritySettings() {
 // server/userpermissions.go), so hiding a button is a courtesy to the user, not a security
 // boundary — someone who calls the endpoint directly gets a 403 either way.
 
-function BackupRestore({ perms, superAdmin }) {
+function BackupRestore({ perms, superAdmin, hideAccessTab }) {
   const can = useCallback((p) => perms.includes(p), [perms]);
   const [tab, setTab] = useState("history");
 
   const tabs = [
     { id: "history", label: "Backup History", show: can("BACKUP_VIEW") },
     { id: "schedule", label: "Automatic Backups", show: can("BACKUP_VIEW") },
-    { id: "access", label: "Access Management", show: can("BACKUP_ACCESS_MANAGEMENT") },
+    // Access Management now lives as its own Settings section, so this tab is hidden when
+    // BackupRestore is rendered inside the Settings workspace. Kept behind a flag rather than
+    // deleted, so any legacy caller opening the standalone modal still gets the old shape.
+    { id: "access", label: "Access Management", show: can("BACKUP_ACCESS_MANAGEMENT") && !hideAccessTab },
   ].filter((t) => t.show);
 
   // Derived rather than corrected in an effect. Which tabs exist depends on permissions, which
@@ -4526,10 +4651,15 @@ function BackupSchedule({ can }) {
   );
 }
 
-function BackupAccessManagement({ superAdmin }) {
+function BackupAccessManagement({ superAdmin, restrictToGroups }) {
   const [users, setUsers] = useState(null);
   const [groups, setGroups] = useState([]);
   const [allPerms, setAllPerms] = useState([]);
+  // If restrictToGroups is set, only those group keys are shown in the grid AND in the editor.
+  // The save path preserves the user's OTHER-group permissions so filtering never revokes them.
+  const visibleGroups = useMemo(
+    () => (restrictToGroups?.length ? groups.filter((g) => restrictToGroups.includes(g.key)) : groups),
+    [groups, restrictToGroups]);
   const [history, setHistory] = useState([]);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(null);   // { user, next: Set }
@@ -4593,9 +4723,13 @@ function BackupAccessManagement({ superAdmin }) {
   function attemptSave() {
     const before = new Set(editing.user.permissions);
     const newlyHighRisk = [...editing.next].filter((p) => !before.has(p) && HIGH_RISK_PERMISSIONS.has(p));
-    // Send permissions in the server's stable order so the saved list and any audit diff read as
-    // a real change.
-    const permissions = allPerms.filter((k) => editing.next.has(k));
+    // Only permissions from the visible groups may have been changed here. Permissions from other
+    // groups must be carried through unchanged, so a HIM-filtered editor cannot silently revoke a
+    // user's Doctor or HR grants.
+    const visibleKeys = new Set(visibleGroups.flatMap((g) => g.permissions));
+    const preserved = editing.user.permissions.filter((k) => !visibleKeys.has(k));
+    const chosen = allPerms.filter((k) => visibleKeys.has(k) && editing.next.has(k));
+    const permissions = allPerms.filter((k) => preserved.includes(k) || chosen.includes(k));
     if (newlyHighRisk.length) setConfirmRisk({ permissions, newlyHighRisk });
     else commit(permissions);
   }
@@ -4612,7 +4746,7 @@ function BackupAccessManagement({ superAdmin }) {
           onChange={(e) => setSearch(e.target.value)}
         />
         <p className="text-xs text-slate-400">
-          {groups.length} permission group{groups.length === 1 ? "" : "s"} · {allPerms.length} total grants
+          {visibleGroups.length} permission group{visibleGroups.length === 1 ? "" : "s"} shown · {visibleGroups.reduce((n, g) => n + g.permissions.length, 0)} grants
         </p>
       </div>
 
@@ -4622,7 +4756,7 @@ function BackupAccessManagement({ superAdmin }) {
             <tr>
               <th className="text-left px-3 py-2 font-medium">User</th>
               <th className="text-left px-3 py-2 font-medium">Role</th>
-              {groups.map((g) => (
+              {visibleGroups.map((g) => (
                 <th key={g.key} className="px-2 py-2 font-medium text-center" title={g.label}>
                   {g.label}
                 </th>
@@ -4646,7 +4780,7 @@ function BackupAccessManagement({ superAdmin }) {
                     <div className="text-xs text-slate-400">{u.email}{u.disabled ? " · disabled" : ""}</div>
                   </td>
                   <td className="px-3 py-2 text-xs text-slate-500">{u.role}</td>
-                  {groups.map((g) => {
+                  {visibleGroups.map((g) => {
                     const held = g.permissions.filter((k) => u.permissions.includes(k)).length;
                     return (
                       <td key={g.key} className="px-2 py-2 text-center text-xs">
@@ -4706,7 +4840,7 @@ function BackupAccessManagement({ superAdmin }) {
             those endpoints; unticking one refuses them at the next request.
           </p>
           <div className="space-y-4 mb-4">
-            {groups.map((g) => {
+            {visibleGroups.map((g) => {
               const allInGroup = g.permissions.every((k) => editing.next.has(k));
               return (
                 <div key={g.key} className="border border-slate-200 rounded-lg">
