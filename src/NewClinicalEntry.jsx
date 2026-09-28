@@ -15,7 +15,8 @@ const primary = `${btn} bg-teal-600 text-white hover:bg-teal-700 disabled:opacit
 const plain = `${btn} border border-slate-200 text-slate-700 hover:bg-slate-50`;
 
 // Small typeahead against the narrow patient lookup. Returns { id, name, mrn, dob } on select.
-function PatientPicker({ value, onChange }) {
+// Exported so the Lab and Rx workspaces reuse the same picker instead of duplicating it.
+export function PatientPicker({ value, onChange }) {
   const [q, setQ] = useState("");
   const [list, setList] = useState([]);
   const [busy, setBusy] = useState(false);

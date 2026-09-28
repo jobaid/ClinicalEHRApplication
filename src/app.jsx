@@ -14,6 +14,7 @@ import HrArea from "./HrArea";
 import ProfileSettings from "./ProfileSettings";
 import HimWorklist from "./HimWorklist";
 import AntimicrobialReview from "./AntimicrobialReview";
+import { LabWorkspace, RxWorkspace } from "./LabRxWorkspaces";
 import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
@@ -30,7 +31,7 @@ import {
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
   Activity, Pill, ClipboardList, Microscope, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
-  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut,
+  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut, FlaskConical,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -2579,6 +2580,8 @@ function ClinicApp({
     { id: "claims", label: "Claims", icon: FileStack },
     { id: "reports", label: "Reports", icon: BarChart3 },
     { id: "record", label: "Medical Record", icon: Stethoscope, needsPerm: "DOCTOR_MEDICAL_RECORD_VIEW" },
+    { id: "lab", label: "Lab", icon: FlaskConical, needsPerm: "DOCTOR_LAB_VIEW" },
+    { id: "rx", label: "Rx", icon: Pill, needsPerm: "RX_VIEW" },
     { id: "him", label: "HIM", icon: ClipboardList, needsPerm: "HIM_WORKLIST_VIEW" },
     { id: "antimicrobial", label: "Antimicrobial", icon: Microscope, needsPerm: "ANTIMICROBIAL_VIEW" },
     { id: "hr", label: "HR", icon: Users, needsPerm: "HR_WORKFORCE_VIEW" },
@@ -3581,6 +3584,14 @@ function ClinicApp({
             hasOpenBatch={!!myOpenBatch}
             onCreateTickler={(prefill) => { setTicklerPrefill(prefill); setShowTicklerPanel(true); }}
           />
+        )}
+
+        {tabAllowed && tab === "lab" && (
+          <LabWorkspace permissions={backupPerms.permissions} />
+        )}
+
+        {tabAllowed && tab === "rx" && (
+          <RxWorkspace permissions={backupPerms.permissions} />
         )}
 
         {tabAllowed && tab === "him" && (
