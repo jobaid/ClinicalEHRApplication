@@ -2198,8 +2198,15 @@ function LoginPage({ onLogin }) {
 // Deliberately a plain search over the patient list the application has already loaded: picking
 // a patient is not itself clinical access, and the record only loads - and is only audited -
 // once one is opened.
-function RecordPatientPicker({ patients, onOpen }) {
+//
+// Today's appointments are shown above the search so a physician lands on the day's work without
+// having to type. The physician's own appointments come first; other providers' are collapsed
+// underneath so a locum can still find one across the practice. Marking a visit complete sets
+// the appointment status to "Checked out", which is what the Schedule tab already reads - so
+// completing here updates Schedule automatically, no second write.
+function RecordPatientPicker({ patients, appointments, session, onOpen, onSetApptStatus }) {
   const [q, setQ] = useState("");
+  const [showOthers, setShowOthers] = useState(false);
   const term = q.trim().toLowerCase();
   const shown = term
     ? patients.filter(p =>
@@ -2208,41 +2215,134 @@ function RecordPatientPicker({ patients, onOpen }) {
         (p.dob || "").includes(term))
     : patients.slice(0, 25);
 
+  const patientById = useMemo(() => Object.fromEntries(patients.map(p => [p.id, p])), [patients]);
+  const todaysAppts = useMemo(
+    () => (appointments || [])
+      .filter((a) => a.date === TODAY)
+      .sort((a, b) => (a.time || "").localeCompare(b.time || "")),
+    [appointments]);
+  const mine = todaysAppts.filter((a) => a.provider === session?.name);
+  const others = todaysAppts.filter((a) => a.provider !== session?.name);
+
+  const complete = (apptId) => onSetApptStatus?.(apptId, "Checked out");
+
   return (
-    <Card className="p-4">
-      <SectionTitle>Open a patient record</SectionTitle>
-      <div className="relative mb-3">
-        <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
-        <input
-          autoFocus
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="Search by name, MRN or date of birth"
-          className="w-full border border-slate-200 rounded-lg pl-8 pr-3 py-2 text-sm"
-        />
-      </div>
-      {shown.length === 0 && <p className="text-sm text-slate-400">No patients match that search.</p>}
-      <div className="divide-y divide-slate-100">
-        {shown.map(p => (
-          <button
-            key={p.id}
-            onClick={() => onOpen(p.id)}
-            className="w-full text-left py-2.5 px-1 hover:bg-slate-50 flex items-center justify-between gap-3"
-          >
-            <span>
-              <span className="block text-sm text-slate-800">{p.name}</span>
-              <span className="block text-xs text-slate-400">MRN {p.id} · DOB {p.dob || "Not available"}</span>
-            </span>
-            <ChevronRight size={15} className="text-slate-300 shrink-0" />
-          </button>
-        ))}
-      </div>
-      {!term && patients.length > 25 && (
-        <p className="text-xs text-slate-400 mt-3">
-          Showing the first 25 of {patients.length}. Search to narrow.
-        </p>
-      )}
-    </Card>
+    <div className="space-y-4">
+      <Card className="p-4">
+        <SectionTitle>
+          Today's appointments — {fmtDate(TODAY)}
+          <span className="text-slate-400 font-normal ml-1">({todaysAppts.length})</span>
+        </SectionTitle>
+        {todaysAppts.length === 0 ? (
+          <p className="text-sm text-slate-400">No appointments scheduled for today.</p>
+        ) : (
+          <>
+            <AppointmentRows
+              rows={mine}
+              patientById={patientById}
+              onOpen={onOpen}
+              onComplete={complete}
+              emptyLabel={session?.name ? `No appointments assigned to ${session.name} today.` : ""}
+            />
+            {others.length > 0 && (
+              <div className="mt-2">
+                <button onClick={() => setShowOthers((s) => !s)}
+                  className="text-xs text-slate-500 hover:text-slate-700 underline">
+                  {showOthers ? "Hide" : "Show"} other providers' appointments ({others.length})
+                </button>
+                {showOthers && (
+                  <div className="mt-2">
+                    <AppointmentRows
+                      rows={others}
+                      patientById={patientById}
+                      onOpen={onOpen}
+                      onComplete={complete}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </Card>
+
+      <Card className="p-4">
+        <SectionTitle>Open a patient record</SectionTitle>
+        <div className="relative mb-3">
+          <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search by name, MRN or date of birth"
+            className="w-full border border-slate-200 rounded-lg pl-8 pr-3 py-2 text-sm"
+          />
+        </div>
+        {shown.length === 0 && <p className="text-sm text-slate-400">No patients match that search.</p>}
+        <div className="divide-y divide-slate-100">
+          {shown.map(p => (
+            <button
+              key={p.id}
+              onClick={() => onOpen(p.id)}
+              className="w-full text-left py-2.5 px-1 hover:bg-slate-50 flex items-center justify-between gap-3"
+            >
+              <span>
+                <span className="block text-sm text-slate-800">{p.name}</span>
+                <span className="block text-xs text-slate-400">MRN {p.id} · DOB {p.dob || "Not available"}</span>
+              </span>
+              <ChevronRight size={15} className="text-slate-300 shrink-0" />
+            </button>
+          ))}
+        </div>
+        {!term && patients.length > 25 && (
+          <p className="text-xs text-slate-400 mt-3">
+            Showing the first 25 of {patients.length}. Search to narrow.
+          </p>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function AppointmentRows({ rows, patientById, onOpen, onComplete, emptyLabel }) {
+  if (rows.length === 0) {
+    return emptyLabel ? <p className="text-xs text-slate-400">{emptyLabel}</p> : null;
+  }
+  return (
+    <div className="divide-y divide-slate-100">
+      {rows.map((a) => {
+        const patient = patientById[a.patientId];
+        const done = a.status === "Checked out";
+        return (
+          <div key={a.id} className="py-2.5 flex items-center gap-3">
+            <div className="text-xs font-medium text-slate-700 w-14 shrink-0">{a.time || "—"}</div>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm text-slate-800 truncate">
+                {patient?.name || "Unknown patient"}
+                {patient && <span className="text-slate-400 font-normal"> · MRN {patient.id}</span>}
+              </div>
+              <div className="text-[11px] text-slate-500 truncate">
+                {a.type || "Appointment"}{a.provider ? " · " + a.provider : ""}{a.cpt ? " · CPT " + a.cpt : ""}
+              </div>
+            </div>
+            <StatusPill status={a.status} />
+            <div className="flex items-center gap-1.5 shrink-0">
+              {patient && (
+                <button onClick={() => onOpen(patient.id)}
+                  className="text-xs text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2.5 py-1 hover:bg-teal-100">
+                  Open chart
+                </button>
+              )}
+              {!done && (
+                <button onClick={() => onComplete(a.id)}
+                  className="text-xs text-emerald-700 border border-emerald-200 bg-emerald-50 rounded-lg px-2.5 py-1 hover:bg-emerald-100">
+                  Complete visit
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -3654,7 +3754,13 @@ function ClinicApp({
               onBack={() => setRecordPatientId(null)}
             />
           ) : (
-            <RecordPatientPicker patients={patients} onOpen={setRecordPatientId} />
+            <RecordPatientPicker
+              patients={patients}
+              appointments={appointments}
+              session={session}
+              onOpen={setRecordPatientId}
+              onSetApptStatus={(id, status) => updateDocument("appointments", id, { status })}
+            />
           )
         )}
 
