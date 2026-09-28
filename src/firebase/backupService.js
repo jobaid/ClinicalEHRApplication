@@ -25,6 +25,9 @@ export const BACKUP_PERMISSIONS = [
 // listBackupAccess response carries the whole set. This table only supplies a human label and a
 // short description.
 export const PERMISSION_META = {
+  // IP & Device Access
+  IP_ACCESS_MANAGE:          { label: "Manage IP & Device Access", help: "Block or allow IP addresses and grant time-limited access. Super Admin only." },
+
   // Backup & Restore (duplicated here so lookup is one path)
   BACKUP_VIEW:               { label: "View Backup History", help: "Open Backup & Restore and see the history and status." },
   BACKUP_CREATE:             { label: "Create Backup", help: "Run Create Backup Now." },
@@ -101,6 +104,7 @@ export const PERMISSION_META = {
 // Mirrors highRiskUserPermissions in server/userpermissions.go. Kept in step with it because
 // the confirmation this drives is the one section 53 asks for.
 export const HIGH_RISK_PERMISSIONS = new Set([
+  "IP_ACCESS_MANAGE",
   "BACKUP_RESTORE", "BACKUP_DELETE", "BACKUP_SETTINGS", "BACKUP_ACCESS_MANAGEMENT",
   "ANTIMICROBIAL_COMPLETE", "HIM_CODING_EDIT", "HIM_COMPLETE",
   "DOCTOR_CLINICAL_NOTE_SIGN", "DOCTOR_MEDICATION_MANAGE", "DOCTOR_DIAGNOSIS_MANAGE",

@@ -122,6 +122,11 @@ const (
 	PermHRLeaveManage      = "HR_LEAVE_MANAGE"
 	PermHRConfigManage     = "HR_CONFIG_MANAGE"
 
+	// IP and device access administration. SUPER_ADMIN only, kept as its own grant so that even if
+	// BACKUP_ACCESS_MANAGEMENT is delegated one day, IP-level authorisation stays with the admin
+	// that boots the practice.
+	PermIPAccessManage = "IP_ACCESS_MANAGE"
+
 	PermRxView        = "RX_VIEW"
 	PermRxCreate      = "RX_CREATE"
 	PermRxSign        = "RX_SIGN"
@@ -149,6 +154,10 @@ var backupPermissionOrder = []string{
 	PermBackupDelete,
 	PermBackupSettings,
 	PermBackupAccessManagement,
+}
+
+var ipAccessPermissionOrder = []string{
+	PermIPAccessManage,
 }
 
 var antimicrobialPermissionOrder = []string{
@@ -221,6 +230,7 @@ var hrPermissionOrder = []string{
 }
 
 var permissionGroups = []permissionGroup{
+	{Key: "ipaccess", Label: "IP & Device Access", Permissions: ipAccessPermissionOrder},
 	{Key: "backup", Label: "Backup & Restore", Permissions: backupPermissionOrder},
 	{Key: "antimicrobial", Label: "Antimicrobial Review", Permissions: antimicrobialPermissionOrder},
 	{Key: "him", Label: "HIM Coding", Permissions: himPermissionOrder},
@@ -295,6 +305,10 @@ var highRiskUserPermissions = map[string]bool{
 	// else's pay and time. Both deserve the confirmation the grant screen shows.
 	PermHREmployeeManage: true,
 	PermHRLeaveManage:    true,
+
+	// Cutting off IPs, revoking sessions and changing the VPN policy can lock the practice out of
+	// its own application. High-risk so the grant screen shows the confirmation.
+	PermIPAccessManage: true,
 }
 
 func isHighRiskPermission(p string) bool { return highRiskUserPermissions[p] }

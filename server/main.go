@@ -435,6 +435,14 @@ func main() {
 	mux.HandleFunc("POST /api/me/certificates/{id}/file", s.requireAuth(s.handleMyCertificateUpload))
 	mux.HandleFunc("GET /api/me/certificates/{id}/file", s.requireAuth(s.handleMyCertificateDownload))
 
+	// IP and device access administration. All gated on IP_ACCESS_MANAGE, granted by default only
+	// to a Super Admin. See ipdevice.go for the trusted-proxy and enforcement rules.
+	mux.HandleFunc("GET /api/admin/ip-access/rules", s.requirePerm(PermIPAccessManage, s.handleIPRuleList))
+	mux.HandleFunc("POST /api/admin/ip-access/rules", s.requirePerm(PermIPAccessManage, s.handleIPRuleCreate))
+	mux.HandleFunc("DELETE /api/admin/ip-access/rules/{id}", s.requirePerm(PermIPAccessManage, s.handleIPRuleRevoke))
+	mux.HandleFunc("GET /api/admin/ip-access/events", s.requirePerm(PermIPAccessManage, s.handleAccessEventList))
+	mux.HandleFunc("POST /api/admin/ip-access/check", s.requirePerm(PermIPAccessManage, s.handleIPCheck))
+
 	// HR employee documents. Reading takes HR_EMPLOYEE_VIEW; uploading and archiving take
 	// HR_EMPLOYEE_MANAGE - the same grants that gate the rest of the employee profile.
 	mux.HandleFunc("GET /api/hr/employees/{userId}/documents", s.requirePerm(PermHREmployeeView, s.handleEmployeeDocumentsList))
@@ -468,6 +476,11 @@ func main() {
 	// Report PDF column on lab_orders. Additive and idempotent, same pattern as every other step.
 	if err := s.ensureLabUploadSchema(context.Background()); err != nil {
 		log.Printf("labs: %v - the lab report upload feature will not work until this is resolved", err)
+	}
+
+	// IP / device access rules, events and VPN cache. Additive and idempotent.
+	if err := s.ensureIPDeviceSchema(context.Background()); err != nil {
+		log.Printf("ipdevice: %v - the IP & Device Access screen will not work until this is resolved", err)
 	}
 
 	// Uploaded medical records. Additive and idempotent, same as every other schema step here.

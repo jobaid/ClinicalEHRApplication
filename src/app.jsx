@@ -15,6 +15,7 @@ import ProfileSettings from "./ProfileSettings";
 import HimWorklist from "./HimWorklist";
 import AntimicrobialReview from "./AntimicrobialReview";
 import { LabWorkspace, RxWorkspace } from "./LabRxWorkspaces";
+import IpDeviceAccess from "./IpDeviceAccess";
 import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
@@ -3885,6 +3886,8 @@ function SettingsWorkspace(props) {
     // HIM lives INSIDE Access Management now, not as its own top-level section - see the group
     // filter inside BackupAccessManagement, which reaches HIM as Settings → Access Management → HIM.
     { key: "access", label: "Access Management", icon: Shield, show: canManageAccess },
+    { key: "ipaccess", label: "IP & Device Access", icon: Shield,
+      show: backupPerms.superAdmin || backupPerms.permissions.includes("IP_ACCESS_MANAGE") },
     { key: "backup", label: "Backup & Restore", icon: Database, show: canSeeBackup },
     { key: "insurance", label: "Insurance Management", icon: Shield, show: insurancePerms?.any },
     { key: "practice", label: "Practice catalog", icon: Stethoscope, show: isAccountAdmin },
@@ -3936,6 +3939,9 @@ function SettingsWorkspace(props) {
           )}
           {active === "access" && (
             <BackupAccessManagement superAdmin={backupPerms.superAdmin} />
+          )}
+          {active === "ipaccess" && (
+            <IpDeviceAccess />
           )}
           {active === "backup" && (
             <BackupRestore perms={backupPerms.permissions} superAdmin={backupPerms.superAdmin} hideAccessTab />
