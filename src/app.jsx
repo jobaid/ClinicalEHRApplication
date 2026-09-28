@@ -3871,7 +3871,8 @@ function SettingsWorkspace(props) {
   const sections = [
     { key: "users", label: "User accounts", icon: UserCog, show: isAccountAdmin },
     { key: "roles", label: "Manage roles", icon: ShieldCheck, show: isAccountAdmin },
-    { key: "him", label: "HIM", icon: ClipboardList, show: canSeeHim },
+    // HIM lives INSIDE Access Management now, not as its own top-level section - see the group
+    // filter inside BackupAccessManagement, which reaches HIM as Settings → Access Management → HIM.
     { key: "access", label: "Access Management", icon: Shield, show: canManageAccess },
     { key: "backup", label: "Backup & Restore", icon: Database, show: canSeeBackup },
     { key: "insurance", label: "Insurance Management", icon: Shield, show: insurancePerms?.any },
@@ -3921,9 +3922,6 @@ function SettingsWorkspace(props) {
           {active === "roles" && (
             <ManageRoles rolePermissions={rolePermissions} users={userAccounts} navItems={allNav}
               onSave={saveRolePermissions} />
-          )}
-          {active === "him" && (
-            <BackupAccessManagement superAdmin={backupPerms.superAdmin} restrictToGroups={["him"]} />
           )}
           {active === "access" && (
             <BackupAccessManagement superAdmin={backupPerms.superAdmin} />
@@ -4655,11 +4653,15 @@ function BackupAccessManagement({ superAdmin, restrictToGroups }) {
   const [users, setUsers] = useState(null);
   const [groups, setGroups] = useState([]);
   const [allPerms, setAllPerms] = useState([]);
-  // If restrictToGroups is set, only those group keys are shown in the grid AND in the editor.
-  // The save path preserves the user's OTHER-group permissions so filtering never revokes them.
-  const visibleGroups = useMemo(
-    () => (restrictToGroups?.length ? groups.filter((g) => restrictToGroups.includes(g.key)) : groups),
-    [groups, restrictToGroups]);
+  // The interior filter lets a Super Admin drill into one permission group at a time - so HIM is
+  // reachable as Settings → Access Management → HIM in one click, without splitting it out into a
+  // separate Settings section. `restrictToGroups`, when passed, still overrides the filter.
+  const [groupFilter, setGroupFilter] = useState("all");
+  const visibleGroups = useMemo(() => {
+    if (restrictToGroups?.length) return groups.filter((g) => restrictToGroups.includes(g.key));
+    if (groupFilter === "all") return groups;
+    return groups.filter((g) => g.key === groupFilter);
+  }, [groups, restrictToGroups, groupFilter]);
   const [history, setHistory] = useState([]);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(null);   // { user, next: Set }
@@ -4738,6 +4740,25 @@ function BackupAccessManagement({ superAdmin, restrictToGroups }) {
     <div className="space-y-4">
       {error && <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{error}</div>}
 
+      {!restrictToGroups?.length && groups.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 mb-2">
+          <span className="text-[11px] uppercase tracking-wide text-slate-400 mr-1">Section</span>
+          <button
+            onClick={() => setGroupFilter("all")}
+            className={`text-xs rounded-lg px-2.5 py-1 border ${
+              groupFilter === "all" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-700 hover:bg-slate-50"}`}>
+            All
+          </button>
+          {groups.map((g) => (
+            <button key={g.key}
+              onClick={() => setGroupFilter(g.key)}
+              className={`text-xs rounded-lg px-2.5 py-1 border ${
+                groupFilter === g.key ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-700 hover:bg-slate-50"}`}>
+              {g.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="flex items-center gap-2 mb-2">
         <input
           className={`${inputCls} max-w-xs`}
