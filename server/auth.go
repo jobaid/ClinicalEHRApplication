@@ -293,6 +293,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 // completeLogin issues the real session token. Every successful sign-in ends here, whatever route
 // it took, so there is exactly one place a session can be minted.
 func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, u authedUser, via string, remember bool) {
+	ip := clientIP(r)
+	// IP block at the login layer, so a blocked IP cannot obtain a session in the first place.
+	// SUPER_ADMIN bypasses, matching the requireAuth rule - if the person can prove they are the
+	// admin they can always sign in, no matter what rules have been written.
+	if u.Role != "SUPER_ADMIN" && ipAccessEnforce() {
+		if d := s.evaluateIP(r.Context(), ip); d.Decision == "block" {
+			s.recordAccessEvent(r.Context(), u, ip, r.UserAgent(), "/api/auth/login",
+				"blocked_ip", "block", "unchecked", "", d.Reason)
+			writeErr(w, http.StatusForbidden,
+				"access from this network is not permitted by the organization's security policy")
+			return
+		}
+	}
 	token, err := s.issueToken(u, remember)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not issue session")
@@ -300,7 +313,6 @@ func (s *Server) completeLogin(w http.ResponseWriter, r *http.Request, u authedU
 	}
 	// One access_events row per successful login. This is what the IP & Device Access screen
 	// reads to show which IP each user signed in from. Best-effort; failure never blocks a login.
-	ip := clientIP(r)
 	vpn := s.vpnLookup(r.Context(), ip)
 	s.recordAccessEvent(r.Context(), u, ip, r.UserAgent(), "/api/auth/login",
 		"login", "allow", vpn.Status, vpn.Source, via)
@@ -798,6 +810,21 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		u := authedUser{UID: claims.UID, Email: email, Role: role, Name: name,
 			IsDemo: isDemo, SessionEpoch: epoch}
+
+		// IP block enforcement. Applied to every authenticated request when
+		// IP_ACCESS_ENFORCE=true. A SUPER_ADMIN is never blocked so a bad rule cannot lock the
+		// practice out of its own application.
+		if role != "SUPER_ADMIN" && ipAccessEnforce() {
+			ip := clientIP(r)
+			if d := s.evaluateIP(r.Context(), ip); d.Decision == "block" {
+				s.recordAccessEvent(r.Context(), u, ip, r.UserAgent(), r.URL.Path,
+					"blocked_ip", "block", "unchecked", "", d.Reason)
+				writeErr(w, http.StatusForbidden,
+					"access from this network is not permitted by the organization's security policy")
+				return
+			}
+		}
+
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
 	}
 }
