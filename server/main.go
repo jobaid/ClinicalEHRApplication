@@ -357,6 +357,12 @@ func main() {
 	// MRN, DOB and gates on either a role tab or a worklist grant. See patientlookup.go.
 	mux.HandleFunc("GET /api/patients/lookup", s.requireAuth(s.handlePatientLookup))
 
+	// Patient profile picture. Read gated by tab-based patient access; write gated on the
+	// patients tab so the same rule that governs demography edits governs the photo.
+	mux.HandleFunc("GET /api/patients/{id}/photo", s.requirePatientPhotoRead(s.handlePatientPhotoGet))
+	mux.HandleFunc("POST /api/patients/{id}/photo", s.requirePatientPhotoWrite(s.handlePatientPhotoUpload))
+	mux.HandleFunc("DELETE /api/patients/{id}/photo", s.requirePatientPhotoWrite(s.handlePatientPhotoDelete))
+
 	// Uploaded medical records. Patient id is part of every query, so editing a record id in the
 	// URL cannot reach a document belonging to someone else.
 	mux.HandleFunc("GET /api/patients/{id}/records", s.requirePerm(PermMedRecView, s.handleMedRecList))
@@ -483,6 +489,11 @@ func main() {
 	// IP / device access rules, events and VPN cache. Additive and idempotent.
 	if err := s.ensureIPDeviceSchema(context.Background()); err != nil {
 		log.Printf("ipdevice: %v - the IP & Device Access screen will not work until this is resolved", err)
+	}
+
+	// Patient profile photos. Additive and idempotent.
+	if err := s.ensurePatientPhotoSchema(context.Background()); err != nil {
+		log.Printf("patient photos: %v - the patient photo feature will not work until this is resolved", err)
 	}
 
 	// Uploaded medical records. Additive and idempotent, same as every other schema step here.

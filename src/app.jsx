@@ -6,7 +6,7 @@ import { signIn, signOutUser, fetchUserProfile, createUserAccount, changeOwnPass
   verifyMfa, startMfaEnrollment, confirmMfaEnrollment, securityStatus, listTrustedDevices,
   revokeTrustedDevice, revokeAllTrustedDevices, demoInfo } from "./firebase/authService";
 import { useFirestoreCollection, setDocument, updateDocument, addDocument, deleteDocument, newBatch, docRef } from "./firebase/firestoreService";
-import { api, apiBlob, onTokenChange } from "./firebase/apiClient";
+import { api, apiBlob, onTokenChange, API_BASE, getToken } from "./firebase/apiClient";
 import DoctorWorkspace from "./DoctorWorkspace";
 import Cms1500Modal from "./Cms1500";
 import ClaimWorkspace from "./ClaimWorkspace";
@@ -32,7 +32,7 @@ import {
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
   Activity, Pill, ClipboardList, Microscope, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
-  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut, FlaskConical,
+  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut, FlaskConical, UserRound,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -7040,7 +7040,9 @@ function DemographyTab({ patient, onUpdatePatient }) {
   function save() { onUpdatePatient(form); setEditing(false); }
 
   return (
-    <Card className="p-4">
+    <div className="space-y-4">
+      <PatientPhotoCard patient={patient} />
+      <Card className="p-4">
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-medium text-slate-700">Demographics</h3>
         {!editing ? (
@@ -7074,6 +7076,168 @@ function DemographyTab({ patient, onUpdatePatient }) {
           <Field label="City"><input className={inputCls} value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} /></Field>
           <Field label="State"><input className={inputCls} value={form.state || ""} onChange={(e) => setForm({ ...form, state: e.target.value })} /></Field>
         </div>
+      )}
+      </Card>
+    </div>
+  );
+}
+
+// Patient profile picture. Auth-gated GET streams the image bytes; the object URL is generated
+// from the fetched blob so we never expose a bearer token in <img src>. A cache-buster on the
+// URL forces the <img> to refetch after a successful upload or delete.
+function PatientPhotoCard({ patient }) {
+  const [objectUrl, setObjectUrl] = useState("");
+  const [state, setState] = useState("loading"); // loading | none | shown | error
+  const [reloadKey, setReloadKey] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (!patient?.id) return undefined;
+    let alive = true;
+    let localUrl = "";
+    setState("loading"); setError("");
+    fetch(`${API_BASE}/api/patients/${encodeURIComponent(patient.id)}/photo`, {
+      headers: { Authorization: `Bearer ${getToken() || ""}` },
+    })
+      .then((r) => {
+        if (r.status === 404) { if (alive) { setObjectUrl(""); setState("none"); } return null; }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.blob();
+      })
+      .then((blob) => {
+        if (!blob || !alive) return;
+        localUrl = URL.createObjectURL(blob);
+        setObjectUrl(localUrl);
+        setState("shown");
+      })
+      .catch((e) => { if (alive) { setError(e.message || "Could not load photo."); setState("error"); } });
+    return () => {
+      alive = false;
+      if (localUrl) URL.revokeObjectURL(localUrl);
+    };
+  }, [patient?.id, reloadKey]);
+
+  async function onFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!/^image\/(jpeg|png|webp)$/i.test(file.type)) {
+      setError("Only JPG, PNG or WebP images are accepted.");
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      setError("The photo is larger than 8 MB.");
+      return;
+    }
+    setBusy(true); setError("");
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      const res = await fetch(
+        `${API_BASE}/api/patients/${encodeURIComponent(patient.id)}/photo`,
+        { method: "POST", headers: { Authorization: `Bearer ${getToken() || ""}` }, body: fd });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error(b.error || `Upload failed (${res.status})`);
+      }
+      setReloadKey((n) => n + 1);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doDelete() {
+    setBusy(true); setError("");
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/patients/${encodeURIComponent(patient.id)}/photo`,
+        { method: "DELETE", headers: { Authorization: `Bearer ${getToken() || ""}` } });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        throw new Error(b.error || `Delete failed (${res.status})`);
+      }
+      setConfirmDelete(false);
+      setReloadKey((n) => n + 1);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const initials = (patient?.name || "?").split(" ").filter(Boolean).map((n) => n[0]).slice(0, 2).join("").toUpperCase();
+
+  return (
+    <Card className="p-4">
+      <div className="flex items-start gap-4">
+        <div className="shrink-0">
+          <div className="w-28 h-28 rounded-xl bg-slate-100 border border-slate-200 overflow-hidden flex items-center justify-center">
+            {state === "loading" && <Loader2 size={20} className="animate-spin text-slate-400" />}
+            {state === "shown" && objectUrl && (
+              <img src={objectUrl} alt={`${patient?.name || "Patient"} profile photo`}
+                className="w-full h-full object-cover" />
+            )}
+            {(state === "none" || state === "error") && (
+              <div className="text-center">
+                <UserRound size={36} className="text-slate-400 mx-auto" />
+                <div className="text-[10px] text-slate-500 mt-0.5">{initials || "No photo"}</div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <h3 className="font-medium text-slate-700 mb-0.5">Patient photo</h3>
+          <p className="text-xs text-slate-500 mb-3">JPG, PNG or WebP · up to 8 MB · stored securely with the record.</p>
+
+          {error && <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 mb-2 text-xs text-rose-800">{error}</div>}
+
+          <div className="flex flex-wrap gap-2">
+            <input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp"
+              className="hidden" onChange={onFile} />
+            {state === "none" || state === "error" ? (
+              <button onClick={() => inputRef.current?.click()} disabled={busy}
+                className="flex items-center gap-1.5 bg-teal-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-teal-700 disabled:opacity-60">
+                {busy ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
+                {busy ? "Uploading…" : "Upload picture"}
+              </button>
+            ) : state === "shown" && (
+              <>
+                <button onClick={() => inputRef.current?.click()} disabled={busy}
+                  className="flex items-center gap-1.5 border border-slate-200 text-slate-700 text-xs px-3 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-60">
+                  {busy ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
+                  Change picture
+                </button>
+                <button onClick={() => setConfirmDelete(true)} disabled={busy}
+                  className="flex items-center gap-1.5 border border-rose-200 text-rose-600 text-xs px-3 py-1.5 rounded-lg hover:bg-rose-50 disabled:opacity-60">
+                  <Trash2 size={13} /> Delete picture
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {confirmDelete && (
+        <Modal title="Delete patient picture?" onClose={() => setConfirmDelete(false)}>
+          <p className="text-sm text-slate-600 mb-3">
+            Are you sure you want to remove {patient?.name || "this patient"}'s profile picture?
+            The rest of the patient's record is unchanged.
+          </p>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setConfirmDelete(false)}
+              className="text-sm px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg">Cancel</button>
+            <button onClick={doDelete} disabled={busy}
+              className="text-sm px-3 py-2 bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-50">
+              {busy ? "Deleting…" : "Delete picture"}
+            </button>
+          </div>
+        </Modal>
       )}
     </Card>
   );
