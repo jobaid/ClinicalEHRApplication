@@ -32,7 +32,7 @@ import {
   Download, Printer, TrendingDown, TrendingUp,
   Shield, History, IdCard, Ban, Eye, FileText,
   Activity, Pill, ClipboardList, Microscope, FileSignature, AlertTriangle, HeartPulse, UserCog, Bell, Wrench, Paperclip,
-  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut, FlaskConical, UserRound,
+  KeyRound, ShieldCheck, Database, UserRoundCog, LogOut, FlaskConical, UserRound, Loader2,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
