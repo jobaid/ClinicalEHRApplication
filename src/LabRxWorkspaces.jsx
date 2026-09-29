@@ -37,6 +37,27 @@ function PatientHeader({ patient, onClear }) {
 
 // ---------- Labs ----------
 
+// viewOriginal opens the stored PDF/image for a lab order. The bearer token is required so we
+// fetch, wrap in an object URL, and open that in a new tab.
+async function viewOriginal(patientId, orderId) {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/doctor/patients/${encodeURIComponent(patientId)}/labs/${encodeURIComponent(orderId)}/file`,
+      { headers: { Authorization: `Bearer ${getToken() || ""}` } });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      alert(b.error || `Could not open the file (${res.status})`);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank");
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  } catch (e) {
+    alert(e.message || "Could not open the file.");
+  }
+}
+
 export function LabWorkspace({ permissions }) {
   const [patient, setPatient] = useState(null);
   const [data, setData] = useState(null);
@@ -140,6 +161,11 @@ export function LabWorkspace({ permissions }) {
               </button>
               {isOpen && (
                 <div className="px-3 pb-2">
+                  <button
+                    onClick={() => viewOriginal(patient.id, o.id)}
+                    className="text-[11px] text-teal-700 border border-teal-200 bg-teal-50 rounded-lg px-2 py-1 mb-2 hover:bg-teal-100">
+                    View original
+                  </button>
                   {(o.results || []).length === 0 && <p className="text-[11px] text-slate-400 py-1">No components recorded.</p>}
                   {(o.results || []).map((r, i) => (
                     <div key={i} className="grid grid-cols-4 gap-2 text-xs py-1 border-t border-slate-100 first:border-t-0">
@@ -286,8 +312,19 @@ function LabUploadDialog({ patient, onClose, onSaved }) {
   const [error, setError] = useState("");
   const [extracted, setExtracted] = useState(null); // { order, results, pdfBase64, pdfName }
 
+  // Read the file to base64 client-side so a manual-entry save still carries the original along
+  // with the typed values. Returns { pdfBase64, pdfName } or empty when no file is chosen.
+  const readFile = async () => {
+    if (!file) return { pdfBase64: "", pdfName: "" };
+    const buf = await file.arrayBuffer();
+    let s = "";
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return { pdfBase64: btoa(s), pdfName: file.name };
+  };
+
   async function extract() {
-    if (!file) { setError("Choose a PDF first."); return; }
+    if (!file) { setError("Choose a file first, or use Enter manually."); return; }
     setError(""); setPhase("extracting");
     try {
       const fd = new FormData();
@@ -295,6 +332,15 @@ function LabUploadDialog({ patient, onClose, onSaved }) {
       const res = await fetch(
         `${API_BASE}/api/doctor/patients/${encodeURIComponent(patient.id)}/labs/extract`,
         { method: "POST", headers: { Authorization: `Bearer ${getToken() || ""}` }, body: fd });
+      if (res.status === 503) {
+        // AI is not configured on this server. Fall back to manual entry gracefully, carrying
+        // the file through so the report is still attached.
+        const carry = await readFile();
+        setExtracted({ order: {}, results: [], pdfBase64: carry.pdfBase64, pdfName: carry.pdfName });
+        setError("AI extraction is not configured on the server. The file is attached; enter the values by hand.");
+        setPhase("review");
+        return;
+      }
       if (!res.ok) {
         const b = await res.json().catch(() => ({}));
         throw new Error(b.error || `Extraction failed (${res.status})`);
@@ -308,9 +354,16 @@ function LabUploadDialog({ patient, onClose, onSaved }) {
       });
       setPhase("review");
     } catch (e) {
-      setError(e.message || "The report could not be extracted.");
+      setError(e.message || "The report could not be extracted. You can still Enter manually.");
       setPhase("pick");
     }
+  }
+
+  async function skipToManual() {
+    setError("");
+    const carry = await readFile();
+    setExtracted({ order: {}, results: [], pdfBase64: carry.pdfBase64, pdfName: carry.pdfName });
+    setPhase("review");
   }
 
   return (
@@ -327,14 +380,13 @@ function LabUploadDialog({ patient, onClose, onSaved }) {
           <div className="p-5">
             {error && <div className="bg-rose-50 border border-rose-200 rounded-lg p-2 mb-3 text-xs text-rose-800">{error}</div>}
             <p className="text-xs text-slate-500 mb-3">
-              The PDF is sent to the language model, which reads the text and proposes rows for a
-              lab order plus its analytes. You review and edit the proposal before it is saved.
-              Nothing about the value's normality is derived by this application - flags are shown
-              exactly as the model finds them printed on the report.
+              Attach the original PDF or image, then either enter the values by hand or let AI
+              propose them. The file is stored either way. AI extraction is optional and only
+              proposes the rows - you still review before saving.
             </p>
             <label className="block mb-3">
-              <span className={lbl}>Lab report PDF (max 20 MB)</span>
-              <input type="file" accept="application/pdf"
+              <span className={lbl}>Lab report file — PDF, JPG or PNG (max 20 MB, optional if entering manually)</span>
+              <input type="file" accept="application/pdf,image/jpeg,image/png"
                 onChange={(e) => setFile(e.target.files?.[0] || null)}
                 className="text-xs block w-full" />
             </label>
@@ -344,12 +396,16 @@ function LabUploadDialog({ patient, onClose, onSaved }) {
               </p>
             )}
             <p className="text-[11px] text-slate-400">
-              Scanned images without OCR have no text layer and cannot be extracted. Re-scan with
-              OCR enabled or enter the values by hand for those.
+              Scanned images without OCR have no text layer and cannot be extracted by AI. Use
+              Enter manually for those.
             </p>
-            <div className="flex justify-end gap-2 mt-4">
+            <div className="flex justify-end gap-2 mt-4 flex-wrap">
               <button onClick={onClose} className={plain}>Cancel</button>
-              <button onClick={extract} disabled={!file} className={primary}>
+              <button onClick={skipToManual} className={plain}>
+                Enter manually
+              </button>
+              <button onClick={extract} disabled={!file} className={primary}
+                title={!file ? "Attach a PDF first" : "Sends the PDF to the AI provider for extraction"}>
                 <Sparkles size={13} /> Extract with AI
               </button>
             </div>
@@ -365,12 +421,15 @@ function LabUploadDialog({ patient, onClose, onSaved }) {
         )}
 
         {phase === "review" && extracted && (
-          <LabReviewForm
-            patientId={patient.id}
-            initial={extracted}
-            onCancel={() => onClose()}
-            onSaved={onSaved}
-          />
+          <>
+            {error && <div className="mx-5 mt-4 -mb-2 bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-800">{error}</div>}
+            <LabReviewForm
+              patientId={patient.id}
+              initial={extracted}
+              onCancel={() => onClose()}
+              onSaved={onSaved}
+            />
+          </>
         )}
       </div>
     </div>

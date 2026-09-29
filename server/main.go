@@ -352,6 +352,7 @@ func main() {
 	// rows plus the PDF. Both gated on DOCTOR_LAB_MANAGE, kept separate from LAB_VIEW.
 	mux.HandleFunc("POST /api/doctor/patients/{id}/labs/extract", s.requirePerm(PermDoctorLabManage, s.handleLabExtract))
 	mux.HandleFunc("POST /api/doctor/patients/{id}/labs", s.requirePerm(PermDoctorLabManage, s.handleLabCreate))
+	mux.HandleFunc("GET /api/doctor/patients/{id}/labs/{orderId}/file", s.requirePerm(PermDoctorLabView, s.handleLabReportFile))
 
 	// Narrow patient lookup for HIM and Antimicrobial creation forms - returns only id, name,
 	// MRN, DOB and gates on either a role tab or a worklist grant. See patientlookup.go.

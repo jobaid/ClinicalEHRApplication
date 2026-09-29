@@ -30,9 +30,15 @@ import (
 //go:embed migrations/019_lab_upload.sql
 var labUploadSchemaSQL string
 
+//go:embed migrations/022_lab_file_mime.sql
+var labMimeSchemaSQL string
+
 func (s *Server) ensureLabUploadSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, labUploadSchemaSQL); err != nil {
 		return fmt.Errorf("lab upload schema: %w", err)
+	}
+	if _, err := s.db.Exec(ctx, labMimeSchemaSQL); err != nil {
+		return fmt.Errorf("lab mime schema: %w", err)
 	}
 	return nil
 }
@@ -333,26 +339,37 @@ func (s *Server) handleLabCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If a PDF was carried over from the extract step, keep it. A base64 payload larger than the
-	// upload limit is refused outright - somebody sending a bigger one would be trying to skip the
-	// extract path.
-	pdfDataURL := ""
-	pdfName := ""
+	// Optional file - PDF, JPG or PNG. Manual entry skips this and just enters structured rows.
+	// Kept as a base64 data URL to match the storage pattern used by medical_records and
+	// id_documents; the mime column then decides what Content-Type the download endpoint sends.
+	fileDataURL := ""
+	fileName := ""
+	fileMime := ""
 	if body.PdfBase64 != "" {
-		if !isProbablyBase64PDF(body.PdfBase64) {
-			writeErr(w, http.StatusBadRequest, "the attached PDF is malformed")
-			return
-		}
 		if len(body.PdfBase64) > (maxLabPdfBytes*4/3)+64 {
-			writeErr(w, http.StatusBadRequest, "the attached PDF is larger than 20 MB")
+			writeErr(w, http.StatusBadRequest, "the attached file is larger than 20 MB")
 			return
 		}
-		pdfDataURL = "data:application/pdf;base64," + body.PdfBase64
-		pdfName = safeBackupName(strings.TrimSpace(body.PdfName))
-		if pdfName == "" {
-			pdfName = "lab-report.pdf"
-		} else if !strings.HasSuffix(strings.ToLower(pdfName), ".pdf") {
-			pdfName += ".pdf"
+		decoded, ok := decodeBase64(body.PdfBase64)
+		if !ok || len(decoded) == 0 {
+			writeErr(w, http.StatusBadRequest, "the attached file is malformed")
+			return
+		}
+		// Sniff by magic bytes. Reuses sniffFileType (PDF/JPG/PNG only) - same policy as
+		// medical records, so a lab report and a scanned document go through the same filter.
+		mime, ext, ok := sniffFileType(decoded)
+		if !ok {
+			writeErr(w, http.StatusBadRequest,
+				"only PDF, JPG and PNG lab reports are accepted. The file's contents do not match any of those.")
+			return
+		}
+		fileMime = mime
+		fileDataURL = "data:" + mime + ";base64," + body.PdfBase64
+		fileName = safeBackupName(strings.TrimSpace(body.PdfName))
+		if fileName == "" {
+			fileName = "lab-report" + ext
+		} else if !strings.HasSuffix(strings.ToLower(fileName), ext) {
+			fileName += ext
 		}
 	}
 
@@ -373,8 +390,8 @@ func (s *Server) handleLabCreate(w http.ResponseWriter, r *http.Request) {
 		INSERT INTO lab_orders
 		  (id, patient_id, panel_name, category, ordering_provider, lab_name, accession,
 		   ordered_at, collected_at, resulted_at, status, comments, created_by,
-		   report_pdf, report_pdf_name)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		   report_pdf, report_pdf_name, report_pdf_mime)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		orderID, patientID,
 		strings.TrimSpace(body.Order.PanelName),
 		strings.TrimSpace(body.Order.Category),
@@ -385,7 +402,7 @@ func (s *Server) handleLabCreate(w http.ResponseWriter, r *http.Request) {
 		strings.TrimSpace(body.Order.Status),
 		strings.TrimSpace(body.Order.Comments),
 		u.Name,
-		pdfDataURL, pdfName,
+		fileDataURL, fileName, fileMime,
 	); err != nil {
 		writeErr(w, http.StatusInternalServerError, "could not save the lab order: "+err.Error())
 		return
@@ -460,10 +477,54 @@ func firstNonEmpty(vs ...any) any {
 	return nil
 }
 
-func isProbablyBase64PDF(s string) bool {
-	if len(s) < 40 {
-		return false
+// decodeBase64 accepts a raw base64 string (no data-URL prefix) and returns its bytes.
+func decodeBase64(s string) ([]byte, bool) {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, false
 	}
-	// A PDF starts with "%PDF-", which base64-encodes to "JVBERi0..." for standard alphabet.
-	return strings.HasPrefix(s, "JVBER")
+	return raw, true
+}
+
+// GET /api/doctor/patients/{id}/labs/{orderId}/file
+//
+// Streams the stored report file (PDF, JPG or PNG). Gated on DOCTOR_LAB_VIEW - a doctor who may
+// see labs at all may see the originals; DOCTOR_LAB_MANAGE is only about writing.
+func (s *Server) handleLabReportFile(w http.ResponseWriter, r *http.Request) {
+	patientID := r.PathValue("id")
+	orderID := r.PathValue("orderId")
+
+	var dataURL, name, mime string
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT report_pdf, report_pdf_name, report_pdf_mime
+		   FROM lab_orders WHERE id = $1 AND patient_id = $2`,
+		orderID, patientID).Scan(&dataURL, &name, &mime); err != nil {
+		writeErr(w, http.StatusNotFound, "no such lab report for this patient")
+		return
+	}
+	if dataURL == "" {
+		writeErr(w, http.StatusNotFound, "no file is attached to this lab report")
+		return
+	}
+	// data:MIME;base64,BYTES - strip everything up to the comma.
+	i := strings.Index(dataURL, "base64,")
+	if i < 0 {
+		writeErr(w, http.StatusInternalServerError, "the stored file is malformed")
+		return
+	}
+	raw, ok := decodeBase64(dataURL[i+len("base64,"):])
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "the stored file is malformed")
+		return
+	}
+	if mime == "" {
+		mime = "application/pdf" // legacy rows before the mime column
+	}
+	if name == "" {
+		name = "lab-report"
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(raw)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename=%q`, name))
+	_, _ = w.Write(raw)
 }
