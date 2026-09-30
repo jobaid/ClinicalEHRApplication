@@ -16,6 +16,7 @@ import HimWorklist from "./HimWorklist";
 import AntimicrobialReview from "./AntimicrobialReview";
 import { LabWorkspace, RxWorkspace } from "./LabRxWorkspaces";
 import IpDeviceAccess from "./IpDeviceAccess";
+import ClaimsBillingSettings from "./ClaimsBillingSettings";
 import WorkforceTodayCard from "./WorkforceTodayCard";
 import { normalizeDx } from "./claimService";
 import {
@@ -3997,6 +3998,8 @@ function SettingsWorkspace(props) {
     { key: "backup", label: "Backup & Restore", icon: Database, show: canSeeBackup },
     { key: "insurance", label: "Insurance Management", icon: Shield, show: insurancePerms?.any },
     { key: "practice", label: "Practice catalog", icon: Stethoscope, show: isAccountAdmin },
+    { key: "claimsBilling", label: "Claims & Billing Settings", icon: Receipt,
+      show: backupPerms.superAdmin || backupPerms.permissions.includes("CLAIM_SETTINGS_MANAGE") },
     { key: "batch", label: "Batch management", icon: Landmark, show: true },
     { key: "password", label: "Change password", icon: KeyRound, show: true },
     { key: "security", label: "Security & devices", icon: ShieldCheck, show: true },
@@ -4060,6 +4063,12 @@ function SettingsWorkspace(props) {
             <PracticeCatalog physicians={physicians} cptCatalog={cptCatalog}
               charges={charges} appointments={appointments}
               onSavePhysician={savePhysician} onSaveCpt={saveCptCode} onSetActive={setCatalogEntryActive} />
+          )}
+          {active === "claimsBilling" && (
+            <ClaimsBillingSettings
+              onOpenPracticeCatalog={() => setSection("practice")}
+              onOpenInsuranceAdmin={() => setSection("insurance")}
+            />
           )}
           {active === "batch" && (
             <BatchManagement batches={batches} session={session} isOversight={isBillingOversightRole}

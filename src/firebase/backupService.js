@@ -28,6 +28,9 @@ export const PERMISSION_META = {
   // IP & Device Access
   IP_ACCESS_MANAGE:          { label: "Manage IP & Device Access", help: "Block or allow IP addresses and grant time-limited access. Super Admin only." },
 
+  // Claims & Billing Settings
+  CLAIM_SETTINGS_MANAGE:     { label: "Manage Claims & Billing Settings", help: "Configure practice-wide claim settings, reason codes and payer defaults." },
+
   // Backup & Restore (duplicated here so lookup is one path)
   BACKUP_VIEW:               { label: "View Backup History", help: "Open Backup & Restore and see the history and status." },
   BACKUP_CREATE:             { label: "Create Backup", help: "Run Create Backup Now." },

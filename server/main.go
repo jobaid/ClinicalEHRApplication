@@ -442,6 +442,16 @@ func main() {
 	mux.HandleFunc("POST /api/me/certificates/{id}/file", s.requireAuth(s.handleMyCertificateUpload))
 	mux.HandleFunc("GET /api/me/certificates/{id}/file", s.requireAuth(s.handleMyCertificateDownload))
 
+	// Claims & Billing Settings administration. Storage only in this commit; the claim workflow
+	// does not yet consume these values - see claimsettings.go.
+	mux.HandleFunc("GET /api/admin/claim-settings", s.requirePerm(PermClaimSettingsManage, s.handleClaimSettingsList))
+	mux.HandleFunc("GET /api/admin/claim-settings/{key}", s.requirePerm(PermClaimSettingsManage, s.handleClaimSettingGet))
+	mux.HandleFunc("PUT /api/admin/claim-settings/{key}", s.requirePerm(PermClaimSettingsManage, s.handleClaimSettingPut))
+	mux.HandleFunc("GET /api/admin/claim-reason-codes", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeList))
+	mux.HandleFunc("POST /api/admin/claim-reason-codes", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeCreate))
+	mux.HandleFunc("PUT /api/admin/claim-reason-codes/{id}", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeUpdate))
+	mux.HandleFunc("DELETE /api/admin/claim-reason-codes/{id}", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeDelete))
+
 	// IP and device access administration. All gated on IP_ACCESS_MANAGE, granted by default only
 	// to a Super Admin. See ipdevice.go for the trusted-proxy and enforcement rules.
 	mux.HandleFunc("GET /api/admin/ip-access/rules", s.requirePerm(PermIPAccessManage, s.handleIPRuleList))
@@ -495,6 +505,11 @@ func main() {
 	// Patient profile photos. Additive and idempotent.
 	if err := s.ensurePatientPhotoSchema(context.Background()); err != nil {
 		log.Printf("patient photos: %v - the patient photo feature will not work until this is resolved", err)
+	}
+
+	// Claims & Billing Settings k/v store and reason-code catalog. Additive, idempotent.
+	if err := s.ensureClaimSettingsSchema(context.Background()); err != nil {
+		log.Printf("claim settings: %v - Claims & Billing Settings will not persist until this is resolved", err)
 	}
 
 	// Uploaded medical records. Additive and idempotent, same as every other schema step here.

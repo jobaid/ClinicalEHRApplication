@@ -127,6 +127,11 @@ const (
 	// that boots the practice.
 	PermIPAccessManage = "IP_ACCESS_MANAGE"
 
+	// Claims & Billing Settings administration. Kept as its own grant so a Super Admin can
+	// eventually delegate practice configuration to an office manager without handing out
+	// broader admin rights.
+	PermClaimSettingsManage = "CLAIM_SETTINGS_MANAGE"
+
 	PermRxView        = "RX_VIEW"
 	PermRxCreate      = "RX_CREATE"
 	PermRxSign        = "RX_SIGN"
@@ -158,6 +163,10 @@ var backupPermissionOrder = []string{
 
 var ipAccessPermissionOrder = []string{
 	PermIPAccessManage,
+}
+
+var claimSettingsPermissionOrder = []string{
+	PermClaimSettingsManage,
 }
 
 var antimicrobialPermissionOrder = []string{
@@ -238,6 +247,7 @@ var permissionGroups = []permissionGroup{
 	{Key: "medicalRecords", Label: "Medical Records", Permissions: medicalRecordPermissionOrder},
 	{Key: "rx", Label: "Rx / Prescriptions", Permissions: rxPermissionOrder},
 	{Key: "claims", Label: "Claims / CMS-1500", Permissions: claimPermissionOrder},
+	{Key: "claimSettings", Label: "Claims & Billing Settings", Permissions: claimSettingsPermissionOrder},
 	{Key: "hr", Label: "HR / Workforce", Permissions: hrPermissionOrder},
 }
 
