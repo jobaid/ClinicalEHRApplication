@@ -49,7 +49,28 @@ import {
 // vocabulary, plus pure helper functions.
 
 // CMS-1500-style claim fields — practice defaults, prefilled but editable per charge.
-const PRACTICE_INFO = { name: "Jobaid Clinic", address: "400 Harbor Way, Bellerose, NY 11426", taxId: "13-5551234" };
+// Default practice identity. Settings ▸ Claims & Billing Settings ▸ Practice Settings overrides
+// these values at runtime through loadPracticeSettings(); the constants act as the fallback for
+// a fresh install that has not saved practice settings yet.
+const PRACTICE_DEFAULT = { name: "Jobaid Clinic", address: "400 Harbor Way, Bellerose, NY 11426", taxId: "13-5551234", billingNPI: "", taxonomy: "" };
+const PRACTICE_INFO = { ...PRACTICE_DEFAULT };
+
+// One-time load: fetches Settings → Claims & Billing → Practice Settings and, when values are
+// present, mutates PRACTICE_INFO in place so every existing consumer picks up the configured
+// values without having to be re-plumbed. Called once at app boot; a Save on the Settings screen
+// stores to the server, and a page refresh picks up the new values.
+export async function loadPracticeSettings() {
+  try {
+    const v = await api("/api/practice-info");
+    if (v?.organizationName) PRACTICE_INFO.name = v.organizationName;
+    if (v?.serviceLocation) PRACTICE_INFO.address = v.serviceLocation;
+    if (v?.taxId) PRACTICE_INFO.taxId = v.taxId;
+    if (v?.billingNPI) PRACTICE_INFO.billingNPI = v.billingNPI;
+    if (v?.taxonomy) PRACTICE_INFO.taxonomy = v.taxonomy;
+  } catch {
+    // Endpoint returns empty on error - defaults keep rendering.
+  }
+}
 const emptyDxCodes = () => Array(10).fill("");
 
 // ---------- Auth / RBAC ----------
@@ -2460,6 +2481,7 @@ export default function ClinicBilling() {
           if (saved?.lastActivity && Date.now() - saved.lastActivity < IDLE_LIMIT_MS) {
             setSession(saved);
             lastActivityRef.current = Date.now();
+            loadPracticeSettings();
           } else {
             await storageAdapter.remove(SESSION_KEY);
           }
@@ -2512,6 +2534,9 @@ export default function ClinicBilling() {
     lastWriteRef.current = Date.now();
     persistSession(sess);
     addDocument("loginAudit", { action: "Login", user: user.name, role: user.role, timestamp: nowIso() });
+    // Load practice identity so PDFs and headers show the configured practice name / address /
+    // tax ID / billing NPI. Failure keeps the shipped defaults - never blocks login.
+    loadPracticeSettings();
   }
 
   async function handleLogout(reason) {
@@ -6267,6 +6292,16 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
   });
   const [error, setError] = useState("");
   const set = (k) => (e) => setF(prev => ({ ...prev, [k]: e.target.value }));
+  // Write-off reason suggestions from Settings → Claims & Billing Settings → Write-Off Reasons.
+  // Datalist means the biller can still type any reason for a case the catalog does not cover.
+  const [writeoffReasons, setWriteoffReasons] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    api("/api/reason-codes?kind=writeoff")
+      .then((r) => { if (alive) setWriteoffReasons((r?.reasons || []).filter((x) => x.active).map((x) => x.description)); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   function autoCalculate() {
     const allowed = Number(f.allowedAmount) || 0;
@@ -6355,7 +6390,14 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
       <SectionTitle>Write off</SectionTitle>
       <AmountField label="Write-off amount" value={f.writeoff} onChange={set("writeoff")} />
       {Number(f.writeoff) > 0 && (
-        <Field label="Write-off reason (required)"><input className={inputCls} value={f.writeoffReason} onChange={set("writeoffReason")} placeholder="Contractual adjustment, timely filing, etc." /></Field>
+        <Field label="Write-off reason (required)">
+          <input className={inputCls} list="writeoffReasonSuggestions" value={f.writeoffReason}
+            onChange={set("writeoffReason")}
+            placeholder="Contractual adjustment, timely filing, etc." />
+          <datalist id="writeoffReasonSuggestions">
+            {(writeoffReasons || []).map((r) => <option key={r} value={r} />)}
+          </datalist>
+        </Field>
       )}
 
       <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>

@@ -118,6 +118,33 @@ func (s *Server) handleClaimSettingPut(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// GET /api/practice-info
+//
+// Public (any signed-in user) read of the display fields on the Practice Settings row -
+// organisation name, service location address, tax ID, billing NPI, taxonomy. Everything else
+// on the settings row stays behind the admin grant. Used by the PDF templates so a Biller can
+// generate a statement with the practice's real header without holding CLAIM_SETTINGS_MANAGE.
+func (s *Server) handlePracticeInfo(w http.ResponseWriter, r *http.Request) {
+	var raw []byte
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT value FROM claim_settings WHERE key = 'practice'`).Scan(&raw); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	var v map[string]any
+	if json.Unmarshal(raw, &v) != nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	out := map[string]any{}
+	for _, k := range []string{"organizationName", "serviceLocation", "taxId", "billingNPI", "taxonomy", "phone", "email"} {
+		if val, ok := v[k]; ok {
+			out[k] = val
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // GET /api/admin/claim-settings - list every key that has been written.
 func (s *Server) handleClaimSettingsList(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(),

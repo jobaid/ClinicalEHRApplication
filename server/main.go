@@ -454,6 +454,9 @@ func main() {
 	// Atomic claim-number allocation, so two concurrent creates cannot collide. Any signed-in
 	// user - a biller creating a claim - may call it.
 	mux.HandleFunc("POST /api/claim-numbering/next", s.requireAuth(s.handleClaimNumberingNext))
+	// Practice identity - name, address, tax ID, billing NPI, taxonomy - readable by any signed
+	// -in user so statements and CMS-1500 output pick up the configured header.
+	mux.HandleFunc("GET /api/practice-info", s.requireAuth(s.handlePracticeInfo))
 	mux.HandleFunc("POST /api/admin/claim-reason-codes", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeCreate))
 	mux.HandleFunc("PUT /api/admin/claim-reason-codes/{id}", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeUpdate))
 	mux.HandleFunc("DELETE /api/admin/claim-reason-codes/{id}", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeDelete))
