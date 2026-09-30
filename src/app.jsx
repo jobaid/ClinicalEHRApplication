@@ -294,6 +294,31 @@ function agingBucket(days) {
   return "90+";
 }
 
+// Detailed 8-bucket format used by the Run Aging Report modal when "Detailed" is picked.
+// A balance is placed in exactly ONE bucket - the same single-return guarantee agingBucket() gives.
+function agingBucketDetailed(days) {
+  if (days <= 30) return "0-30";
+  if (days <= 60) return "31-60";
+  if (days <= 90) return "61-90";
+  if (days <= 120) return "91-120";
+  if (days <= 150) return "121-150";
+  if (days <= 180) return "151-180";
+  if (days <= 365) return "181-365";
+  return "365+";
+}
+
+const AGING_BUCKETS_STANDARD = ["0-30", "31-60", "61-90", "91-120", "120+"];
+const AGING_BUCKETS_DETAILED = ["0-30", "31-60", "61-90", "91-120", "121-150", "151-180", "181-365", "365+"];
+
+// Standard 5-bucket variant (0-30/31-60/61-90/91-120/120+). Same single-return placement rule.
+function agingBucketStandard(days) {
+  if (days <= 30) return "0-30";
+  if (days <= 60) return "31-60";
+  if (days <= 90) return "61-90";
+  if (days <= 120) return "91-120";
+  return "120+";
+}
+
 // ---------- Export helpers (CSV / print-to-PDF) ----------
 
 function downloadBlob(filename, blob) {
@@ -10070,6 +10095,419 @@ function AddUserForm({ onSubmit }) {
   );
 }
 
+// ---------- Aging Report: filtering, bucketing, summary (used by ReportCenter) ----------
+//
+// One place computes the aging rows so the on-screen table, the summary cards, the CSV export and
+// the PDF statement all read from the same array. Balances are never recalculated here: every row
+// reads balanceOf() and currentPrimaryPolicy() straight from the app's existing data, so a change
+// to the billing engine flows through automatically and this file never disagrees with the ledger.
+
+function defaultAgingFilters() {
+  return {
+    asOfDate: TODAY,
+    agingBasis: "dos",             // only DOS is universally present, so it's the safe default
+    responsibility: "all",         // all | insurance | patient
+    payerFilter: "",               // "" = all payers; else insuranceCompany name
+    bucketFormat: "standard",      // standard | detailed
+    providerFilter: "",            // "" = all
+    insuranceFilter: "",           // "" = all
+    financialClass: "",            // "" = all
+    patientFilter: "",             // "" = all; else patient id
+    locationFilter: "",            // "" = all
+    cptFilter: "",                 // "" = all
+    dosFrom: "",
+    dosTo: "",
+    balanceMode: "gt0",            // all | gt0 | gt10 | gt25 | gt50 | gt100 | custom
+    balanceMin: "",
+    balanceMax: "",
+    groupBy: "responsibility",     // responsibility | patient | insurance | provider | location | dos | bucket
+    sortBy: "oldest",              // oldest | newest | balanceDesc | balanceAsc | patient | insurance | provider | dos
+    reportType: "detailed",        // summary | detailed | claim
+    includeZero: false,
+    includeCredits: false,
+    claimStatuses: {               // exclude nothing by default; unchecked = excluded
+      Open: true, Partial: true, Paid: false, "Written off": false, Overpayment: false,
+    },
+  };
+}
+
+// Pure filter + bucket function. Returns { rows, buckets, totals, groups }.
+// Nothing in here mutates the caller's charges/policies/patients.
+function computeAgingReport(charges, patientById, policies, filters) {
+  const f = filters || defaultAgingFilters();
+  const asOf = f.asOfDate || TODAY;
+  const bucketList = f.bucketFormat === "detailed" ? AGING_BUCKETS_DETAILED : AGING_BUCKETS_STANDARD;
+  const bucketFn = f.bucketFormat === "detailed" ? agingBucketDetailed : agingBucketStandard;
+
+  const minBalance = (() => {
+    switch (f.balanceMode) {
+      case "all": return null;
+      case "gt0": return 0.01;
+      case "gt10": return 10;
+      case "gt25": return 25;
+      case "gt50": return 50;
+      case "gt100": return 100;
+      case "custom": return f.balanceMin === "" ? null : Number(f.balanceMin);
+      default: return 0.01;
+    }
+  })();
+  const maxBalance = f.balanceMode === "custom" && f.balanceMax !== "" ? Number(f.balanceMax) : null;
+
+  const rows = [];
+  for (const c of charges) {
+    const bal = balanceOf(c);
+    // Zero balance: excluded unless the user opted in.
+    if (Math.abs(bal) <= BALANCE_EPSILON && !f.includeZero) continue;
+    // Credits (negative balance = overpayment): excluded unless the user opted in.
+    if (bal < -BALANCE_EPSILON && !f.includeCredits) continue;
+    // Positive balance thresholds. Credits (negatives) are always kept as credits.
+    if (bal > BALANCE_EPSILON) {
+      if (minBalance != null && bal < minBalance) continue;
+      if (maxBalance != null && bal > maxBalance) continue;
+    }
+
+    const status = chargeStatus(c);
+    if (!f.claimStatuses[status]) continue;
+
+    if (f.dosFrom && (c.dos || "") < f.dosFrom) continue;
+    if (f.dosTo && (c.dos || "") > f.dosTo) continue;
+    if (f.providerFilter && c.provider !== f.providerFilter) continue;
+    if (f.cptFilter && normCpt(c.cpt) !== normCpt(f.cptFilter)) continue;
+    if (f.locationFilter && (c.location || "") !== f.locationFilter) continue;
+    if (f.patientFilter && c.patientId !== f.patientFilter) continue;
+
+    const primary = currentPrimaryPolicy(c.patientId, policies);
+    const isInsuranceResponsibility = !!primary;
+    if (f.responsibility === "insurance" && !isInsuranceResponsibility) continue;
+    if (f.responsibility === "patient" && isInsuranceResponsibility) continue;
+
+    const insuranceName = primary ? primary.insuranceCompany : "Self-pay";
+    if (f.insuranceFilter && insuranceName !== f.insuranceFilter) continue;
+    if (f.payerFilter && insuranceName !== f.payerFilter) continue;
+
+    // Aging basis: only DOS is universally present. Fall back cleanly for the others.
+    const basisDate =
+      f.agingBasis === "claimCreated" ? (c.claimCreatedDate || c.dos) :
+      f.agingBasis === "firstSubmit" ? (c.firstSubmittedDate || c.claimCreatedDate || c.dos) :
+      f.agingBasis === "lastSubmit"  ? (c.lastSubmittedDate  || c.firstSubmittedDate || c.claimCreatedDate || c.dos) :
+      f.agingBasis === "patientResp" ? (c.patientResponsibilityDate || c.dos) :
+      c.dos;
+
+    const age = Math.max(0, daysBetween(basisDate, asOf));
+    const bucket = bucketFn(age);
+    const p = patientById[c.patientId] || null;
+
+    rows.push({
+      // Identifier fields
+      chargeId: c.id,
+      patientId: c.patientId,
+      Patient: p ? p.name : "(patient record missing)",
+      Account: p ? p.id : c.patientId,
+      DOB: p ? fmtDate(p.dob) : "",
+      Phone: p ? p.phone || "" : "",
+      SSN: p ? maskSSN(p.ssn) : "",
+      "Claim #": c.claimNumber || c.id,
+      DOS: fmtDate(c.dos),
+      _dosIso: c.dos || "",
+      CPT: c.cpt,
+      Modifier: c.modifier || "",
+      Provider: c.provider || "",
+      Location: c.location || "",
+      "Insurance name": insuranceName,
+      "Insurance ID": primary ? primary.memberId : "",
+      Responsibility: isInsuranceResponsibility ? "Insurance" : "Patient",
+      Charge: c.charge,
+      "Insurance Paid": isInsuranceResponsibility ? c.paid : 0,
+      "Patient Paid": isInsuranceResponsibility ? 0 : c.paid,
+      Paid: c.paid,
+      Adjustments: 0,
+      "Write-Off": c.writeoff,
+      Credits: c.credits || 0,
+      Balance: bal,
+      Age: age,
+      Bucket: bucket,
+      "Claim Status": status,
+      _memos: (c.memos || []).map(m => ({
+        date: fmtDate(m.date), user: m.user || "", type: m.type || "Note", text: m.text || "",
+      })),
+    });
+  }
+
+  // Sort
+  const cmp = {
+    oldest: (a, b) => b.Age - a.Age,
+    newest: (a, b) => a.Age - b.Age,
+    balanceDesc: (a, b) => b.Balance - a.Balance,
+    balanceAsc: (a, b) => a.Balance - b.Balance,
+    patient: (a, b) => (a.Patient || "").localeCompare(b.Patient || ""),
+    insurance: (a, b) => (a["Insurance name"] || "").localeCompare(b["Insurance name"] || ""),
+    provider: (a, b) => (a.Provider || "").localeCompare(b.Provider || ""),
+    dos: (a, b) => (a._dosIso || "").localeCompare(b._dosIso || ""),
+  }[f.sortBy] || ((a, b) => b.Age - a.Age);
+  rows.sort(cmp);
+
+  // Group key
+  const groupKeyFn = (r) => {
+    switch (f.groupBy) {
+      case "patient": return r.Patient;
+      case "insurance": return r["Insurance name"];
+      case "provider": return r.Provider || "(no provider)";
+      case "location": return r.Location || "(no location)";
+      case "dos": return r.DOS || "(no DOS)";
+      case "bucket": return r.Bucket;
+      case "responsibility":
+      default: return r.Responsibility;
+    }
+  };
+  rows.forEach(r => { r.Group = groupKeyFn(r); });
+
+  // Bucket totals: each balance lives in exactly one bucket - the single-return in bucketFn
+  // guarantees it, and this is where the "no double counting between buckets" invariant is enforced.
+  const buckets = Object.fromEntries(bucketList.map(b => [b, 0]));
+  for (const r of rows) buckets[r.Bucket] = (buckets[r.Bucket] || 0) + r.Balance;
+
+  const totals = {
+    total: rows.reduce((s, r) => s + r.Balance, 0),
+    insurance: rows.filter(r => r.Responsibility === "Insurance").reduce((s, r) => s + r.Balance, 0),
+    patient:   rows.filter(r => r.Responsibility === "Patient").reduce((s, r) => s + r.Balance, 0),
+    count: rows.length,
+  };
+
+  const groups = {};
+  for (const r of rows) groups[r.Group] = (groups[r.Group] || 0) + r.Balance;
+
+  return { rows, buckets, bucketList, totals, groups };
+}
+
+// The modal that opens when the user clicks Reports -> Aging Report. Nothing is generated until
+// the user clicks Run Report; Cancel restores the previous filter state untouched.
+function RunAgingReportModal({ initial, providers, insurances, locations, patients, cptCodes, onCancel, onRun }) {
+  const [f, setF] = useState(initial || defaultAgingFilters());
+  const set = (k) => (v) => setF(s => ({ ...s, [k]: v }));
+  const setEv = (k) => (e) => setF(s => ({ ...s, [k]: e.target.value }));
+  const toggleStatus = (k) => setF(s => ({ ...s, claimStatuses: { ...s.claimStatuses, [k]: !s.claimStatuses[k] } }));
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50 p-4 print:hidden">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[92vh] overflow-hidden flex flex-col">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-800">Run Aging Report</h2>
+            <p className="text-xs text-slate-500">Choose the report criteria, then click Run Report.</p>
+          </div>
+          <button onClick={onCancel} className="text-slate-400 hover:text-slate-700"><X size={18} /></button>
+        </div>
+
+        <div className="p-6 overflow-y-auto grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Field label="Aging As Of Date">
+            <input type="date" className={inputCls} value={f.asOfDate} onChange={setEv("asOfDate")} />
+          </Field>
+          <Field label="Aging Based On">
+            <select className={inputCls} value={f.agingBasis} onChange={setEv("agingBasis")}>
+              <option value="dos">Date of Service</option>
+              <option value="claimCreated">Claim Creation Date</option>
+              <option value="firstSubmit">First Submission Date</option>
+              <option value="lastSubmit">Last Submission Date</option>
+              <option value="patientResp">Patient Responsibility Date</option>
+            </select>
+          </Field>
+
+          <Field label="Responsibility">
+            <select className={inputCls} value={f.responsibility} onChange={setEv("responsibility")}>
+              <option value="all">All</option>
+              <option value="insurance">Insurance</option>
+              <option value="patient">Patient / Self Pay</option>
+            </select>
+          </Field>
+          <Field label="Aging Bucket Format">
+            <select className={inputCls} value={f.bucketFormat} onChange={setEv("bucketFormat")}>
+              <option value="standard">Standard (0-30 / 31-60 / 61-90 / 91-120 / 120+)</option>
+              <option value="detailed">Detailed (adds 121-150, 151-180, 181-365, 365+)</option>
+            </select>
+          </Field>
+
+          <Field label="Provider">
+            <select className={inputCls} value={f.providerFilter} onChange={setEv("providerFilter")}>
+              <option value="">All Providers</option>
+              {providers.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </Field>
+          <Field label="Insurance / Payer">
+            <select className={inputCls} value={f.insuranceFilter} onChange={setEv("insuranceFilter")}>
+              <option value="">All Insurance</option>
+              {insurances.map(i => <option key={i} value={i}>{i}</option>)}
+            </select>
+          </Field>
+
+          <Field label="Patient">
+            <select className={inputCls} value={f.patientFilter} onChange={setEv("patientFilter")}>
+              <option value="">All Patients</option>
+              {patients.map(p => <option key={p.id} value={p.id}>{p.name} ({p.id})</option>)}
+            </select>
+          </Field>
+          <Field label="Location">
+            <select className={inputCls} value={f.locationFilter} onChange={setEv("locationFilter")}>
+              <option value="">All Locations</option>
+              {locations.map(l => <option key={l} value={l}>{l}</option>)}
+            </select>
+          </Field>
+
+          <Field label="DOS From">
+            <input type="date" className={inputCls} value={f.dosFrom} onChange={setEv("dosFrom")} />
+          </Field>
+          <Field label="DOS To">
+            <input type="date" className={inputCls} value={f.dosTo} onChange={setEv("dosTo")} />
+          </Field>
+
+          <Field label="Procedure / CPT">
+            <select className={inputCls} value={f.cptFilter} onChange={setEv("cptFilter")}>
+              <option value="">All CPT Codes</option>
+              {cptCodes.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </Field>
+          <Field label="Balance">
+            <select className={inputCls} value={f.balanceMode} onChange={setEv("balanceMode")}>
+              <option value="all">All Balances</option>
+              <option value="gt0">Greater Than $0</option>
+              <option value="gt10">Greater Than $10</option>
+              <option value="gt25">Greater Than $25</option>
+              <option value="gt50">Greater Than $50</option>
+              <option value="gt100">Greater Than $100</option>
+              <option value="custom">Custom range</option>
+            </select>
+          </Field>
+
+          {f.balanceMode === "custom" && (
+            <>
+              <Field label="Minimum Balance">
+                <input type="number" step="0.01" className={inputCls} value={f.balanceMin} onChange={setEv("balanceMin")} placeholder="0.00" />
+              </Field>
+              <Field label="Maximum Balance">
+                <input type="number" step="0.01" className={inputCls} value={f.balanceMax} onChange={setEv("balanceMax")} placeholder="No cap" />
+              </Field>
+            </>
+          )}
+
+          <Field label="Group By">
+            <select className={inputCls} value={f.groupBy} onChange={setEv("groupBy")}>
+              <option value="responsibility">Responsibility</option>
+              <option value="patient">Patient</option>
+              <option value="insurance">Insurance</option>
+              <option value="provider">Provider</option>
+              <option value="location">Location</option>
+              <option value="dos">Date of Service</option>
+              <option value="bucket">Aging Bucket</option>
+            </select>
+          </Field>
+          <Field label="Sort By">
+            <select className={inputCls} value={f.sortBy} onChange={setEv("sortBy")}>
+              <option value="oldest">Oldest Balance First</option>
+              <option value="newest">Newest Balance First</option>
+              <option value="balanceDesc">Highest Balance</option>
+              <option value="balanceAsc">Lowest Balance</option>
+              <option value="patient">Patient Name</option>
+              <option value="insurance">Insurance Name</option>
+              <option value="provider">Provider Name</option>
+              <option value="dos">Date of Service</option>
+            </select>
+          </Field>
+
+          <div className="md:col-span-2">
+            <div className="text-xs font-medium text-slate-500 mb-1">Claim Status</div>
+            <div className="flex flex-wrap gap-3 border border-slate-200 rounded-lg p-3 bg-slate-50/60">
+              {Object.keys(f.claimStatuses).map(k => (
+                <label key={k} className="text-sm text-slate-700 flex items-center gap-2">
+                  <input type="checkbox" checked={!!f.claimStatuses[k]} onChange={() => toggleStatus(k)} />
+                  {k}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="md:col-span-2">
+            <div className="text-xs font-medium text-slate-500 mb-1">Report Type</div>
+            <div className="flex flex-wrap gap-4 border border-slate-200 rounded-lg p-3 bg-slate-50/60">
+              {[
+                { v: "summary", label: "Summary" },
+                { v: "detailed", label: "Detailed" },
+                { v: "claim", label: "Claim Detail" },
+              ].map(o => (
+                <label key={o.v} className="text-sm text-slate-700 flex items-center gap-2">
+                  <input type="radio" name="agingReportType" checked={f.reportType === o.v} onChange={() => set("reportType")(o.v)} />
+                  {o.label}
+                </label>
+              ))}
+              <label className="text-sm text-slate-700 flex items-center gap-2 ml-4">
+                <input type="checkbox" checked={f.includeZero} onChange={() => set("includeZero")(!f.includeZero)} />
+                Include Zero Balance Claims
+              </label>
+              <label className="text-sm text-slate-700 flex items-center gap-2">
+                <input type="checkbox" checked={f.includeCredits} onChange={() => set("includeCredits")(!f.includeCredits)} />
+                Include Credit Balances
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-slate-200 bg-slate-50">
+          <button onClick={onCancel} className="text-sm text-slate-600 border border-slate-200 rounded-lg px-4 py-2 hover:bg-white">Cancel</button>
+          <button onClick={() => onRun(f)} className="text-sm bg-teal-600 text-white rounded-lg px-4 py-2 hover:bg-teal-700">Run Report</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Summary/percentage cards at the top of the generated report.
+function AgingSummaryCards({ totals, buckets, bucketList }) {
+  const denom = totals.total > 0 ? totals.total : 0;
+  const pct = (v) => denom > 0 ? `${Math.round((v / denom) * 1000) / 10}%` : "0%";
+  return (
+    <div className="mb-4 print:mb-2">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+        <Card className="p-4">
+          <div className="text-xs uppercase tracking-wide text-slate-500">Total A/R</div>
+          <div className="text-2xl font-semibold text-slate-800 mt-1">{money(totals.total)}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs uppercase tracking-wide text-slate-500">Insurance A/R</div>
+          <div className="text-2xl font-semibold text-slate-800 mt-1">{money(totals.insurance)}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs uppercase tracking-wide text-slate-500">Patient A/R</div>
+          <div className="text-2xl font-semibold text-slate-800 mt-1">{money(totals.patient)}</div>
+        </Card>
+      </div>
+      <Card className="p-4">
+        <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Aging distribution</div>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+              <th className="py-2 font-medium">Bucket</th>
+              <th className="py-2 font-medium text-right">Amount</th>
+              <th className="py-2 font-medium text-right">% of A/R</th>
+            </tr>
+          </thead>
+          <tbody>
+            {bucketList.map(b => (
+              <tr key={b} className="border-b border-slate-100 last:border-0">
+                <td className="py-1.5 text-slate-700">{b}</td>
+                <td className="py-1.5 text-right font-medium text-slate-800">{money(buckets[b] || 0)}</td>
+                <td className="py-1.5 text-right text-slate-500">{pct(buckets[b] || 0)}</td>
+              </tr>
+            ))}
+            <tr>
+              <td className="py-2 font-semibold text-slate-800">Total</td>
+              <td className="py-2 text-right font-semibold text-slate-800">{money(totals.total)}</td>
+              <td className="py-2 text-right text-slate-500">100%</td>
+            </tr>
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
 // ---------- Report center: aging / debit / credit, with CSV / PDF export ----------
 
 function ReportCenter({ charges, patientById, transactions, patients, policies, batches, userAccounts, session, isOversight }) {
@@ -10078,6 +10516,11 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [showDailyTxn, setShowDailyTxn] = useState(false);
+  // Run Aging Report modal: filters live here so Cancel is truly non-destructive and Run Report
+  // simply commits the modal's state. `agingFilters` = null means "the user has not run the new
+  // report yet"; the existing quick-generate aging table above is what shows until they do.
+  const [showRunAging, setShowRunAging] = useState(false);
+  const [agingFilters, setAgingFilters] = useState(null);
   // Held here rather than inside the modal so the printable block can live outside it — the modal
   // panel is fixed and scroll-clipped, which would truncate the printout.
   const [dailyTxnResult, setDailyTxnResult] = useState(null);
@@ -10089,6 +10532,91 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
 
   // ----- Aging report -----
   const openCharges = charges.filter(c => balanceOf(c) > 0);
+
+  // Option lists for the Run Aging Report modal, derived from what's actually in the data so no
+  // dropdown value is ever a fabrication.
+  const providerOptions = useMemo(
+    () => Array.from(new Set(charges.map(c => c.provider).filter(Boolean))).sort(),
+    [charges]
+  );
+  const insuranceOptions = useMemo(
+    () => Array.from(new Set(policies.map(p => p.insuranceCompany).filter(Boolean))).sort(),
+    [policies]
+  );
+  const locationOptions = useMemo(
+    () => Array.from(new Set(charges.map(c => c.location).filter(Boolean))).sort(),
+    [charges]
+  );
+  const cptOptions = useMemo(
+    () => Array.from(new Set(charges.map(c => c.cpt).filter(Boolean))).sort(),
+    [charges]
+  );
+  const patientOptions = useMemo(
+    () => [...patients].sort((a, b) => (a.name || "").localeCompare(b.name || "")),
+    [patients]
+  );
+
+  // The generated Run-Aging report; null until Run Report has been clicked at least once.
+  const agingRun = useMemo(() => {
+    if (!agingFilters) return null;
+    return computeAgingReport(charges, patientById, policies, agingFilters);
+  }, [agingFilters, charges, patientById, policies]);
+
+  function handleRunAgingReport(filters) {
+    setAgingFilters(filters);
+    setShowRunAging(false);
+  }
+
+  function handleAgingRunCSV() {
+    if (!agingRun) return;
+    const cleaned = agingRun.rows.map(r => {
+      const out = {};
+      for (const [k, v] of Object.entries(r)) if (!k.startsWith("_")) out[k] = v;
+      return out;
+    });
+    exportCSV(`aging-report-${agingFilters.reportType}-${agingFilters.asOfDate}.csv`, cleaned);
+  }
+
+  function handleAgingRunPDF() {
+    if (!agingRun) return;
+    const result = openAgingStatementPDF({
+      rows: agingRun.rows.map(r => ({
+        ...r,
+        _activity: r._memos || [],
+      })),
+      groupTotals: agingRun.groups,
+      groupLabel: {
+        responsibility: "Responsibility", patient: "Patient", insurance: "Insurance",
+        provider: "Provider", location: "Location", dos: "Date of Service", bucket: "Aging Bucket",
+      }[agingFilters.groupBy] || "Group",
+      criteria: {
+        "Report type": `Aging — ${agingFilters.reportType}`,
+        "As-of date": fmtDate(agingFilters.asOfDate),
+        "Aging basis": {
+          dos: "Date of Service", claimCreated: "Claim Creation Date",
+          firstSubmit: "First Submission Date", lastSubmit: "Last Submission Date",
+          patientResp: "Patient Responsibility Date",
+        }[agingFilters.agingBasis] || "Date of Service",
+        "Bucket format": agingFilters.bucketFormat === "detailed" ? "Detailed" : "Standard",
+        "Responsibility": agingFilters.responsibility === "all" ? "All" : (agingFilters.responsibility === "insurance" ? "Insurance" : "Patient / Self Pay"),
+        "Provider": agingFilters.providerFilter || "All",
+        "Insurance": agingFilters.insuranceFilter || "All",
+        "Patient": agingFilters.patientFilter ? (patientById[agingFilters.patientFilter]?.name || agingFilters.patientFilter) : "All",
+        "Location": agingFilters.locationFilter || "All",
+        "CPT": agingFilters.cptFilter || "All",
+        "DOS range": `${agingFilters.dosFrom ? fmtDate(agingFilters.dosFrom) : "all"} — ${agingFilters.dosTo ? fmtDate(agingFilters.dosTo) : "all"}`,
+        "Include zero balance": agingFilters.includeZero ? "Yes" : "No",
+        "Include credit balances": agingFilters.includeCredits ? "Yes" : "No",
+        "Total A/R": money(agingRun.totals.total),
+        "Insurance A/R": money(agingRun.totals.insurance),
+        "Patient A/R": money(agingRun.totals.patient),
+        "Rows": String(agingRun.rows.length),
+        "Prepared by": session?.name || "",
+      },
+      filename: safeFilename("Aging_Report", agingFilters.reportType, agingFilters.asOfDate) + ".pdf",
+    });
+    if (result && !result.ok) alert(result.error || "Unable to generate PDF");
+  }
 
   const agingDetailRows = useMemo(() => {
     if (reportType !== "aging") return [];
@@ -10303,11 +10831,17 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
         </button>
       </div>
 
-      <div className="flex items-center gap-2 mb-3 print:hidden">
+      <div className="flex items-center gap-2 mb-3 print:hidden flex-wrap">
         <span className="text-xs text-slate-400">Quick generate:</span>
         <button onClick={() => setReportType("debit")} className={`text-xs px-3 py-1.5 rounded-lg border ${reportType === "debit" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>Debit report</button>
         <button onClick={() => setReportType("credit")} className={`text-xs px-3 py-1.5 rounded-lg border ${reportType === "credit" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>Credit report</button>
         <button onClick={() => setReportType("aging")} className={`text-xs px-3 py-1.5 rounded-lg border ${reportType === "aging" ? "bg-slate-900 text-white border-slate-900" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>Aging report</button>
+        <button
+          onClick={() => { setReportType("aging"); setShowRunAging(true); }}
+          className="text-xs px-3 py-1.5 rounded-lg border border-teal-600 bg-teal-600 text-white hover:bg-teal-700 flex items-center gap-1.5"
+        >
+          <BarChart3 size={12} /> Run Aging Report…
+        </button>
       </div>
 
       <div className="flex flex-wrap items-end gap-3 mb-4 print:hidden">
@@ -10495,7 +11029,136 @@ function ReportCenter({ charges, patientById, transactions, patients, policies, 
             </table>
           )}
         </Card>
+
+        {/* Run-Aging report output: summary cards + the picked report type. Rendered as a sibling
+            of the quick-generate table so both stay visible; the quick view was untouched. */}
+        {reportType === "aging" && agingRun && (
+          <div className="mt-6">
+            <div className="flex items-center justify-between mb-3 print:hidden">
+              <div>
+                <h3 className="font-medium text-slate-800">Aging Report — {agingFilters.reportType === "summary" ? "Summary" : agingFilters.reportType === "claim" ? "Claim Detail" : "Detailed"}</h3>
+                <p className="text-xs text-slate-500">
+                  As of {fmtDate(agingFilters.asOfDate)} · Basis: {agingFilters.agingBasis.toUpperCase()} · Responsibility: {agingFilters.responsibility}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => setShowRunAging(true)} className="text-xs border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50">Edit filters</button>
+                <button onClick={handleAgingRunCSV} className="text-xs border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50 flex items-center gap-1.5"><Download size={13} /> CSV</button>
+                <button onClick={handleAgingRunPDF} className="text-xs border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50 flex items-center gap-1.5"><Printer size={13} /> PDF</button>
+                <button onClick={() => window.print()} className="text-xs border border-slate-200 rounded-lg px-3 py-2 hover:bg-slate-50 flex items-center gap-1.5"><Printer size={13} /> Print</button>
+              </div>
+            </div>
+
+            <AgingSummaryCards totals={agingRun.totals} buckets={agingRun.buckets} bucketList={agingRun.bucketList} />
+
+            {agingFilters.reportType === "summary" && (
+              <Card className="p-4">
+                <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Group totals ({agingFilters.groupBy})</div>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+                      <th className="py-2 font-medium">Group</th>
+                      <th className="py-2 font-medium text-right">Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(agingRun.groups).sort((a, b) => b[1] - a[1]).map(([g, v]) => (
+                      <tr key={g} className="border-b border-slate-100 last:border-0">
+                        <td className="py-2 text-slate-700">{g}</td>
+                        <td className="py-2 text-right font-medium text-slate-800">{money(v)}</td>
+                      </tr>
+                    ))}
+                    {agingRun.rows.length === 0 && <tr><td colSpan={2} className="py-3 text-slate-400">No matching balances.</td></tr>}
+                  </tbody>
+                </table>
+              </Card>
+            )}
+
+            {(agingFilters.reportType === "detailed" || agingFilters.reportType === "claim") && (
+              <Card className="p-4 overflow-x-auto">
+                <table className="w-full text-sm whitespace-nowrap">
+                  <thead>
+                    <tr className="text-left text-xs text-slate-500 border-b border-slate-200">
+                      <th className="py-2 pr-3 font-medium">Patient</th>
+                      <th className="py-2 pr-3 font-medium">Account #</th>
+                      <th className="py-2 pr-3 font-medium">Claim #</th>
+                      <th className="py-2 pr-3 font-medium">DOS</th>
+                      {agingFilters.reportType === "claim" && <th className="py-2 pr-3 font-medium">CPT</th>}
+                      {agingFilters.reportType === "claim" && <th className="py-2 pr-3 font-medium">Mod</th>}
+                      <th className="py-2 pr-3 font-medium">Provider</th>
+                      <th className="py-2 pr-3 font-medium">Insurance</th>
+                      <th className="py-2 pr-3 font-medium">Responsibility</th>
+                      <th className="py-2 pr-3 font-medium text-right">Charge</th>
+                      <th className="py-2 pr-3 font-medium text-right">Ins Paid</th>
+                      <th className="py-2 pr-3 font-medium text-right">Pt Paid</th>
+                      <th className="py-2 pr-3 font-medium text-right">Write-Off</th>
+                      <th className="py-2 pr-3 font-medium text-right">Balance</th>
+                      <th className="py-2 pr-3 font-medium">Age</th>
+                      <th className="py-2 pr-3 font-medium">Bucket</th>
+                      <th className="py-2 pr-3 font-medium">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      let lastGroup = null;
+                      const out = [];
+                      agingRun.rows.forEach((r, i) => {
+                        if (r.Group !== lastGroup) {
+                          lastGroup = r.Group;
+                          out.push(
+                            <tr key={`grp-${r.Group}-${i}`} className="bg-slate-50">
+                              <td colSpan={agingFilters.reportType === "claim" ? 15 : 13} className="py-1.5 pr-3 font-medium text-slate-600 text-xs uppercase tracking-wide">{r.Group}</td>
+                              <td className="py-1.5 pr-3 text-right font-semibold text-slate-700">{money(agingRun.groups[r.Group])}</td>
+                            </tr>
+                          );
+                        }
+                        out.push(
+                          <tr key={i} className="border-b border-slate-100 last:border-0">
+                            <td className="py-2 pr-3 text-slate-700">{r.Patient}</td>
+                            <td className="py-2 pr-3 text-slate-500 text-xs">{r.Account}</td>
+                            <td className="py-2 pr-3 text-slate-500 text-xs">{r["Claim #"]}</td>
+                            <td className="py-2 pr-3 text-slate-600">{r.DOS}</td>
+                            {agingFilters.reportType === "claim" && <td className="py-2 pr-3 text-slate-600">{r.CPT}</td>}
+                            {agingFilters.reportType === "claim" && <td className="py-2 pr-3 text-slate-500">{r.Modifier || "—"}</td>}
+                            <td className="py-2 pr-3 text-slate-600">{r.Provider}</td>
+                            <td className="py-2 pr-3 text-slate-600">{r["Insurance name"]}</td>
+                            <td className="py-2 pr-3"><StatusPill status={r.Responsibility === "Insurance" ? "Open" : "Partial"} /></td>
+                            <td className="py-2 pr-3 text-right text-slate-700">{money(r.Charge)}</td>
+                            <td className="py-2 pr-3 text-right text-slate-600">{money(r["Insurance Paid"])}</td>
+                            <td className="py-2 pr-3 text-right text-slate-600">{money(r["Patient Paid"])}</td>
+                            <td className="py-2 pr-3 text-right text-slate-600">{money(r["Write-Off"])}</td>
+                            <td className={`py-2 pr-3 text-right font-medium ${r.Balance < 0 ? "text-emerald-700" : "text-rose-600"}`}>{money(r.Balance)}</td>
+                            <td className="py-2 pr-3 text-slate-600">{r.Age}d</td>
+                            <td className="py-2 pr-3 text-slate-600">{r.Bucket}</td>
+                            <td className="py-2 pr-3 text-slate-600 text-xs">{r["Claim Status"]}</td>
+                          </tr>
+                        );
+                      });
+                      return out;
+                    })()}
+                    {agingRun.rows.length === 0 && (
+                      <tr><td colSpan={agingFilters.reportType === "claim" ? 16 : 14} className="py-3 text-slate-400">No matching balances.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </Card>
+            )}
+          </div>
+        )}
       </div>
+
+      {showRunAging && (
+        <RunAgingReportModal
+          initial={agingFilters || defaultAgingFilters()}
+          providers={providerOptions}
+          insurances={insuranceOptions}
+          locations={locationOptions}
+          patients={patientOptions}
+          cptCodes={cptOptions}
+          onCancel={() => setShowRunAging(false)}
+          onRun={handleRunAgingReport}
+        />
+      )}
 
       {showDailyTxn && (
         <DailyTransactionModal
