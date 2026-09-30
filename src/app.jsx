@@ -8120,6 +8120,19 @@ function WriteOffDOSForm({ max, onSubmit }) {
   const [f, setF] = useState({ amount: "", reason: "", date: TODAY, notes: "" });
   const [error, setError] = useState("");
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  // Write-off reason catalog from Settings → Claims & Billing Settings → Write-Off Reasons.
+  // When at least one active row exists we render a select and force the biller to pick from
+  // it (deviating still possible by typing in a new one on the settings screen). If none are
+  // configured yet, the input stays free-text so existing installations keep working.
+  const [reasons, setReasons] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    api("/api/reason-codes?kind=writeoff")
+      .then((r) => { if (alive) setReasons((r?.reasons || []).filter((x) => x.active).map((x) => x.description)); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
   function submit() {
     const amt = Number(f.amount);
     if (!amt || amt <= 0) { setError("Enter a write-off amount greater than 0."); return; }
@@ -8132,7 +8145,17 @@ function WriteOffDOSForm({ max, onSubmit }) {
         <AmountField label={`Write-off amount (max ${money(max)})`} value={f.amount} onChange={set("amount")} />
         <button onClick={() => setF({ ...f, amount: String(max) })} className="h-9 mt-5 text-xs text-slate-500 border border-slate-200 rounded-lg px-2 whitespace-nowrap">Full balance</button>
       </div>
-      <Field label="Reason"><input className={inputCls} value={f.reason} onChange={set("reason")} placeholder="Contractual adjustment, timely filing, etc." /></Field>
+      <Field label="Reason">
+        {reasons.length > 0 ? (
+          <select className={inputCls} value={f.reason} onChange={set("reason")}>
+            <option value="">Choose a reason…</option>
+            {reasons.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select>
+        ) : (
+          <input className={inputCls} value={f.reason} onChange={set("reason")}
+            placeholder="Contractual adjustment, timely filing, etc." />
+        )}
+      </Field>
       <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
       <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>
       {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
