@@ -3188,11 +3188,19 @@ function ClinicApp({
     batch.commit();
   }
 
-  function generateClaimFromCharge(charge) {
+  async function generateClaimFromCharge(charge) {
     if (claims.some(c => c.chargeId === charge.id)) return;
     const primary = primaryPolicyByPatient[charge.patientId];
     const primaryDx = (charge.diagnosisCodes || []).find(d => d) || "";
-    const id = uid("CLM-7");
+    // Try the configured numbering; fall back to the existing CLM-7 pattern when no setting has
+    // been saved. Server allocates the number atomically, so two concurrent creates cannot
+    // collide.
+    let id = "";
+    try {
+      const r = await api("/api/claim-numbering/next", { method: "POST" });
+      id = (r?.claimId || "").trim();
+    } catch { /* fall through to default */ }
+    if (!id) id = uid("CLM-7");
     setDocument("claims", id, {
       id, patientId: charge.patientId, chargeId: charge.id,
       payer: primary ? primary.insuranceCompany : "Self-pay", cpt: charge.cpt, dx: primaryDx, amount: charge.charge, submitted: "", status: "Draft",
@@ -7711,7 +7719,31 @@ function DebitPostingForm({ posting, max, onSubmit }) {
   const kind = postingPayerKind(posting);
   const debitTypeOptions = kind === "insurance" ? ["Insurance Refund", "Insurance Credit Balance"] : ["Patient Refund", "Patient Credit Balance"];
   const [mode, setMode] = useState("debit"); // "debit" (reason required, keeps history) | "system" (no reason, removes the posting)
-  const [f, setF] = useState({ amount: String(max), debitType: debitTypeOptions[0], reason: debitReasons[0], date: TODAY, notes: "" });
+  // Debit reason list: the admin-configured catalog if any active rows exist, otherwise the
+  // hardcoded fallback (debitReasons) so existing installations keep working before they set
+  // one up. Fetched once per open, and re-uses the last-successful list on subsequent errors so
+  // a hiccup does not blank the picker mid-typing.
+  const [reasons, setReasons] = useState(debitReasons);
+  useEffect(() => {
+    let alive = true;
+    api("/api/reason-codes?kind=debit")
+      .then((r) => {
+        if (!alive) return;
+        const active = (r?.reasons || []).filter((x) => x.active).map((x) => x.description);
+        if (active.length > 0) setReasons(active);
+      })
+      // A caller without CLAIM_SETTINGS_MANAGE gets 403 - fine, the hardcoded fallback still works.
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  const [f, setF] = useState({ amount: String(max), debitType: debitTypeOptions[0], reason: reasons[0], date: TODAY, notes: "" });
+  // If the reasons list changes after mount and the current selection is no longer in it, snap
+  // to the first available option so the form does not submit a stale value.
+  useEffect(() => {
+    if (!reasons.includes(f.reason)) setF((prev) => ({ ...prev, reason: reasons[0] }));
+  }, [reasons]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
@@ -7774,7 +7806,7 @@ function DebitPostingForm({ posting, max, onSubmit }) {
             <select className={inputCls} value={f.debitType} onChange={set("debitType")}>{debitTypeOptions.map(o => <option key={o}>{o}</option>)}</select>
           </Field>
           <Field label="Reason">
-            <select className={inputCls} value={f.reason} onChange={set("reason")}>{debitReasons.map(r => <option key={r}>{r}</option>)}</select>
+            <select className={inputCls} value={f.reason} onChange={set("reason")}>{reasons.map(r => <option key={r}>{r}</option>)}</select>
           </Field>
           <Field label="Date"><input type="date" className={inputCls} value={f.date} onChange={set("date")} /></Field>
           <Field label="Notes"><textarea className={`${inputCls} h-16 resize-none`} value={f.notes} onChange={set("notes")} /></Field>

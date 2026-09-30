@@ -448,6 +448,12 @@ func main() {
 	mux.HandleFunc("GET /api/admin/claim-settings/{key}", s.requirePerm(PermClaimSettingsManage, s.handleClaimSettingGet))
 	mux.HandleFunc("PUT /api/admin/claim-settings/{key}", s.requirePerm(PermClaimSettingsManage, s.handleClaimSettingPut))
 	mux.HandleFunc("GET /api/admin/claim-reason-codes", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeList))
+	// Read-only, any signed-in user - so a biller opening the debit form can see the reason list
+	// without holding the admin grant. Writes stay behind CLAIM_SETTINGS_MANAGE above.
+	mux.HandleFunc("GET /api/reason-codes", s.requireAuth(s.handleReasonCodeList))
+	// Atomic claim-number allocation, so two concurrent creates cannot collide. Any signed-in
+	// user - a biller creating a claim - may call it.
+	mux.HandleFunc("POST /api/claim-numbering/next", s.requireAuth(s.handleClaimNumberingNext))
 	mux.HandleFunc("POST /api/admin/claim-reason-codes", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeCreate))
 	mux.HandleFunc("PUT /api/admin/claim-reason-codes/{id}", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeUpdate))
 	mux.HandleFunc("DELETE /api/admin/claim-reason-codes/{id}", s.requirePerm(PermClaimSettingsManage, s.handleReasonCodeDelete))

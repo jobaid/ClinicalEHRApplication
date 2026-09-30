@@ -275,6 +275,53 @@ func (s *Server) handleReasonCodeUpdate(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// POST /api/claim-numbering/next
+//
+// Atomically allocates and returns the next claim number using the claim_settings row 'claimNumbering'.
+// If no settings have been saved, returns "" so the caller can fall back to its existing id
+// generator. Kept behind requireAuth (not the admin grant) so a biller creating a claim can call
+// it; the settings themselves are still admin-only to edit.
+func (s *Server) handleClaimNumberingNext(w http.ResponseWriter, r *http.Request) {
+	// Single UPDATE ... RETURNING with jsonb_set does the read, increment, and write in one
+	// atomic statement so two concurrent claim creations cannot collide.
+	var raw []byte
+	err := s.db.QueryRow(r.Context(),
+		`UPDATE claim_settings
+		    SET value = jsonb_set(value, '{nextSequence}',
+		                          to_jsonb(COALESCE((value->>'nextSequence')::int, 1) + 1)),
+		        updated_at = now()
+		  WHERE key = 'claimNumbering'
+		 RETURNING value`).Scan(&raw)
+	if err != nil {
+		// No settings row yet - return empty so the caller uses its default generator.
+		writeJSON(w, http.StatusOK, map[string]any{"claimId": ""})
+		return
+	}
+	var cfg map[string]any
+	if json.Unmarshal(raw, &cfg) != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"claimId": ""})
+		return
+	}
+	// nextSequence now holds the ALLOCATED number + 1; the number to return is one less.
+	next, _ := cfg["nextSequence"].(float64)
+	allocated := int(next) - 1
+	prefix, _ := cfg["prefix"].(string)
+	padTo := 0
+	switch v := cfg["padTo"].(type) {
+	case float64:
+		padTo = int(v)
+	case string:
+		fmt.Sscanf(v, "%d", &padTo)
+	}
+	numStr := fmt.Sprintf("%d", allocated)
+	for len(numStr) < padTo {
+		numStr = "0" + numStr
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"claimId": prefix + numStr,
+	})
+}
+
 // DELETE /api/admin/claim-reason-codes/{id}
 //
 // Soft-delete: sets active=false. Historical rows that reference the reason keep their meaning
