@@ -2148,7 +2148,7 @@ function LoginPage({ onLogin }) {
           <div className="w-9 h-9 rounded-lg bg-teal-500 flex items-center justify-center text-white">
             <Stethoscope size={18} />
           </div>
-          <div className="text-slate-800 font-semibold text-lg">Jobaid Clinic</div>
+          <div className="text-slate-800 font-semibold text-lg">CuraNex</div>
         </div>
 
         <Card className="p-6">
@@ -3550,7 +3550,7 @@ function ClinicApp({
               <Stethoscope size={18} />
             </div>
             <div>
-              <div className="text-white font-semibold text-sm leading-tight">Obaid Clinic</div>
+              <div className="text-white font-semibold text-sm leading-tight">CuraNex</div>
               <div className="text-xs text-slate-500">Practice manager</div>
             </div>
           </div>
