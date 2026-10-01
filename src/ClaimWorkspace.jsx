@@ -535,12 +535,17 @@ export default function ClaimWorkspace({
           </Section>
 
           {/* Claim information */}
-          <Section id="claim" title="Claim Information">
+          <Section id="claim" title="Claim Information"
+            note="Prior authorization and corrected-claim fields are edited from Edit Claim on the ledger; shown here read-only so a biller can see what will print in CMS-1500 Boxes 22 and 23.">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <Row label="Claim ID" value={claim.id} />
               <Row label="Status" value={claim.status || "Draft"} />
               <Row label="Date of service" value={shortDate(draft.lines[0]?.dos)} />
               <Row label="Submitted" value={claim.submitted ? shortDate(claim.submitted) : ""} missing="Not submitted" />
+              <Row label="Authorization no. (Box 23)" value={data.authorizationNumber} missing="Not recorded" />
+              <Row label="Corrected claim code (Box 22)" value={data.correctedSubmissionCode}
+                missing="Original claim" />
+              <Row label="Original claim ref." value={data.originalClaimReference} missing="—" />
             </div>
           </Section>
 

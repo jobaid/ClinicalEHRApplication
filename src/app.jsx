@@ -7701,6 +7701,24 @@ function PerDosDetails({ charge, claims, policies, hasClaim, onGenerateClaim, on
             <div><span className="text-slate-400 text-xs block">Tax ID</span>{charge.taxId || "—"}</div>
             <div><span className="text-slate-400 text-xs block">Units / Time</span>{charge.units || 1}{charge.time ? ` · ${charge.time} min` : ""}</div>
             {charge.ndc && <div><span className="text-slate-400 text-xs block">NDC</span>{charge.ndc}</div>}
+            {(() => {
+              const mods = readModifiers(charge).filter(Boolean);
+              return mods.length > 0 ? (
+                <div className="col-span-2"><span className="text-slate-400 text-xs block">Modifiers (24D)</span>
+                  <span className="font-mono">{mods.join(" | ")}</span>
+                </div>
+              ) : null;
+            })()}
+            {charge.authorizationNumber && (
+              <div className="col-span-2"><span className="text-slate-400 text-xs block">Authorization (Box 23)</span>
+                <span className="font-mono">{charge.authorizationNumber}</span>
+              </div>
+            )}
+            {charge.correctedSubmissionCode && (
+              <div className="col-span-2"><span className="text-slate-400 text-xs block">Corrected claim (Box 22)</span>
+                <span className="font-mono">Code {charge.correctedSubmissionCode}{charge.originalClaimReference ? ` · Original ref ${charge.originalClaimReference}` : ""}</span>
+              </div>
+            )}
           </div>
           {charge.diagnosisCodes?.some(d => d) && (
             <div className="mb-1">
@@ -8247,6 +8265,7 @@ function EditClaimForm({ charge, onSubmit }) {
   const providerOptions = useProviderOptions(charge.provider);
   const npiByProvider = useNpiByProvider();
   const cptOptions = useCptOptions(charge.cpt);
+  const initialMods = readModifiers(charge);
   const [f, setF] = useState({
     dos: charge.dos, cpt: charge.cpt, provider: charge.provider, referralPhysician: charge.referralPhysician || "",
     facilityName: charge.facilityName || PRACTICE_INFO.name, facilityAddress: charge.facilityAddress || PRACTICE_INFO.address,
@@ -8256,8 +8275,17 @@ function EditClaimForm({ charge, onSubmit }) {
     // blank set otherwise, which silently dropped every code on a charge stored with any other
     // length - including the twelve a CMS-1500 carries.
     diagnosisCodes: normalizeDx(charge.diagnosisCodes),
+    // Additive fields — modifiers, authorization, corrected-claim. Each optional. Loaded from
+    // the extra JSONB the store's catch-all flattens back onto the doc.
+    mod1: initialMods[0], mod2: initialMods[1], mod3: initialMods[2],
+    authorizationNumber: charge.authorizationNumber || "",
+    correctedSubmissionCode: charge.correctedSubmissionCode || "",
+    originalClaimReference: charge.originalClaimReference || "",
   });
+  const [tab, setTab] = useState("claim"); // claim | authorization | corrected
+  const [error, setError] = useState("");
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const setMod = (k) => (e) => setF({ ...f, [k]: cleanModifier(e.target.value) });
   function setDx(i, val) {
     const next = [...f.diagnosisCodes];
     next[i] = val.toUpperCase();
@@ -8265,46 +8293,108 @@ function EditClaimForm({ charge, onSubmit }) {
   }
   function setProviderAndNPI(p) { setF({ ...f, provider: p, npi: npiByProvider[p] || f.npi }); }
   function submit() {
+    if (f.correctedSubmissionCode && !String(f.originalClaimReference || "").trim()) {
+      setError("Original Claim Reference Number is required for a corrected claim.");
+      setTab("corrected");
+      return;
+    }
+    setError("");
     const entry = cptCatalog.find(c => c.code === f.cpt);
     onSubmit({
       dos: f.dos, cpt: f.cpt, desc: entry ? entry.desc : charge.desc, provider: f.provider, referralPhysician: f.referralPhysician,
       facilityName: f.facilityName, facilityAddress: f.facilityAddress, taxId: f.taxId, npi: f.npi, ndc: f.ndc,
       units: Number(f.units) || 1, time: f.time, diagnosisCodes: f.diagnosisCodes,
+      ...packModifiers(f.mod1, f.mod2, f.mod3),
+      authorizationNumber: String(f.authorizationNumber || "").trim(),
+      correctedSubmissionCode: f.correctedSubmissionCode || "",
+      originalClaimReference: String(f.originalClaimReference || "").trim(),
     });
   }
+  const tabBtn = (id, label) => (
+    <button type="button" onClick={() => setTab(id)}
+      className={`px-3 py-1.5 text-sm border-b-2 -mb-px transition-colors ${
+        tab === id ? "border-teal-600 text-teal-700 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>
+      {label}
+    </button>
+  );
   return (
     <div>
-      <SectionTitle>Service</SectionTitle>
-      <div className="grid grid-cols-3 gap-3">
-        <Field label="Date of service"><input type="date" className={inputCls} value={f.dos} onChange={set("dos")} /></Field>
-        <Field label="CPT code">
-          <select className={inputCls} value={f.cpt} onChange={set("cpt")}>{cptOptions.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
-        </Field>
-        <Field label="Units"><input type="number" min="1" className={inputCls} value={f.units} onChange={set("units")} /></Field>
-        <Field label="Time (minutes)"><input className={inputCls} value={f.time} onChange={set("time")} /></Field>
-        <Field label="National Drug Code (NDC)"><input className={inputCls} value={f.ndc} onChange={set("ndc")} /></Field>
+      <div className="flex items-center gap-1 border-b border-slate-200 mb-3">
+        {tabBtn("claim", "Claim details")}
+        {tabBtn("authorization", "Authorization")}
+        {tabBtn("corrected", "Corrected Claim")}
       </div>
-      <SectionTitle>Providers</SectionTitle>
-      <div className="grid grid-cols-3 gap-3">
-        <Field label="Physician">
-          <select className={inputCls} value={f.provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providerOptions.map(p => <option key={p}>{p}</option>)}</select>
-        </Field>
-        <Field label="Physician NPI"><input className={inputCls} value={f.npi} onChange={set("npi")} /></Field>
-        <Field label="Referral physician"><input className={inputCls} value={f.referralPhysician} onChange={set("referralPhysician")} placeholder="Optional" /></Field>
-      </div>
-      <SectionTitle>Facility &amp; billing entity</SectionTitle>
-      <div className="grid grid-cols-3 gap-3">
-        <Field label="Practice name"><input className={inputCls} value={f.facilityName} onChange={set("facilityName")} /></Field>
-        <Field label="Facility address"><input className={inputCls} value={f.facilityAddress} onChange={set("facilityAddress")} /></Field>
-        <Field label="Tax ID"><input className={inputCls} value={f.taxId} onChange={set("taxId")} /></Field>
-      </div>
-      <SectionTitle>Diagnosis codes (ICD-10, up to 12)</SectionTitle>
-      <div className="grid grid-cols-6 gap-2 mb-3">
-        {f.diagnosisCodes.map((code, i) => (
-          <input key={i} className={`${inputCls} text-center`} value={code} onChange={(e) => setDx(i, e.target.value)} placeholder={`Dx ${i + 1}`} />
-        ))}
-      </div>
-      <p className="text-xs text-slate-400 mb-3">Changing the CPT here updates the claim's coding fields only — use "Recode" from the ledger if you also need the charge amount to change.</p>
+
+      {tab === "claim" && (
+        <>
+          <SectionTitle>Service</SectionTitle>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Date of service"><input type="date" className={inputCls} value={f.dos} onChange={set("dos")} /></Field>
+            <Field label="CPT code">
+              <select className={inputCls} value={f.cpt} onChange={set("cpt")}>{cptOptions.map(c => <option key={c.code} value={c.code}>{c.code} — {c.desc}</option>)}</select>
+            </Field>
+            <Field label="Units"><input type="number" min="1" className={inputCls} value={f.units} onChange={set("units")} /></Field>
+            <Field label="Time (minutes)"><input className={inputCls} value={f.time} onChange={set("time")} /></Field>
+            <Field label="National Drug Code (NDC)"><input className={inputCls} value={f.ndc} onChange={set("ndc")} /></Field>
+          </div>
+          <SectionTitle>Modifiers (up to 3, CMS-1500 24D)</SectionTitle>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Modifier 1" hint="Optional · 2 characters"><input className={`${inputCls} font-mono uppercase`} maxLength={2} value={f.mod1} onChange={setMod("mod1")} placeholder="e.g. 25" /></Field>
+            <Field label="Modifier 2" hint="Optional · 2 characters"><input className={`${inputCls} font-mono uppercase`} maxLength={2} value={f.mod2} onChange={setMod("mod2")} placeholder="e.g. 59" /></Field>
+            <Field label="Modifier 3" hint="Optional · 2 characters"><input className={`${inputCls} font-mono uppercase`} maxLength={2} value={f.mod3} onChange={setMod("mod3")} placeholder="e.g. LT" /></Field>
+          </div>
+          <SectionTitle>Providers</SectionTitle>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Physician">
+              <select className={inputCls} value={f.provider} onChange={(e) => setProviderAndNPI(e.target.value)}>{providerOptions.map(p => <option key={p}>{p}</option>)}</select>
+            </Field>
+            <Field label="Physician NPI"><input className={inputCls} value={f.npi} onChange={set("npi")} /></Field>
+            <Field label="Referral physician"><input className={inputCls} value={f.referralPhysician} onChange={set("referralPhysician")} placeholder="Optional" /></Field>
+          </div>
+          <SectionTitle>Facility &amp; billing entity</SectionTitle>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Practice name"><input className={inputCls} value={f.facilityName} onChange={set("facilityName")} /></Field>
+            <Field label="Facility address"><input className={inputCls} value={f.facilityAddress} onChange={set("facilityAddress")} /></Field>
+            <Field label="Tax ID"><input className={inputCls} value={f.taxId} onChange={set("taxId")} /></Field>
+          </div>
+          <SectionTitle>Diagnosis codes (ICD-10, up to 12)</SectionTitle>
+          <div className="grid grid-cols-6 gap-2 mb-3">
+            {f.diagnosisCodes.map((code, i) => (
+              <input key={i} className={`${inputCls} text-center`} value={code} onChange={(e) => setDx(i, e.target.value)} placeholder={`Dx ${i + 1}`} />
+            ))}
+          </div>
+          <p className="text-xs text-slate-400 mb-3">Changing the CPT here updates the claim's coding fields only — use "Recode" from the ledger if you also need the charge amount to change.</p>
+        </>
+      )}
+
+      {tab === "authorization" && (
+        <>
+          <SectionTitle>Prior authorization (CMS-1500 Box 23)</SectionTitle>
+          <Field label="Authorization number" hint="Optional · flows to Box 23 of the printed CMS-1500 and REF*G1 on the 837P when populated.">
+            <input className={inputCls} value={f.authorizationNumber} onChange={set("authorizationNumber")} placeholder="e.g. AUTH123456" />
+          </Field>
+          <p className="text-xs text-slate-400 mb-3">The existing per-payer &quot;Prior authorization required&quot; flag on the insurance policy is untouched — this is the actual number the payer issued for this service.</p>
+        </>
+      )}
+
+      {tab === "corrected" && (
+        <>
+          <SectionTitle>Corrected claim (CMS-1500 Box 22)</SectionTitle>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Submission code" hint="Leave blank for an original claim; pick 6/7/8 for a corrected/replacement/void.">
+              <select className={inputCls} value={f.correctedSubmissionCode} onChange={set("correctedSubmissionCode")}>
+                {CORRECTED_CLAIM_CODES.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
+              </select>
+            </Field>
+            <Field label="Original claim reference number (ICN/DCN)" hint="Required when a corrected/replacement/void code is selected.">
+              <input className={inputCls} value={f.originalClaimReference} onChange={set("originalClaimReference")} placeholder="e.g. 123456789012" />
+            </Field>
+          </div>
+          <p className="text-xs text-slate-400 mb-3">Populates Box 22 on the printed CMS-1500 and CLM05-3 / REF*F8 on the 837P. Does not change the claim number or resubmit anything on its own.</p>
+        </>
+      )}
+
+      {error && <p className="text-rose-600 text-xs mb-2">{error}</p>}
       <button onClick={submit} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700">Save claim edits</button>
     </div>
   );
@@ -8786,6 +8876,41 @@ function ManageChargeForm({ charge, onRecordPayment, onWriteOff, onRecode, onAdd
   );
 }
 
+// CMS-1500 supports up to three modifiers per service line (24D). Stored two ways so the
+// existing readers keep working: `modifiers` as a single space-joined string (which the
+// ClaimWorkspace line editor, cms1500Form.buildCms1500 and server assembleClaim already
+// consume) plus `modifier1`/`modifier2`/`modifier3` as individual keys in the charge's
+// `extra` JSONB, which is the "stored separately" requirement. Reading prefers the split
+// keys and falls back to parsing the joined string, so a charge saved before this feature
+// still loads correctly.
+function readModifiers(charge) {
+  if (!charge) return ["", "", ""];
+  if (charge.modifier1 || charge.modifier2 || charge.modifier3) {
+    return [charge.modifier1 || "", charge.modifier2 || "", charge.modifier3 || ""];
+  }
+  const parts = String(charge.modifiers || "").trim().split(/\s+/).filter(Boolean);
+  return [parts[0] || "", parts[1] || "", parts[2] || ""];
+}
+function cleanModifier(v) {
+  return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 2);
+}
+function packModifiers(m1, m2, m3) {
+  const c1 = cleanModifier(m1), c2 = cleanModifier(m2), c3 = cleanModifier(m3);
+  return {
+    modifier1: c1, modifier2: c2, modifier3: c3,
+    modifiers: [c1, c2, c3].filter(Boolean).join(" "),
+  };
+}
+// CMS-1500 Box 22 resubmission codes (X12N 837P claim frequency values). Used to identify a
+// corrected/replacement claim to the payer.
+const CORRECTED_CLAIM_CODES = [
+  { code: "", label: "— (original claim)" },
+  { code: "1", label: "1 — Original" },
+  { code: "6", label: "6 — Corrected" },
+  { code: "7", label: "7 — Replacement of prior claim" },
+  { code: "8", label: "8 — Void / Cancel of prior claim" },
+];
+
 function AddChargeForm({ onSubmit }) {
   const cptCatalog = useContext(CptCatalogContext);
   const providerOptions = useProviderOptions();
@@ -8803,6 +8928,14 @@ function AddChargeForm({ onSubmit }) {
   const [units, setUnits] = useState("1");
   const [time, setTime] = useState("");
   const [dxCodes, setDxCodes] = useState(emptyDxCodes());
+  // Additive claim fields — each optional, each stored in extra JSONB by the store's
+  // catch-all. Do not touch charge amount, adjustments, paid, or existing claim workflow.
+  const [mod1, setMod1] = useState("");
+  const [mod2, setMod2] = useState("");
+  const [mod3, setMod3] = useState("");
+  const [authorizationNumber, setAuthorizationNumber] = useState("");
+  const [correctedSubmissionCode, setCorrectedSubmissionCode] = useState("");
+  const [originalClaimReference, setOriginalClaimReference] = useState("");
   const [error, setError] = useState("");
 
   function setProviderAndNPI(p) {
@@ -8819,11 +8952,20 @@ function AddChargeForm({ onSubmit }) {
     if (!dos) { setError("Date of service is required."); return; }
     const entry = cptCatalog.find(c => c.code === cpt);
     if (!entry) { setError("Select a CPT code."); return; }
+    // Section 9 validation: corrected claims must carry an original claim reference number.
+    if (correctedSubmissionCode && !originalClaimReference.trim()) {
+      setError("Original Claim Reference Number is required for a corrected claim.");
+      return;
+    }
     setError("");
     onSubmit({
       dos, provider, referralPhysician, cpt: entry.code, desc: entry.desc, charge: entry.charge,
       facilityName, facilityAddress, taxId, npi, ndc, units: Number(units) || 1, time,
       diagnosisCodes: dxCodes,
+      ...packModifiers(mod1, mod2, mod3),
+      authorizationNumber: authorizationNumber.trim(),
+      correctedSubmissionCode,
+      originalClaimReference: originalClaimReference.trim(),
     });
   }
 
@@ -8840,6 +8982,32 @@ function AddChargeForm({ onSubmit }) {
         <Field label="Units"><input type="number" min="1" className={inputCls} value={units} onChange={(e) => setUnits(e.target.value)} /></Field>
         <Field label="Time (minutes)" hint="For time-based CPT codes"><input className={inputCls} value={time} onChange={(e) => setTime(e.target.value)} placeholder="Optional" /></Field>
         <Field label="National Drug Code (NDC)" hint="If applicable"><input className={inputCls} value={ndc} onChange={(e) => setNdc(e.target.value)} placeholder="e.g. 0069-0420-01" /></Field>
+      </div>
+
+      <SectionTitle>Modifiers (up to 3, CMS-1500 24D)</SectionTitle>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Modifier 1" hint="Optional · 2 characters"><input className={`${inputCls} font-mono uppercase`} maxLength={2} value={mod1} onChange={(e) => setMod1(cleanModifier(e.target.value))} placeholder="e.g. 25" /></Field>
+        <Field label="Modifier 2" hint="Optional · 2 characters"><input className={`${inputCls} font-mono uppercase`} maxLength={2} value={mod2} onChange={(e) => setMod2(cleanModifier(e.target.value))} placeholder="e.g. 59" /></Field>
+        <Field label="Modifier 3" hint="Optional · 2 characters"><input className={`${inputCls} font-mono uppercase`} maxLength={2} value={mod3} onChange={(e) => setMod3(cleanModifier(e.target.value))} placeholder="e.g. LT" /></Field>
+      </div>
+
+      <SectionTitle>Authorization (CMS-1500 Box 23)</SectionTitle>
+      <div className="grid grid-cols-1 gap-3">
+        <Field label="Prior authorization number" hint="Optional · flows to Box 23 of the printed CMS-1500 and REF*G1 on the 837P.">
+          <input className={inputCls} value={authorizationNumber} onChange={(e) => setAuthorizationNumber(e.target.value)} placeholder="e.g. AUTH123456" />
+        </Field>
+      </div>
+
+      <SectionTitle>Corrected Claim (CMS-1500 Box 22)</SectionTitle>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Submission code" hint="Leave blank for an original claim; pick 6/7/8 for a corrected/replacement/void.">
+          <select className={inputCls} value={correctedSubmissionCode} onChange={(e) => setCorrectedSubmissionCode(e.target.value)}>
+            {CORRECTED_CLAIM_CODES.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Original claim reference number (ICN/DCN)" hint="Required when a corrected/replacement/void code is selected.">
+          <input className={inputCls} value={originalClaimReference} onChange={(e) => setOriginalClaimReference(e.target.value)} placeholder="e.g. 123456789012" />
+        </Field>
       </div>
 
       <SectionTitle>Providers</SectionTitle>

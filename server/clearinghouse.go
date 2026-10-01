@@ -110,7 +110,12 @@ type claimServiceLine struct {
 	LineNo         int
 	DOS            string
 	CPT            string
+	// Modifiers is the CMS-1500 24D value, space-joined for the paper form. The individual
+	// slots below are what the 837P SV1-01-3/4/5/6 fields need one-per-position.
 	Modifiers      string
+	Modifier1      string
+	Modifier2      string
+	Modifier3      string
 	PlaceOfService string
 	DiagnosisPtr   string
 	Units          float64
@@ -152,6 +157,14 @@ type claimForTransmit struct {
 
 	// TotalCharges is computed on the server from the charge rows, never accepted from a client.
 	TotalCharges float64
+
+	// Populated from the anchor charge's extra fields. Optional throughout: an original claim
+	// with no prior-auth and no resubmission simply leaves them empty. Consumed by the CMS-1500
+	// renderer (Box 22 / Box 23) and by an 837P integration (REF*G1 for prior auth, CLM05-3 and
+	// REF*F8 for the resubmission code / original claim ref).
+	AuthorizationNumber       string
+	CorrectedSubmissionCode   string
+	OriginalClaimReference    string
 }
 
 // ---------- the default implementation ----------

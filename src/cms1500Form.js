@@ -57,6 +57,11 @@ export const CMS1500_FIELDS = [
   F("14", "Date of current illness", 0.34, 5.66, 1.3),
   F("17", "Referring provider", 0.55, 6.03, 2.6),
   F("17b", "Referring provider NPI", 3.42, 6.03, 1.5),
+  // Box 22: resubmission code + original reference number. Sits above the diagnosis grid.
+  F("22-code", "Resubmission code", 5.55, 6.40, 0.6),
+  F("22-orig", "Original reference no.", 6.30, 6.40, 1.7),
+  // Box 23: prior authorization number (or CLIA / mammography cert, depending on payer).
+  F("23", "Prior authorization number", 5.55, 6.78, 2.4),
   F("21a", "Diagnosis A", 0.62, 6.78, 0.9),
   F("21b", "Diagnosis B", 2.12, 6.78, 0.9),
   F("21c", "Diagnosis C", 3.62, 6.78, 0.9),
@@ -129,9 +134,19 @@ export function buildCms1500({ charges, patient, policy, practice }) {
   const first = lines[0] || {};
   const dx = (first.diagnosisCodes || []).filter(Boolean);
 
+  // Box 22 / Box 23: corrected-claim submission and prior-auth. Sourced from the anchor
+  // charge (which is what assembleClaim also reads for the electronic claim), so screen,
+  // print and 837P describe the same claim. Values are optional and only appear when set.
+  const corrCode = first.correctedSubmissionCode || "";
+  const corrRef = first.originalClaimReference || "";
+  const authNo = first.authorizationNumber || "";
+
   const boxes = {
     "1": (policy?.insuranceType || "").toUpperCase(),
     "1a": policy?.memberId || "",
+    "22-code": corrCode,
+    "22-orig": corrRef,
+    "23": authNo,
     "2": patient?.name || "",
     "3-dob": yyyymmdd(patient?.dob),
     "3-sex": (patient?.extra?.sex || "").slice(0, 1).toUpperCase(),
@@ -171,7 +186,12 @@ export function buildCms1500({ charges, patient, policy, practice }) {
     dosTo: yyyymmdd(c.dos),
     pos: c.placeOfService || "11",       // 11 = office, the practice's default setting
     cpt: c.cpt || "",
-    mod: c.modifiers || "",
+    // 24D modifiers: up to three, printed space-joined. Prefer the split modifier1/2/3
+    // stored separately on the charge (the "stored separately" requirement); fall back to
+    // the legacy single `modifiers` string so pre-existing charges keep printing correctly.
+    mod: (c.modifier1 || c.modifier2 || c.modifier3)
+      ? [c.modifier1, c.modifier2, c.modifier3].filter(Boolean).join(" ")
+      : (c.modifiers || ""),
     // Pointer letters for the diagnoses this line actually references. Defaults to A when the
     // charge carries no explicit pointer, which is the common single-diagnosis case.
     pointer: c.diagnosisPointer || (dx.length ? "A" : ""),

@@ -72,15 +72,22 @@ func (s *Server) assembleClaim(ctx context.Context, claimID string) (claimForTra
 			&c.PatientCity, &c.PatientState, &c.PatientZip, &c.PatientSex)
 
 	// The anchor charge decides the date of service, the provider and facility identifiers, and
-	// which insurance policy the claim is being billed to.
+	// which insurance policy the claim is being billed to. The three additive fields
+	// (authorization number, corrected-claim submission code, original claim reference number)
+	// live in `extra` JSONB - stored there by the schemaless catch-all so no migration is
+	// needed - and are optional throughout.
 	var dos, insuranceID string
 	_ = s.db.QueryRow(ctx,
 		`SELECT coalesce(dos,''), coalesce(provider,''), coalesce(referral_physician,''),
 		        coalesce(facility_name,''), coalesce(facility_address,''),
-		        coalesce(tax_id,''), coalesce(npi,''), coalesce(charge_insurance_id,'')
+		        coalesce(tax_id,''), coalesce(npi,''), coalesce(charge_insurance_id,''),
+		        coalesce(extra->>'authorizationNumber',''),
+		        coalesce(extra->>'correctedSubmissionCode',''),
+		        coalesce(extra->>'originalClaimReference','')
 		   FROM charges WHERE id = $1`, chargeID).
 		Scan(&dos, &c.BillingProviderName, &c.ReferringProvider,
-			&c.FacilityName, &c.FacilityAddress, &c.TaxID, &c.BillingNPI, &insuranceID)
+			&c.FacilityName, &c.FacilityAddress, &c.TaxID, &c.BillingNPI, &insuranceID,
+			&c.AuthorizationNumber, &c.CorrectedSubmissionCode, &c.OriginalClaimReference)
 
 	// The policy the charge was assigned to, falling back to the patient's active primary. Read,
 	// never created: a claim never adds an insurance record.
@@ -123,10 +130,14 @@ func (s *Server) assembleClaim(ctx context.Context, claimID string) (claimForTra
 	}
 
 	// Service lines: every charge for this patient on this date of service, oldest id first so the
-	// line order is stable between a preview and the print that follows it.
+	// line order is stable between a preview and the print that follows it. Each line pulls
+	// modifier1/2/3 (the "store separately" fields) as well as the legacy single `modifiers`
+	// string so a charge stored before the three-modifier UI shipped still carries its 24D value.
 	rows, err := s.db.Query(ctx,
 		`SELECT id, coalesce(dos,''), coalesce(cpt,''), coalesce(units,1), coalesce(charge,0),
 		        coalesce(npi,''), coalesce(provider,''), coalesce(extra->>'modifiers',''),
+		        coalesce(extra->>'modifier1',''), coalesce(extra->>'modifier2',''),
+		        coalesce(extra->>'modifier3',''),
 		        coalesce(extra->>'placeOfService',''), coalesce(extra->>'diagnosisPointer','')
 		   FROM charges
 		  WHERE patient_id = $1 AND dos = $2
@@ -135,9 +146,9 @@ func (s *Server) assembleClaim(ctx context.Context, claimID string) (claimForTra
 		defer rows.Close()
 		n := 0
 		for rows.Next() {
-			var id, ldos, cpt, npi, prov, mods, pos, ptr string
+			var id, ldos, cpt, npi, prov, mods, m1, m2, m3, pos, ptr string
 			var units, amount float64
-			if rows.Scan(&id, &ldos, &cpt, &units, &amount, &npi, &prov, &mods, &pos, &ptr) != nil {
+			if rows.Scan(&id, &ldos, &cpt, &units, &amount, &npi, &prov, &mods, &m1, &m2, &m3, &pos, &ptr) != nil {
 				continue
 			}
 			n++
@@ -147,8 +158,22 @@ func (s *Server) assembleClaim(ctx context.Context, claimID string) (claimForTra
 			if ptr == "" && len(c.DiagnosisCodes) > 0 {
 				ptr = "A"
 			}
+			// Prefer the split modifier1/2/3 when present (what the Add/Edit charge form writes
+			// now); fall back to the single `modifiers` string for charges saved before that.
+			combined := mods
+			if m1 != "" || m2 != "" || m3 != "" {
+				parts := []string{}
+				for _, p := range []string{m1, m2, m3} {
+					if p != "" {
+						parts = append(parts, p)
+					}
+				}
+				combined = strings.Join(parts, " ")
+			}
 			c.ServiceLines = append(c.ServiceLines, claimServiceLine{
-				LineNo: n, DOS: ldos, CPT: cpt, Modifiers: mods, PlaceOfService: pos,
+				LineNo: n, DOS: ldos, CPT: cpt,
+				Modifiers: combined, Modifier1: m1, Modifier2: m2, Modifier3: m3,
+				PlaceOfService: pos,
 				DiagnosisPtr: ptr, Units: units, Charge: amount,
 				RenderingNPI: npi, Provider: prov,
 			})
@@ -430,7 +455,9 @@ func (s *Server) handleClaimHCFA(w http.ResponseWriter, r *http.Request) {
 	lines := make([]map[string]any, 0, len(c.ServiceLines))
 	for _, l := range c.ServiceLines {
 		lines = append(lines, map[string]any{
-			"lineNo": l.LineNo, "dos": l.DOS, "cpt": l.CPT, "modifiers": l.Modifiers,
+			"lineNo": l.LineNo, "dos": l.DOS, "cpt": l.CPT,
+			"modifiers": l.Modifiers,
+			"modifier1": l.Modifier1, "modifier2": l.Modifier2, "modifier3": l.Modifier3,
 			"placeOfService": l.PlaceOfService, "diagnosisPointer": l.DiagnosisPtr,
 			"units": l.Units, "charge": l.Charge, "renderingNpi": l.RenderingNPI,
 			"provider": l.Provider,
@@ -454,6 +481,10 @@ func (s *Server) handleClaimHCFA(w http.ResponseWriter, r *http.Request) {
 		"diagnosisCodes": c.DiagnosisCodes,
 		"serviceLines":   lines,
 		"totalCharges":   c.TotalCharges,
+		// CMS-1500 Box 22 / Box 23 anchor-charge fields. Empty strings when not set.
+		"authorizationNumber":     c.AuthorizationNumber,
+		"correctedSubmissionCode": c.CorrectedSubmissionCode,
+		"originalClaimReference":  c.OriginalClaimReference,
 	})
 }
 
