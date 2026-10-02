@@ -1679,6 +1679,20 @@ function Card({ children, className = "" }) {
   return <div className={`bg-white border border-slate-200 rounded-xl ${className}`}>{children}</div>;
 }
 
+// CuraNex mark: four circular lobes in a plus/cross with a filled centre. Inherits currentColor
+// so each caller just sets a text color class.
+function CuraNexMark({ size = 32, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" className={className} aria-hidden="true">
+      <circle cx="16" cy="7" r="6" fill="currentColor" />
+      <circle cx="25" cy="16" r="6" fill="currentColor" />
+      <circle cx="16" cy="25" r="6" fill="currentColor" />
+      <circle cx="7" cy="16" r="6" fill="currentColor" />
+      <circle cx="16" cy="16" r="4.5" fill="currentColor" />
+    </svg>
+  );
+}
+
 // `size` is an optional Tailwind max-width escape hatch for reports that need more room than
 // `wide` gives; omitting it keeps the original md/2xl behaviour every existing caller relies on.
 function Modal({ title, onClose, children, wide, size }) {
@@ -2148,10 +2162,8 @@ function LoginPage({ onLogin }) {
         <div className="relative hidden md:flex flex-col justify-between p-10 bg-gradient-to-br from-teal-50 via-cyan-50 to-teal-100/70 overflow-hidden">
           <ShieldCheck size={140} className="absolute -top-8 -right-8 text-teal-200/50" aria-hidden />
           <div className="relative flex items-center gap-2.5 z-10">
-            <div className="w-11 h-11 rounded-xl bg-teal-600 flex items-center justify-center text-white shadow-md">
-              <Stethoscope size={22} />
-            </div>
-            <div className="text-teal-900 font-bold text-xl tracking-tight">CuraNex</div>
+            <CuraNexMark size={36} className="text-teal-600" />
+            <div className="text-teal-700 font-bold text-2xl tracking-tight">CuraNex</div>
           </div>
 
           <div className="relative py-10 flex items-center justify-center">
@@ -2178,8 +2190,8 @@ function LoginPage({ onLogin }) {
         {/* Form panel */}
         <div className="p-7 sm:p-10 flex flex-col justify-center">
           <div className="md:hidden flex items-center gap-2 mb-6">
-            <div className="w-9 h-9 rounded-lg bg-teal-600 flex items-center justify-center text-white"><Stethoscope size={18} /></div>
-            <div className="text-slate-800 font-semibold text-lg">CuraNex</div>
+            <CuraNexMark size={28} className="text-teal-600" />
+            <div className="text-teal-700 font-bold text-lg tracking-tight">CuraNex</div>
           </div>
 
           <h1 className="text-3xl font-bold text-slate-900 tracking-tight">Welcome back</h1>
@@ -3584,9 +3596,7 @@ function ClinicApp({
       <header className="bg-slate-900 text-slate-300 shrink-0">
         <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-teal-500 flex items-center justify-center text-white">
-              <Stethoscope size={18} />
-            </div>
+            <CuraNexMark size={30} className="text-teal-400" />
             <div>
               <div className="text-white font-semibold text-sm leading-tight">CuraNex</div>
               <div className="text-xs text-slate-500">Practice manager</div>
