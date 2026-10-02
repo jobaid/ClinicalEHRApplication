@@ -2142,99 +2142,137 @@ function LoginPage({ onLogin }) {
   }
 
   return (
-    <div className="min-h-[700px] bg-slate-50 flex items-center justify-center p-6 font-sans">
-      <div className="w-full max-w-sm">
-        <div className="flex items-center gap-2 justify-center mb-6">
-          <div className="w-9 h-9 rounded-lg bg-teal-500 flex items-center justify-center text-white">
-            <Stethoscope size={18} />
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-teal-50/50 flex items-center justify-center p-4 sm:p-6 font-sans">
+      <div className="w-full max-w-5xl bg-white rounded-2xl shadow-xl border border-slate-200/80 overflow-hidden grid md:grid-cols-2">
+        {/* Branding panel */}
+        <div className="relative hidden md:flex flex-col justify-between p-10 bg-gradient-to-br from-teal-50 via-cyan-50 to-teal-100/70 overflow-hidden">
+          <ShieldCheck size={140} className="absolute -top-8 -right-8 text-teal-200/50" aria-hidden />
+          <div className="relative flex items-center gap-2.5 z-10">
+            <div className="w-11 h-11 rounded-xl bg-teal-600 flex items-center justify-center text-white shadow-md">
+              <Stethoscope size={22} />
+            </div>
+            <div className="text-teal-900 font-bold text-xl tracking-tight">CuraNex</div>
           </div>
-          <div className="text-slate-800 font-semibold text-lg">CuraNex</div>
+
+          <div className="relative py-10 flex items-center justify-center">
+            <div className="absolute w-72 h-72 rounded-full border border-teal-200/70" />
+            <div className="absolute w-56 h-56 rounded-full border border-dashed border-teal-300/60" />
+            <div className="absolute w-40 h-40 rounded-full bg-white/40 backdrop-blur-sm" />
+            <div className="relative grid grid-cols-3 gap-4 w-64 place-items-center">
+              <div className="col-start-2 w-12 h-12 rounded-full bg-white shadow-sm flex items-center justify-center text-teal-600"><Users size={20} /></div>
+              <div className="w-12 h-12 rounded-full bg-white shadow-sm flex items-center justify-center text-teal-600"><Activity size={20} /></div>
+              <div className="col-span-3 flex items-center justify-center">
+                <div className="w-20 h-20 rounded-2xl bg-white shadow-lg flex items-center justify-center text-teal-600"><HeartPulse size={34} /></div>
+              </div>
+              <div className="w-12 h-12 rounded-full bg-white shadow-sm flex items-center justify-center text-teal-600"><Shield size={20} /></div>
+              <div className="col-start-2 w-12 h-12 rounded-full bg-white shadow-sm flex items-center justify-center text-teal-600"><FileText size={20} /></div>
+            </div>
+          </div>
+
+          <div className="relative z-10">
+            <p className="text-teal-900 font-semibold text-base">Practice management &amp; billing</p>
+            <p className="text-teal-700/80 text-xs mt-1 leading-relaxed">Secure, HIPAA-aware access for your care team.</p>
+          </div>
         </div>
 
-        <Card className="p-6">
-          <h1 className="text-lg font-semibold text-slate-800 mb-1">Sign in</h1>
-          <p className="text-xs text-slate-500 mb-5">Practice management &amp; billing</p>
+        {/* Form panel */}
+        <div className="p-7 sm:p-10 flex flex-col justify-center">
+          <div className="md:hidden flex items-center gap-2 mb-6">
+            <div className="w-9 h-9 rounded-lg bg-teal-600 flex items-center justify-center text-white"><Stethoscope size={18} /></div>
+            <div className="text-slate-800 font-semibold text-lg">CuraNex</div>
+          </div>
 
-          <form onSubmit={submit}>
-            <Field label="Email">
-              <input type="email" required className={inputCls} value={email}
-                onChange={(e) => setEmail(e.target.value)} placeholder="you@medbill.local"
+          <h1 className="text-3xl font-bold text-slate-900 tracking-tight">Welcome back</h1>
+          <p className="text-sm text-slate-500 mt-1.5 mb-7">Sign in to continue to your dashboard</p>
+
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label htmlFor="login-email" className="block text-sm font-medium text-slate-700 mb-1.5">Email address</label>
+              <input id="login-email" type="email" required
+                className="w-full border border-slate-200 rounded-lg px-3.5 py-2.5 text-sm bg-slate-50/60 focus:bg-white focus:outline-none focus:ring-2 focus:ring-teal-500/40 focus:border-teal-500 transition"
+                value={email} onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@medbill.local"
                 name="username" autoComplete="username" autoFocus />
-            </Field>
-            <Field label="Password">
+            </div>
+
+            <div>
+              <label htmlFor="login-password" className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
               <div className="relative">
-                <input type={showPassword ? "text" : "password"} required className={`${inputCls} pr-16`}
-                  value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••"
-                  name="password" autoComplete="current-password"
-                  // The accessible name a screen reader announces. The surrounding <label> wraps
-                  // both this input and the Show button, so implicit association does not apply
-                  // and without this the field is announced as an unlabelled text box.
-                  aria-label="Password" />
-                <button type="button" onClick={() => setShowPassword(s => !s)} className="absolute right-2 top-1.5 text-xs text-slate-400 hover:text-slate-600 px-2 py-1">
-                  {showPassword ? "Hide" : "Show"}
+                <input id="login-password" type={showPassword ? "text" : "password"} required
+                  className="w-full border border-slate-200 rounded-lg px-3.5 py-2.5 pr-11 text-sm bg-slate-50/60 focus:bg-white focus:outline-none focus:ring-2 focus:ring-teal-500/40 focus:border-teal-500 transition"
+                  value={password} onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  name="password" autoComplete="current-password" aria-label="Password" />
+                <button type="button" onClick={() => setShowPassword(s => !s)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-teal-600 p-1.5 rounded-md transition"
+                  aria-label={showPassword ? "Hide password" : "Show password"}>
+                  <Eye size={16} />
                 </button>
               </div>
-            </Field>
-            <div className="flex items-center justify-between mb-4">
-              <label className="flex items-center gap-2 text-xs text-slate-500">
-                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)}
-                  name="remember" /> Remember me
-              </label>
-              <button type="button" className="text-xs text-teal-700 hover:underline">Forgot password?</button>
             </div>
-            {error && <p className="text-rose-600 text-xs mb-3">{error}</p>}
-            <button type="submit" disabled={loading} className="w-full bg-teal-600 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-700 disabled:opacity-60">
+
+            <div className="flex items-center justify-between pt-1">
+              <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500" name="remember" />
+                Remember me
+              </label>
+              <button type="button" className="text-sm text-teal-700 font-medium hover:underline">Forgot password?</button>
+            </div>
+
+            {error && (
+              <div className="flex items-start gap-2 text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2 text-xs">
+                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <button type="submit" disabled={loading}
+              className="w-full bg-teal-600 text-white text-sm font-semibold py-2.5 rounded-lg hover:bg-teal-700 disabled:opacity-60 shadow-sm transition">
               {loading ? "Signing in…" : "Sign in"}
             </button>
           </form>
-        </Card>
 
-        {demo?.enabled && (
-          <Card className="p-4 mt-4 border-teal-200 bg-teal-50/70">
-            <div className="flex items-center gap-1.5 mb-0.5">
-              <Eye size={13} className="text-teal-700" />
-              <p className="text-xs font-semibold text-teal-900">Demo Access</p>
-            </div>
-            <p className="text-[11px] text-teal-700 mb-3">
-              {demo.name} &middot; {ROLE_LABELS[demo.role] || demo.role} role
-            </p>
-
-            <div className="space-y-1.5 mb-3">
-              <CredentialRow label="Username" value={demo.email} field="u" copied={copied} onCopy={copyValue} />
-              <CredentialRow label="Password" value={demo.password} field="p" copied={copied} onCopy={copyValue} />
-            </div>
-
-            <button
-              type="button"
-              onClick={() => loginWith(demo.email, demo.password)}
-              disabled={loading}
-              className="w-full bg-teal-700 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-800 disabled:opacity-60"
-            >
-              {loading ? "Signing in…" : "Login as Demo User"}
-            </button>
-
-            <p className="text-[11px] text-teal-700 mt-2 leading-relaxed">
-              {demo.notice || "This account is for demonstration purposes only."}{" "}
-              It signs in through the same API as every other account, and is the only account
-              exempt from authenticator verification.
-            </p>
-          </Card>
-        )}
-
-        {SHOW_DEMO_LOGINS && (
-        <Card className="p-4 mt-4 bg-amber-50 border-amber-200">
-          <p className="text-xs font-medium text-amber-800 mb-2 flex items-center gap-1.5"><AlertTriangle size={13} /> Development-only credentials</p>
-          <div className="space-y-1 text-xs text-amber-700">
-            {DEMO_LOGIN_HINTS.map(u => (
-              <div key={u.email} className="flex justify-between">
-                <span>{ROLE_LABELS[u.role]}</span>
-                <button onClick={() => { setEmail(u.email); setPassword(u.password); }} className="underline hover:no-underline">{u.email}</button>
+          {demo?.enabled && (
+            <div className="mt-6 rounded-xl border border-teal-200 bg-teal-50/60 p-4">
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <Eye size={13} className="text-teal-700" />
+                <p className="text-xs font-semibold text-teal-900">Demo Access</p>
               </div>
-            ))}
-          </div>
-          <p className="text-[11px] text-amber-600 mt-2">Seeded by scripts/seedFirestore.mjs and shown only in development builds. Sign-in still goes through the API, not this list.</p>
-        </Card>
-        )}
+              <p className="text-[11px] text-teal-700 mb-3">
+                {demo.name} &middot; {ROLE_LABELS[demo.role] || demo.role} role
+              </p>
+              <div className="space-y-1.5 mb-3">
+                <CredentialRow label="Username" value={demo.email} field="u" copied={copied} onCopy={copyValue} />
+                <CredentialRow label="Password" value={demo.password} field="p" copied={copied} onCopy={copyValue} />
+              </div>
+              <button type="button" onClick={() => loginWith(demo.email, demo.password)} disabled={loading}
+                className="w-full bg-teal-700 text-white text-sm font-medium py-2 rounded-lg hover:bg-teal-800 disabled:opacity-60">
+                {loading ? "Signing in…" : "Login as Demo User"}
+              </button>
+              <p className="text-[11px] text-teal-700 mt-2 leading-relaxed">
+                {demo.notice || "This account is for demonstration purposes only."}{" "}
+                It signs in through the same API as every other account, and is the only account
+                exempt from authenticator verification.
+              </p>
+            </div>
+          )}
+
+          {SHOW_DEMO_LOGINS && (
+            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+              <p className="text-xs font-medium text-amber-800 mb-2 flex items-center gap-1.5"><AlertTriangle size={13} /> Development-only credentials</p>
+              <div className="space-y-1 text-xs text-amber-700">
+                {DEMO_LOGIN_HINTS.map(u => (
+                  <div key={u.email} className="flex justify-between">
+                    <span>{ROLE_LABELS[u.role]}</span>
+                    <button onClick={() => { setEmail(u.email); setPassword(u.password); }} className="underline hover:no-underline">{u.email}</button>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-amber-600 mt-2">Seeded by scripts/seedFirestore.mjs and shown only in development builds. Sign-in still goes through the API, not this list.</p>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
