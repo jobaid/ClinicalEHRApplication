@@ -5858,6 +5858,10 @@ function ManualPosting({ charges, claims, patients, patientById, policies, onPos
   const [reference, setReference] = useState("");
   const [paymentAmount, setPaymentAmount] = useState("");
   const [postDate, setPostDate] = useState(TODAY);
+  // The insurance this payment is from. Gates patient search: no patient list is shown until a
+  // biller picks an insurance, and only patients with an active policy under that payer are
+  // offered. "self" is the self-pay / patient-paid value. "" means not selected yet.
+  const [insuranceFilter, setInsuranceFilter] = useState("");
 
   // ----- patient selection -----
   const [search, setSearch] = useState("");
@@ -5879,20 +5883,54 @@ function ManualPosting({ charges, claims, patients, patientById, policies, onPos
   const openCharges = useMemo(() => charges.filter(c => balanceOf(c) > BALANCE_EPSILON), [charges]);
 
   const query = search.trim().toLowerCase();
+
+  // Distinct insurances the Manual Post picker offers — any company that has at least one active
+  // policy on file. Keyed by lowercased name so "Aetna" and "aetna" collapse to one option.
+  const insuranceOptions = useMemo(() => {
+    const map = new Map();
+    (policies || []).forEach(pol => {
+      if (!pol || pol.status !== "Active" || !pol.insuranceCompany) return;
+      const key = pol.insuranceCompany.trim().toLowerCase();
+      if (!map.has(key)) map.set(key, pol.insuranceCompany.trim());
+    });
+    return Array.from(map.values()).sort((a, b) => a.localeCompare(b));
+  }, [policies]);
+
+  // Patient ids eligible for the selected insurance. Match on insurance company name
+  // (case-insensitive) against each patient's ACTIVE policies — a terminated policy under the
+  // same payer does not qualify. For "self", eligibility is patients whose open charges have no
+  // insuranceId (i.e. self-pay charges).
+  const eligiblePatientIds = useMemo(() => {
+    if (!insuranceFilter) return null; // null = no filter, caller must gate on this
+    if (insuranceFilter === "self") {
+      const ids = new Set();
+      openCharges.forEach(c => { if (!c.insuranceId) ids.add(c.patientId); });
+      return ids;
+    }
+    const target = insuranceFilter.trim().toLowerCase();
+    const ids = new Set();
+    (policies || []).forEach(pol => {
+      if (!pol || pol.status !== "Active" || !pol.insuranceCompany) return;
+      if (pol.insuranceCompany.trim().toLowerCase() === target) ids.add(pol.patientId);
+    });
+    return ids;
+  }, [insuranceFilter, policies, openCharges]);
+
   const patientMatches = useMemo(() => {
+    if (!insuranceFilter || !eligiblePatientIds) return [];
     if (!query) return [];
     // Only patients who actually have something postable are offered, so selecting one can never
     // lead to an empty list for a reason the biller cannot see.
     const withOpen = new Set(openCharges.map(c => c.patientId));
     return (patients || [])
-      .filter(p => withOpen.has(p.id))
+      .filter(p => withOpen.has(p.id) && eligiblePatientIds.has(p.id))
       .filter(p =>
         (p.name || "").toLowerCase().includes(query) ||
         (p.id || "").toLowerCase().includes(query) ||
         (p.dob || "").includes(query) ||
         (p.phone || "").replace(/\D/g, "").includes(query.replace(/\D/g, "") || "no-match"))
       .slice(0, 25);
-  }, [query, patients, openCharges]);
+  }, [query, patients, openCharges, insuranceFilter, eligiblePatientIds]);
 
   const patient = patientId ? patientById[patientId] : null;
 
@@ -6023,7 +6061,7 @@ function ManualPosting({ charges, claims, patients, patientById, policies, onPos
   }
 
   function resetPaymentSource() {
-    setReference(""); setPaymentAmount(""); setPostedLines([]); setPatientId(null); setSearch("");
+    setReference(""); setPaymentAmount(""); setPostedLines([]); setPatientId(null); setSearch(""); setInsuranceFilter("");
   }
 
   return (
@@ -6031,10 +6069,18 @@ function ManualPosting({ charges, claims, patients, patientById, policies, onPos
       {/* ---------- 1. payment source ---------- */}
       <Card className="p-4 mb-4">
         <SectionTitle>Payment source</SectionTitle>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
           <Field label="Payment type">
             <select className={inputCls} value={paymentType} onChange={(e) => { setPaymentType(e.target.value); setReference(""); }}>
               {MANUAL_PAYMENT_TYPES.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </select>
+          </Field>
+          <Field label="Insurance" hint="Required. Only patients with an active policy under this payer will be searchable.">
+            <select className={inputCls} value={insuranceFilter}
+              onChange={(e) => { setInsuranceFilter(e.target.value); setPatientId(null); setSearch(""); }}>
+              <option value="">— Select insurance —</option>
+              {insuranceOptions.map(name => <option key={name} value={name}>{name}</option>)}
+              <option value="self">Self / Patient payment</option>
             </select>
           </Field>
           <Field
@@ -6113,17 +6159,23 @@ function ManualPosting({ charges, claims, patients, patientById, policies, onPos
             <Search size={15} className="absolute left-3 top-2.5 text-slate-400" />
             <input
               value={search} onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search patient by name, account number, date of birth, or phone"
-              className={`${inputCls} pl-9`}
+              placeholder={insuranceFilter ? "Search patient by name, account number, date of birth, or phone" : "Select an insurance first"}
+              className={`${inputCls} pl-9 ${!insuranceFilter ? "bg-slate-50 cursor-not-allowed" : ""}`}
+              disabled={!insuranceFilter}
             />
           </div>
 
-          {!query ? (
+          {!insuranceFilter ? (
+            <div className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 flex items-center gap-2">
+              <AlertCircle size={16} className="shrink-0 text-amber-600" />
+              Please select an Insurance before searching for a patient.
+            </div>
+          ) : !query ? (
             <SearchFirstPrompt
               icon={Search}
-              total={new Set(openCharges.map(c => c.patientId)).size}
-              noun={{ one: "patient with open claims", many: "patients with open claims" }}
-              hint="Find the patient this payment belongs to. Only patients with unpaid or partially paid claims are listed."
+              total={eligiblePatientIds ? Array.from(eligiblePatientIds).filter(id => openCharges.some(c => c.patientId === id)).length : 0}
+              noun={{ one: `patient with open claims under ${insuranceFilter === "self" ? "self-pay" : insuranceFilter}`, many: `patients with open claims under ${insuranceFilter === "self" ? "self-pay" : insuranceFilter}` }}
+              hint={`Showing only patients with an active ${insuranceFilter === "self" ? "self-pay charge" : `policy under ${insuranceFilter}`}.`}
             />
           ) : (
             <Card>
@@ -6155,7 +6207,7 @@ function ManualPosting({ charges, claims, patients, patientById, policies, onPos
                   })}
                   {patientMatches.length === 0 && (
                     <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">
-                      No patient with open claims matches &ldquo;{search.trim()}&rdquo;.
+                      No patients found for the selected Insurance matching &ldquo;{search.trim()}&rdquo;.
                     </td></tr>
                   )}
                 </tbody>
