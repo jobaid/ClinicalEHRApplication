@@ -905,6 +905,7 @@ const adjustedOf = (c) => c.paid + c.writeoff + (c.credits || 0);
 // larger than what was owed legitimately drives the balance negative (an overpayment), not $0.00.
 const balanceOf = (c) => c.charge - c.paid - c.writeoff - (c.credits || 0);
 const BALANCE_EPSILON = 0.005; // absorbs floating-point cents, not real balance
+const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
 const chargeStatus = (c) => {
   const bal = balanceOf(c);
   if (bal < -BALANCE_EPSILON) return "Overpayment";
@@ -926,7 +927,6 @@ function nowIso() { return TODAY + "T" + new Date().toTimeString().slice(0, 8); 
 // what the insurer actually pays. Used to auto-fill the manual posting form from an EOB.
 function splitAllowedAmount(allowed, policy) {
   let remaining = Math.max(0, Number(allowed) || 0);
-  const round2 = (n) => Math.round(n * 100) / 100;
   const copay = policy ? Math.min(remaining, Number(policy.copay) || 0) : 0;
   remaining = round2(remaining - copay);
   const deductible = policy ? Math.min(remaining, Number(policy.deductible) || 0) : 0;
@@ -6364,7 +6364,26 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
     amount: "", allowedAmount: "", copay: "", coinsurance: "", deductible: "", writeoff: "", writeoffReason: "", notes: "",
   });
   const [error, setError] = useState("");
-  const set = (k) => (e) => setF(prev => ({ ...prev, [k]: e.target.value }));
+  // Fields that invalidate a prior auto-filled deductible when the biller edits them. Entering a
+  // deductible directly flips `dedTouched` on so the auto-fill backs off until the biller edits
+  // one of these again. Keeps the "deductible = allowed - received - copay - coins" rule from
+  // overwriting an EOB value they typed deliberately.
+  const [dedTouched, setDedTouched] = useState(false);
+  const set = (k) => (e) => setF(prev => {
+    const next = { ...prev, [k]: e.target.value };
+    if (["allowedAmount", "amount", "copay", "coinsurance"].includes(k)) {
+      const allowed = Number(next.allowedAmount) || 0;
+      if (allowed > 0 && !dedTouched) {
+        const received = Number(next.amount) || 0;
+        const copay = Number(next.copay) || 0;
+        const coins = Number(next.coinsurance) || 0;
+        const ded = round2(Math.max(0, allowed - received - copay - coins));
+        next.deductible = ded ? String(ded) : "";
+      }
+    }
+    return next;
+  });
+  const setDeductible = (e) => { setDedTouched(true); setF(prev => ({ ...prev, deductible: e.target.value })); };
   // Write-off reason suggestions from Settings → Claims & Billing Settings → Write-Off Reasons.
   // Datalist means the biller can still type any reason for a case the catalog does not cover.
   const [writeoffReasons, setWriteoffReasons] = useState([]);
@@ -6382,12 +6401,25 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
     const { copay, deductible, coinsurance, insurancePaid } = splitAllowedAmount(allowed, policy);
     const amount = Math.min(bal, insurancePaid);
     const writeoff = Math.min(Math.max(0, bal - amount), Math.max(0, charge.charge - allowed));
+    setDedTouched(true); // policy-driven split: take it as the biller's chosen deductible
     setF(prev => ({
       ...prev,
       copay: copay ? String(copay) : "", coinsurance: coinsurance ? String(coinsurance) : "", deductible: deductible ? String(deductible) : "",
       amount: amount ? String(amount) : "0", writeoff: writeoff ? String(writeoff) : "",
     }));
   }
+
+  // Derived readouts for the Allowed / Received summary. Patient-responsibility total cannot
+  // exceed allowed; `remainingAllowed` is what is left for the payer after copay/coins/ded.
+  const allowedNum = Number(f.allowedAmount) || 0;
+  const receivedNum = Number(f.amount) || 0;
+  const copayNum = Number(f.copay) || 0;
+  const coinsNum = Number(f.coinsurance) || 0;
+  const dedNum = Number(f.deductible) || 0;
+  const patientRespNum = round2(copayNum + coinsNum + dedNum);
+  const remainingAllowed = allowedNum > 0 ? round2(allowedNum - patientRespNum) : 0;
+  const overAllocated = allowedNum > 0 && patientRespNum > allowedNum + BALANCE_EPSILON;
+  const receivedExceedsRemaining = allowedNum > 0 && receivedNum > round2(allowedNum - patientRespNum) + BALANCE_EPSILON;
 
   const amtNum = Number(f.amount) || 0;
   const willOverpay = amtNum > bal + BALANCE_EPSILON;
@@ -6404,6 +6436,8 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
     // A payment may exceed the remaining balance (overpayment) — only the write-off can't.
     if (writeoffAmt > Math.max(0, bal) + BALANCE_EPSILON) { setError(`Write-off can't exceed the remaining balance (${money(Math.max(0, bal))}).`); return; }
     if (writeoffAmt > 0 && !f.writeoffReason.trim()) { setError("A write-off reason is required."); return; }
+    if (overAllocated) { setError(`Copay + coinsurance + deductible (${money(patientRespNum)}) can't exceed the allowed amount (${money(allowedNum)}).`); return; }
+    if (receivedExceedsRemaining) { setError(`Amount received (${money(receivedNum)}) exceeds the remaining allowed (${money(remainingAllowed)}) after patient responsibility.`); return; }
     setError("");
     // onSubmit re-checks the claim against live data and can refuse: the balance may have been
     // paid by another biller since this panel opened, or the amount may exceed what is owed.
@@ -6457,8 +6491,22 @@ function ManualLinePostingForm({ charge, policies, defaultCheckNumber, defaultPo
       <div className="grid grid-cols-3 gap-3">
         <AmountField label="Copay" value={f.copay} onChange={set("copay")} />
         <AmountField label="Coinsurance" value={f.coinsurance} onChange={set("coinsurance")} />
-        <AmountField label="Deductible" value={f.deductible} onChange={set("deductible")} />
+        <AmountField label="Deductible" value={f.deductible} onChange={setDeductible} />
       </div>
+      {allowedNum > 0 && (
+        <div className={`mt-1 mb-3 text-xs rounded-lg border px-3 py-2 ${overAllocated || receivedExceedsRemaining ? "border-rose-200 bg-rose-50 text-rose-700" : "border-slate-200 bg-slate-50 text-slate-600"}`}>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+            <div className="flex justify-between"><span>Allowed</span><span className="font-medium">{money(allowedNum)}</span></div>
+            <div className="flex justify-between"><span>Amount received</span><span className="font-medium">{money(receivedNum)}</span></div>
+            <div className="flex justify-between"><span>Copay</span><span>{money(copayNum)}</span></div>
+            <div className="flex justify-between"><span>Coinsurance</span><span>{money(coinsNum)}</span></div>
+            <div className="flex justify-between"><span>Deductible</span><span>{money(dedNum)}</span></div>
+            <div className="flex justify-between font-medium"><span>Remaining allowed</span><span>{money(remainingAllowed)}</span></div>
+          </div>
+          {overAllocated && <p className="mt-1.5">Patient responsibility exceeds the allowed amount by {money(round2(patientRespNum - allowedNum))}.</p>}
+          {!overAllocated && receivedExceedsRemaining && <p className="mt-1.5">Amount received exceeds the payer's remaining allowed by {money(round2(receivedNum - remainingAllowed))}.</p>}
+        </div>
+      )}
 
       <SectionTitle>Write off</SectionTitle>
       <AmountField label="Write-off amount" value={f.writeoff} onChange={set("writeoff")} />
